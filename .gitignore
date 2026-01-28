@@ -78,7 +78,6 @@ pytest_cache/
 .pytype/
 .pyre/
 .ruff_cache/
-.cache/
 nosetests.xml
 test-results/
 reports/
@@ -161,7 +160,6 @@ crash.log
 *.swo
 *.bak
 *.orig
-.idea
 
 *.mp3
 *.toml
