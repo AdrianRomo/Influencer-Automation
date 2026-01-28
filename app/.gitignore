@@ -1,0 +1,162 @@
+# =========================
+# Python / Byte-compiled
+# =========================
+__pycache__/
+*.py[cod]
+*$py.class
+
+# =========================
+# Virtual envs / uv / pip
+# =========================
+.venv/
+venv/
+env/
+ENV/
+.python-version
+
+# uv (lock + cache)
+.uv/
+uv-cache/
+**/.uv/
+**/uv-cache/
+# If you use uv's lock file, you typically DO want to commit it:
+# uv.lock
+
+# pip / build artifacts
+pip-wheel-metadata/
+*.egg-info/
+.eggs/
+build/
+dist/
+wheels/
+*.whl
+
+# =========================
+# Django
+# =========================
+*.log
+local_settings.py
+db.sqlite3
+db.sqlite3-journal
+media/
+staticfiles/
+
+# Django cache (if used)
+.cache/
+django_cache/
+
+# =========================
+# Env / Secrets
+# =========================
+.env
+.env.*
+!.env.example
+*.env
+secrets/
+*.pem
+*.key
+*.crt
+
+# =========================
+# Celery / Beat
+# =========================
+celerybeat-schedule
+celerybeat.pid
+
+# =========================
+# Tests / Coverage / Reports
+# =========================
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+pytest_cache/
+.nox/
+.tox/
+.mypy_cache/
+.dmypy.json
+.pytype/
+.pyre/
+.ruff_cache/
+.cache/
+nosetests.xml
+test-results/
+reports/
+
+# =========================
+# Jupyter
+# =========================
+.ipynb_checkpoints/
+
+# =========================
+# Logs / Runtime / Temp
+# =========================
+logs/
+*.pid
+*.pid.lock
+tmp/
+temp/
+*.tmp
+
+# =========================
+# OS
+# =========================
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# =========================
+# Editors / IDEs
+# =========================
+# PyCharm / JetBrains
+.idea/
+*.iml
+out/
+
+# VS Code
+.vscode/
+!.vscode/extensions.json
+!.vscode/settings.json
+!.vscode/launch.json
+!.vscode/tasks.json
+
+# =========================
+# Docker / Compose overrides
+# =========================
+docker-compose.override.yml
+**/docker-compose.override.yml
+
+# =========================
+# Type checking / formatting
+# =========================
+pyrightconfig.json
+.mypy.ini.bak
+
+# =========================
+# Node (if any tooling sneaks in)
+# =========================
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# =========================
+# Terraform (if ever)
+# =========================
+.terraform/
+*.tfstate
+*.tfstate.*
+crash.log
+
+# =========================
+# Misc
+# =========================
+*.swp
+*.swo
+*.bak
+*.orig
