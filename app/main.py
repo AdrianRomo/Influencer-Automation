@@ -36,7 +36,7 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "https://app."+os.getenv("DOMAIN",""),
+        "https://autonarrator."+os.getenv("DOMAIN",""),
         "http://localhost:5173",
         "http://127.0.0.1:5173",
     ],
