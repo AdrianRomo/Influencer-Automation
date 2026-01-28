@@ -116,6 +116,7 @@ Thumbs.db
 .idea/
 *.iml
 out/
+.idea
 
 # VS Code
 .vscode/
@@ -160,3 +161,4 @@ crash.log
 *.swo
 *.bak
 *.orig
+.idea
