@@ -12,6 +12,8 @@ services:
       interval: 5s
       timeout: 5s
       retries: 20
+    networks:
+      - backend
 
   redis:
     image: redis:7
@@ -20,6 +22,8 @@ services:
       interval: 5s
       timeout: 3s
       retries: 20
+    networks:
+      - backend
 
   api:
     build: .
@@ -32,14 +36,29 @@ services:
     volumes:
       - ./:/app
       - audio-data:/data/audio
-    ports:
-      - "8000:8000"
+   #  ports:
+   #    - "8000:8000"
+    networks:
+      - proxy
+      - backend
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=proxy"
+
+      # pick a hostname you want
+      - "traefik.http.routers.influencer.rule=Host(`influencer.${DOMAIN}`)"
+      - "traefik.http.routers.influencer.entrypoints=https"
+      - "traefik.http.routers.influencer.tls.certresolver=cloudflare"
+
+      # tell Traefik which internal port uvicorn listens on
+      - "traefik.http.services.influencer.loadbalancer.server.port=8085"
     depends_on:
       db:
         condition: service_healthy
       redis:
         condition: service_healthy
-    command: ["/opt/venv/bin/uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+    command: ["/opt/venv/bin/uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8085", "--reload",
+              "--proxy-headers", "--forwarded-allow-ips", "*"]
 
   worker:
     build: .
@@ -57,8 +76,36 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+    networks:
+      - backend
     command: ["/opt/venv/bin/celery", "-A", "app.tasks.celery_app", "worker", "-l", "INFO"]
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        VITE_API_BASE_URL: https://influencer.${DOMAIN}
+    networks:
+      - proxy
+      - backend
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=proxy"
+
+      - "traefik.http.routers.autonarrator.rule=Host(`autonarrator.${DOMAIN}`)"
+      - "traefik.http.routers.autonarrator.entrypoints=https"
+      - "traefik.http.routers.autonarrator.tls.certresolver=cloudflare"
+
+      - "traefik.http.services.autonarrator.loadbalancer.server.port=80"
+
+
 
 volumes:
   db-data:
   audio-data:
+
+networks:
+  backend:
+    driver: bridge
+  proxy:
+    external: true

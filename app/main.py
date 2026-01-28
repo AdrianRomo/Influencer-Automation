@@ -2,6 +2,7 @@ import os
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Depends, HTTPException
 from fastapi.responses import FileResponse
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from celery.result import AsyncResult
 from sqlalchemy import select
@@ -31,6 +32,19 @@ app = FastAPI(
     title="Medical RSS → Summary → ElevenLabs Audio (MVP)",
     lifespan=lifespan,
 )
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "https://app."+os.getenv("DOMAIN",""),
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 
 class GenerateReq(BaseModel):
     source_id: str
