@@ -15,7 +15,9 @@ SECRET_KEY = os.getenv("SECRET_KEY", "INSECURE-please-set-SECRET_KEY-in-env")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("JWT_EXPIRE_MINUTES", "10080"))  # 7 days
 
-_pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+# bcrypt_sha256 pre-hashes with HMAC-SHA256 before bcrypt, bypassing bcrypt's
+# 72-byte limit while also preventing password-length side-channels.
+_pwd_context = CryptContext(schemes=["bcrypt_sha256"], deprecated="auto")
 
 
 _fernet_instance: Fernet | None = None
