@@ -61,13 +61,16 @@ def get_optional_user(
 def check_api_key(
     x_api_key: str = Header(default=""),
     authorization: str = Header(default=""),
-    db: Session = Depends(get_db),
 ):
-    """Accept either a valid Bearer JWT or the server-level X-API-Key."""
+    """Accept either a valid Bearer JWT (signature only) or the server-level X-API-Key.
+
+    Avoids a DB lookup here — the user record is fetched only when needed via
+    get_optional_user(), which runs as a separate dependency on endpoints that
+    require user context.
+    """
     if authorization.startswith("Bearer "):
-        user = _user_from_bearer(authorization[7:], db)
-        if user:
-            return  # valid JWT
+        if decode_access_token(authorization[7:]) is not None:
+            return  # valid JWT signature
     if API_KEY and x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid or missing auth")
 

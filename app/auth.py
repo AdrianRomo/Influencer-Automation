@@ -18,10 +18,15 @@ ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("JWT_EXPIRE_MINUTES", "10080"))  # 7
 _pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 
+_fernet_instance: Fernet | None = None
+
+
 def _fernet() -> Fernet:
-    # Derive a stable 32-byte key from SECRET_KEY via SHA-256
-    derived = hashlib.sha256(SECRET_KEY.encode("utf-8")).digest()
-    return Fernet(base64.urlsafe_b64encode(derived))
+    global _fernet_instance
+    if _fernet_instance is None:
+        derived = hashlib.sha256(SECRET_KEY.encode("utf-8")).digest()
+        _fernet_instance = Fernet(base64.urlsafe_b64encode(derived))
+    return _fernet_instance
 
 
 # ── Passwords ──────────────────────────────────────────────────────────────
