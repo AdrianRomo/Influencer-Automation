@@ -1,20 +1,28 @@
 import os
 from contextlib import asynccontextmanager
+from datetime import datetime
 from fastapi import FastAPI, Depends, HTTPException, Header, Query
 from fastapi.responses import FileResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from celery.result import AsyncResult
 from sqlalchemy import select, func, delete
-from typing import Literal
+from sqlalchemy.orm import Session
+from typing import Literal, Optional
 
+from app.auth import (
+    create_access_token, decode_access_token,
+    hash_password, verify_password,
+    encrypt_api_key, decrypt_api_key,
+)
 from app.db import get_db, engine
-from app.models import Base, Source, AudioAsset, Article, ImageAsset, VideoAsset
+from app.models import Base, Source, AudioAsset, Article, ImageAsset, VideoAsset, User, UserApiKeys
 from app.rss_sources import SOURCES
 from app.schemas import (
     ArticleResponse, Storyboard,
     AudioAssetRef, ScriptAsset, VisualPromptEntry, ContentPackage,
     ImageAssetRef, VideoAssetRef,
+    RegisterReq, LoginReq, TokenResp, UserResp, UserKeysIn, UserKeysOut,
 )
 from app.captions import storyboard_to_captions, captions_to_srt, captions_to_vtt
 from app.summarize import _count_words, _estimate_seconds
@@ -31,9 +39,37 @@ _audio_tasks: dict[str, str] = {}
 _video_tasks: dict[str, str] = {}
 
 
-def check_api_key(x_api_key: str = Header(default="")):
+# ── Auth dependencies ──────────────────────────────────────────────────────
+
+def _user_from_bearer(token: str, db: Session) -> Optional[User]:
+    user_id = decode_access_token(token)
+    if not user_id:
+        return None
+    return db.get(User, user_id)
+
+
+def get_optional_user(
+    authorization: str = Header(default=""),
+    db: Session = Depends(get_db),
+) -> Optional[User]:
+    """Return the authenticated User or None — never raises."""
+    if authorization.startswith("Bearer "):
+        return _user_from_bearer(authorization[7:], db)
+    return None
+
+
+def check_api_key(
+    x_api_key: str = Header(default=""),
+    authorization: str = Header(default=""),
+    db: Session = Depends(get_db),
+):
+    """Accept either a valid Bearer JWT or the server-level X-API-Key."""
+    if authorization.startswith("Bearer "):
+        user = _user_from_bearer(authorization[7:], db)
+        if user:
+            return  # valid JWT
     if API_KEY and x_api_key != API_KEY:
-        raise HTTPException(status_code=401, detail="Invalid or missing X-API-Key header")
+        raise HTTPException(status_code=401, detail="Invalid or missing auth")
 
 
 @asynccontextmanager
@@ -92,6 +128,98 @@ def health():
     return {"ok": True}
 
 
+# ── Auth ───────────────────────────────────────────────────────────────────
+
+@app.post("/auth/register", response_model=TokenResp)
+def register(req: RegisterReq, db: Session = Depends(get_db)):
+    email = req.email.lower().strip()
+    if db.execute(select(User).where(User.email == email)).scalar_one_or_none():
+        raise HTTPException(status_code=409, detail="Email already registered")
+    if len(req.password) < 8:
+        raise HTTPException(status_code=422, detail="Password must be at least 8 characters")
+    user = User(email=email, hashed_password=hash_password(req.password))
+    db.add(user)
+    db.commit()
+    return TokenResp(
+        access_token=create_access_token(user.id),
+        user_id=user.id,
+        email=user.email,
+    )
+
+
+@app.post("/auth/login", response_model=TokenResp)
+def login(req: LoginReq, db: Session = Depends(get_db)):
+    email = req.email.lower().strip()
+    user = db.execute(select(User).where(User.email == email)).scalar_one_or_none()
+    if not user or not verify_password(req.password, user.hashed_password):
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+    return TokenResp(
+        access_token=create_access_token(user.id),
+        user_id=user.id,
+        email=user.email,
+    )
+
+
+@app.get("/users/me", response_model=UserResp, dependencies=[Depends(check_api_key)])
+def get_me(current_user: Optional[User] = Depends(get_optional_user)):
+    if not current_user:
+        raise HTTPException(status_code=401, detail="JWT required for this endpoint")
+    return UserResp(
+        id=current_user.id,
+        email=current_user.email,
+        created_at=current_user.created_at,
+        has_keys=current_user.api_keys is not None,
+    )
+
+
+@app.put("/users/me/keys", response_model=UserKeysOut, dependencies=[Depends(check_api_key)])
+def upsert_user_keys(
+    req: UserKeysIn,
+    current_user: Optional[User] = Depends(get_optional_user),
+    db: Session = Depends(get_db),
+):
+    if not current_user:
+        raise HTTPException(status_code=401, detail="JWT required for this endpoint")
+    keys = db.get(UserApiKeys, current_user.id)
+    if not keys:
+        keys = UserApiKeys(user_id=current_user.id, updated_at=datetime.utcnow())
+        db.add(keys)
+    if req.openai_key is not None:
+        keys.openai_key_enc = encrypt_api_key(req.openai_key) if req.openai_key else None
+    if req.elevenlabs_key is not None:
+        keys.elevenlabs_key_enc = encrypt_api_key(req.elevenlabs_key) if req.elevenlabs_key else None
+    if req.elevenlabs_voice_id is not None:
+        keys.elevenlabs_voice_id = req.elevenlabs_voice_id or None
+    if req.elevenlabs_model_id is not None:
+        keys.elevenlabs_model_id = req.elevenlabs_model_id or None
+    keys.updated_at = datetime.utcnow()
+    db.commit()
+    return UserKeysOut(
+        has_openai_key=bool(keys.openai_key_enc),
+        has_elevenlabs_key=bool(keys.elevenlabs_key_enc),
+        elevenlabs_voice_id=keys.elevenlabs_voice_id,
+        elevenlabs_model_id=keys.elevenlabs_model_id,
+    )
+
+
+@app.get("/users/me/keys", response_model=UserKeysOut, dependencies=[Depends(check_api_key)])
+def get_user_keys(
+    current_user: Optional[User] = Depends(get_optional_user),
+    db: Session = Depends(get_db),
+):
+    if not current_user:
+        raise HTTPException(status_code=401, detail="JWT required for this endpoint")
+    keys = db.get(UserApiKeys, current_user.id)
+    if not keys:
+        return UserKeysOut(has_openai_key=False, has_elevenlabs_key=False)
+    return UserKeysOut(
+        has_openai_key=bool(keys.openai_key_enc),
+        has_elevenlabs_key=bool(keys.elevenlabs_key_enc),
+        elevenlabs_voice_id=keys.elevenlabs_voice_id,
+        elevenlabs_model_id=keys.elevenlabs_model_id,
+    )
+
+
 # ── Sources ────────────────────────────────────────────────────────────────
 
 @app.get("/sources", dependencies=[Depends(check_api_key)])
@@ -110,7 +238,8 @@ def list_articles(
     source_id: str | None = Query(default=None),
     limit: int = Query(default=20, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
-    db=Depends(get_db),
+    db: Session = Depends(get_db),
+    current_user: Optional[User] = Depends(get_optional_user),
 ):
     # Single query with LEFT JOIN subqueries — avoids N+1 per article
     audio_sq = (
@@ -135,6 +264,8 @@ def list_articles(
     )
     if source_id:
         q = q.where(Article.source_id == source_id)
+    if current_user:
+        q = q.where(Article.user_id == current_user.id)
 
     rows = db.execute(q).all()
     return [
@@ -313,28 +444,38 @@ def list_article_images(article_id: str, db=Depends(get_db)):
 # ── Jobs ───────────────────────────────────────────────────────────────────
 
 @app.post("/generate", dependencies=[Depends(check_api_key)])
-def generate(req: GenerateReq, db=Depends(get_db)):
+def generate(
+    req: GenerateReq,
+    db: Session = Depends(get_db),
+    current_user: Optional[User] = Depends(get_optional_user),
+):
     src = db.get(Source, req.source_id)
     if not src:
         raise HTTPException(status_code=404, detail="Unknown source_id")
 
     # Return existing in-flight task rather than spawning a duplicate
-    existing = _audio_tasks.get(req.source_id)
+    task_key = f"{req.source_id}:{current_user.id if current_user else 'anon'}"
+    existing = _audio_tasks.get(task_key)
     if existing:
         res = AsyncResult(existing, app=celery_app)
         if res.state in ("PENDING", "RECEIVED", "STARTED", "PROGRESS"):
             return {"task_id": existing, "status": "already_running"}
 
+    openai_key, el_key, el_voice = _resolve_user_keys(current_user, db)
+
     task = celery_app.send_task(
         "generate_latest_for_source",
         kwargs={
             "source_id": req.source_id,
-            "voice_id": req.voice_id,
+            "voice_id": el_voice or req.voice_id,
             "target_seconds": req.target_seconds,
             "n_scenes": req.n_scenes,
+            "openai_api_key": openai_key,
+            "elevenlabs_api_key": el_key,
+            "user_id": current_user.id if current_user else None,
         },
     )
-    _audio_tasks[req.source_id] = task.id
+    _audio_tasks[task_key] = task.id
     return {"task_id": task.id, "status": "queued"}
 
 
@@ -364,7 +505,11 @@ def cancel_job(task_id: str):
 
 
 @app.post("/generate-video", dependencies=[Depends(check_api_key)])
-def generate_video(req: GenerateVideoReq, db=Depends(get_db)):
+def generate_video(
+    req: GenerateVideoReq,
+    db: Session = Depends(get_db),
+    current_user: Optional[User] = Depends(get_optional_user),
+):
     article = db.get(Article, req.article_id)
     if not article:
         raise HTTPException(status_code=404, detail="Unknown article_id")
@@ -377,12 +522,14 @@ def generate_video(req: GenerateVideoReq, db=Depends(get_db)):
         if res.state in ("PENDING", "RECEIVED", "STARTED", "PROGRESS"):
             return {"task_id": existing, "status": "already_running"}
 
+    openai_key, _, _ = _resolve_user_keys(current_user, db)
     task = celery_app.send_task(
         "generate_video_for_article",
         kwargs={
             "article_id": req.article_id,
             "audio_asset_id": req.audio_asset_id,
             "burn_subtitles": req.burn_subtitles,
+            "openai_api_key": openai_key,
         },
     )
     _video_tasks[req.article_id] = task.id
@@ -419,7 +566,12 @@ class RegenerateReq(BaseModel):
 
 
 @app.post("/articles/{article_id}/regenerate", dependencies=[Depends(check_api_key)])
-def regenerate_stage(article_id: str, req: RegenerateReq, db=Depends(get_db)):
+def regenerate_stage(
+    article_id: str,
+    req: RegenerateReq,
+    db: Session = Depends(get_db),
+    current_user: Optional[User] = Depends(get_optional_user),
+):
     """Re-run a specific pipeline stage for an existing article.
 
     stage=video  — re-queue video assembly, reusing any already-generated images.
@@ -442,9 +594,14 @@ def regenerate_stage(article_id: str, req: RegenerateReq, db=Depends(get_db)):
         if res.state in ("PENDING", "RECEIVED", "STARTED", "PROGRESS"):
             return {"task_id": existing, "status": "already_running"}
 
+    openai_key, _, _ = _resolve_user_keys(current_user, db)
     task = celery_app.send_task(
         "generate_video_for_article",
-        kwargs={"article_id": article_id, "burn_subtitles": req.burn_subtitles},
+        kwargs={
+            "article_id": article_id,
+            "burn_subtitles": req.burn_subtitles,
+            "openai_api_key": openai_key,
+        },
     )
     _video_tasks[article_id] = task.id
     return {"task_id": task.id, "status": "queued", "stage": req.stage}
@@ -467,6 +624,25 @@ def get_video(video_id: str, db=Depends(get_db)):
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────
+
+def _resolve_user_keys(
+    user: Optional[User],
+    db: Session,
+) -> tuple[Optional[str], Optional[str], Optional[str]]:
+    """Return (openai_key, elevenlabs_key, elevenlabs_voice_id) for the user.
+
+    Returns (None, None, None) when no user is authenticated or user has no stored keys,
+    in which case tasks fall back to server-level env var keys.
+    """
+    if not user:
+        return None, None, None
+    keys = db.get(UserApiKeys, user.id)
+    if not keys:
+        return None, None, None
+    openai_key = decrypt_api_key(keys.openai_key_enc) if keys.openai_key_enc else None
+    el_key = decrypt_api_key(keys.elevenlabs_key_enc) if keys.elevenlabs_key_enc else None
+    return openai_key, el_key, keys.elevenlabs_voice_id
+
 
 def _load_storyboard(article: Article) -> Storyboard | None:
     if not article.storyboard_json:

@@ -116,8 +116,9 @@ def _tolerance_words(tolerance_seconds=TOLERANCE_SECONDS, output_language=None) 
     return int(round(tolerance_seconds * (wpm / 60.0)))
 
 
-def _call_llm(system: str, user: str, model: str, temperature: float = 0.3) -> str:
-    resp = client.responses.create(
+def _call_llm(system: str, user: str, model: str, temperature: float = 0.3, *, api_key: str | None = None) -> str:
+    c = OpenAI(api_key=api_key) if api_key else client
+    resp = c.responses.create(
         model=model,
         input=[
             {"role": "system", "content": system},
@@ -137,6 +138,7 @@ def make_tts_script(
         output_language: str = OUTPUT_LANGUAGE,
         target_words: int | None = None,
         tol_words: int | None = None,
+        api_key: str | None = None,
 ) -> str:
     """
     Returns a narration-ready script aimed at ~target_seconds, always in Spanish by default.
@@ -161,7 +163,7 @@ Length requirement:
 - Target word count: {target} words (acceptable range {target - tol} to {target + tol} words).
 """
 
-    script = _call_llm(SYSTEM_SCRIPT, prompt, model=model, temperature=0.3)
+    script = _call_llm(SYSTEM_SCRIPT, prompt, model=model, temperature=0.3, api_key=api_key)
     wc = _count_words(script)
 
     for _ in range(2):
@@ -178,7 +180,7 @@ Keep it natural spoken narration. End with the brief medical disclaimer in Spani
 SCRIPT:
 {script}
 """
-        script = _call_llm(SYSTEM_REWRITE, rewrite_prompt, model=model, temperature=0.2)
+        script = _call_llm(SYSTEM_REWRITE, rewrite_prompt, model=model, temperature=0.2, api_key=api_key)
         wc = _count_words(script)
 
     return script.strip()
@@ -191,6 +193,7 @@ def make_storyboard(
         n_scenes: int = DEFAULT_SCENES,
         image_prompt_language: str = IMAGE_PROMPT_LANGUAGE,
         wpm_estimate: float | None = None,
+        api_key: str | None = None,
 ) -> List[Dict[str, Any]]:
     """Return timing-enriched scene list aligned to the narration script.
 
@@ -220,7 +223,7 @@ SCRIPT:
 {script}
 """.strip()
 
-    raw = _call_llm(SYSTEM_STORYBOARD, user, model=model, temperature=0.2)
+    raw = _call_llm(SYSTEM_STORYBOARD, user, model=model, temperature=0.2, api_key=api_key)
     try:
         data = json.loads(raw)
         if isinstance(data, list):
@@ -244,6 +247,7 @@ def make_tts_bundle(
         target_words: int | None = None,
         tol_words: int | None = None,
         wpm_estimate: float | None = None,
+        api_key: str | None = None,
 ) -> Dict[str, Any]:
     """Convenience: script + metadata + timing-enriched storyboard in one call."""
     script = make_tts_script(
@@ -253,6 +257,7 @@ def make_tts_bundle(
         output_language=output_language,
         target_words=target_words,
         tol_words=tol_words,
+        api_key=api_key,
     )
     wc = _count_words(script)
     est = _estimate_seconds(wc, output_language)
@@ -261,6 +266,7 @@ def make_tts_bundle(
         language_hint=language_hint,
         n_scenes=n_scenes,
         wpm_estimate=wpm_estimate,
+        api_key=api_key,
     )
     total_duration = sum(s.get("duration_estimate", 0.0) for s in scenes)
 
@@ -279,7 +285,7 @@ def _words_for_seconds(seconds: int, wpm: float) -> int:
     return int(round(seconds * (wpm / 60.0)))
 
 
-def rewrite_to_target_words(script: str, target_words: int, tol_words: int = 10) -> str:
+def rewrite_to_target_words(script: str, target_words: int, tol_words: int = 10, api_key: str | None = None) -> str:
     model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
     prompt = f"""Rewrite this Spanish TTS script to fit the word count range.
 
@@ -290,4 +296,4 @@ Keep it natural spoken narration. End with the brief medical disclaimer in Spani
 SCRIPT:
 {script}
 """
-    return _call_llm(SYSTEM_REWRITE, prompt, model=model, temperature=0.2)
+    return _call_llm(SYSTEM_REWRITE, prompt, model=model, temperature=0.2, api_key=api_key)

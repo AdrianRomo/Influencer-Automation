@@ -1,9 +1,14 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import type { ArticleSummary, ContentPackage, GenerateReq, ImageAssetRef, JobStatus, Source, StoryboardScene } from './types'
+import type {
+  ArticleSummary, ContentPackage, GenerateReq, ImageAssetRef,
+  JobStatus, Source, StoryboardScene, UserResp, UserKeysOut,
+} from './types'
 import {
   cancelJob, getArticlePackage, jobStatus, listArticles, listSources, regenerateStage,
   resolveAudioUrl, resolveCaptionUrl, resolveImageUrl, resolveVideoUrl, setApiKey,
   startGenerate, startGenerateVideo,
+  register, login, getMe, getUserKeys, saveUserKeys,
+  setAuthToken, clearAuthToken,
 } from './api'
 
 // ── Helpers ────────────────────────────────────────────────────────────────
@@ -44,6 +49,185 @@ const STATE_LABELS: Record<string, string> = {
 function stageLabel(s: JobStatus): string {
   if (s.state === 'PROGRESS' && s.meta?.msg) return s.meta.msg
   return STATE_LABELS[s.state] ?? s.state
+}
+
+// ── Auth Modal ─────────────────────────────────────────────────────────────
+
+function AuthModal({ onSuccess }: { onSuccess: (token: string, user: UserResp) => void }) {
+  const [tab, setTab] = useState<'login' | 'register'>('login')
+  const [email, setEmail] = useState('')
+  const [password, setPassword] = useState('')
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState('')
+
+  async function submit(e: React.FormEvent) {
+    e.preventDefault()
+    setError('')
+    setLoading(true)
+    try {
+      const resp = tab === 'login'
+        ? await login(email.trim(), password)
+        : await register(email.trim(), password)
+      setAuthToken(resp.access_token)
+      localStorage.setItem('jwt_token', resp.access_token)
+      const user: UserResp = { id: resp.user_id, email: resp.email, created_at: '', has_keys: false }
+      onSuccess(resp.access_token, user)
+    } catch (e: unknown) {
+      setError(String((e as Error)?.message ?? e))
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  return (
+    <div className="modal-overlay">
+      <div className="modal-card">
+        <div className="modal-title">Medical Content Generator</div>
+        <div className="modal-subtitle">Sign in to generate and manage your content</div>
+
+        <div className="tab-row">
+          <button
+            className={`tab-btn ${tab === 'login' ? 'tab-active' : ''}`}
+            onClick={() => { setTab('login'); setError('') }}
+            type="button"
+          >Sign In</button>
+          <button
+            className={`tab-btn ${tab === 'register' ? 'tab-active' : ''}`}
+            onClick={() => { setTab('register'); setError('') }}
+            type="button"
+          >Create Account</button>
+        </div>
+
+        <form onSubmit={submit} className="auth-form">
+          <div>
+            <label>Email</label>
+            <input
+              type="email"
+              placeholder="you@example.com"
+              value={email}
+              onChange={e => setEmail(e.target.value)}
+              required
+              autoFocus
+            />
+          </div>
+          <div>
+            <label>Password {tab === 'register' && <span className="small">(min 8 chars)</span>}</label>
+            <input
+              type="password"
+              placeholder={tab === 'register' ? 'Create a password' : 'Your password'}
+              value={password}
+              onChange={e => setPassword(e.target.value)}
+              required
+              minLength={tab === 'register' ? 8 : undefined}
+            />
+          </div>
+          {error && <div className="error-text">{error}</div>}
+          <button type="submit" disabled={loading} style={{ width: '100%', marginTop: 4 }}>
+            {loading ? '…' : tab === 'login' ? 'Sign In' : 'Create Account'}
+          </button>
+        </form>
+      </div>
+    </div>
+  )
+}
+
+// ── Keys Setup Modal ───────────────────────────────────────────────────────
+
+function KeysModal({
+  existing,
+  onSave,
+  onSkip,
+}: {
+  existing: UserKeysOut | null
+  onSave: (keys: UserKeysOut) => void
+  onSkip: () => void
+}) {
+  const [openaiKey, setOpenaiKey] = useState('')
+  const [elKey, setElKey] = useState('')
+  const [elVoice, setElVoice] = useState(existing?.elevenlabs_voice_id ?? '')
+  const [elModel, setElModel] = useState(existing?.elevenlabs_model_id ?? 'eleven_multilingual_v2')
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState('')
+
+  async function save(e: React.FormEvent) {
+    e.preventDefault()
+    setError('')
+    setLoading(true)
+    try {
+      const saved = await saveUserKeys({
+        openai_key: openaiKey.trim() || null,
+        elevenlabs_key: elKey.trim() || null,
+        elevenlabs_voice_id: elVoice.trim() || null,
+        elevenlabs_model_id: elModel.trim() || null,
+      })
+      onSave(saved)
+    } catch (e: unknown) {
+      setError(String((e as Error)?.message ?? e))
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  return (
+    <div className="modal-overlay">
+      <div className="modal-card modal-card-wide">
+        <div className="modal-title">Configure API Keys</div>
+        <div className="modal-subtitle">
+          Your keys are encrypted before storage and used only for your generations.
+        </div>
+
+        <form onSubmit={save} className="auth-form">
+          <div>
+            <label>OpenAI API Key {existing?.has_openai_key && <span className="badge badge-audio" style={{ marginLeft: 6 }}>saved</span>}</label>
+            <input
+              type="password"
+              placeholder={existing?.has_openai_key ? '••••••••••••••••••••••••••• (leave blank to keep)' : 'sk-…'}
+              value={openaiKey}
+              onChange={e => setOpenaiKey(e.target.value)}
+              autoComplete="off"
+            />
+          </div>
+          <div>
+            <label>ElevenLabs API Key {existing?.has_elevenlabs_key && <span className="badge badge-audio" style={{ marginLeft: 6 }}>saved</span>}</label>
+            <input
+              type="password"
+              placeholder={existing?.has_elevenlabs_key ? '••••••••••••••••••••••••••• (leave blank to keep)' : 'your ElevenLabs key'}
+              value={elKey}
+              onChange={e => setElKey(e.target.value)}
+              autoComplete="off"
+            />
+          </div>
+          <div className="row">
+            <div>
+              <label>ElevenLabs Voice ID <span className="small">(optional)</span></label>
+              <input
+                placeholder="voice_id override"
+                value={elVoice}
+                onChange={e => setElVoice(e.target.value)}
+              />
+            </div>
+            <div>
+              <label>ElevenLabs Model ID <span className="small">(optional)</span></label>
+              <input
+                placeholder="eleven_multilingual_v2"
+                value={elModel}
+                onChange={e => setElModel(e.target.value)}
+              />
+            </div>
+          </div>
+          {error && <div className="error-text">{error}</div>}
+          <div className="actions" style={{ marginTop: 8 }}>
+            <button type="submit" disabled={loading}>
+              {loading ? 'Saving…' : 'Save Keys'}
+            </button>
+            <button type="button" className="secondary" onClick={onSkip}>
+              {existing?.has_openai_key ? 'Close' : 'Skip for now'}
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+  )
 }
 
 // ── Sub-components ─────────────────────────────────────────────────────────
@@ -123,18 +307,26 @@ function HistoryRow({ article, sources, onLoad }: {
 // ── Main App ───────────────────────────────────────────────────────────────
 
 export default function App() {
-  // Form state
+  // ── Auth state ─────────────────────────────────────────────────────────
+  const [authToken, setAuthTokenState] = useState<string | null>(() => localStorage.getItem('jwt_token'))
+  const [currentUser, setCurrentUser] = useState<UserResp | null>(null)
+  const [userKeys, setUserKeys] = useState<UserKeysOut | null>(null)
+  const [authLoading, setAuthLoading] = useState(true)
+  const [showAuthModal, setShowAuthModal] = useState(false)
+  const [showKeysModal, setShowKeysModal] = useState(false)
+
+  // ── Settings (legacy API key) ───────────────────────────────────────────
+  const [apiKey, setApiKeyState] = useState(() => localStorage.getItem('api_key') ?? '')
+  const [showSettings, setShowSettings] = useState(false)
+
+  // ── Form state ─────────────────────────────────────────────────────────
   const [sources, setSources] = useState<Source[]>([])
   const [sourceId, setSourceId] = useState('')
   const [voiceId, setVoiceId] = useState('')
   const [targetSeconds, setTargetSeconds] = useState(180)
   const [nScenes, setNScenes] = useState(8)
 
-  // Settings
-  const [apiKey, setApiKeyState] = useState(() => localStorage.getItem('api_key') ?? '')
-  const [showSettings, setShowSettings] = useState(false)
-
-  // Audio generation
+  // ── Audio generation ───────────────────────────────────────────────────
   const [loading, setLoading] = useState(false)
   const [statusText, setStatusText] = useState('Idle')
   const [audioJob, setAudioJob] = useState<JobStatus | null>(null)
@@ -144,27 +336,60 @@ export default function App() {
   const activeAudioTaskId = useRef<string | null>(null)
   const activeVideoTaskId = useRef<string | null>(null)
 
-  // Content package
+  // ── Content package ────────────────────────────────────────────────────
   const [pkg, setPkg] = useState<ContentPackage | null>(null)
   const [pkgLoading, setPkgLoading] = useState(false)
 
-  // Video generation
+  // ── Video generation ───────────────────────────────────────────────────
   const [videoLoading, setVideoLoading] = useState(false)
   const [videoJob, setVideoJob] = useState<JobStatus | null>(null)
   const [videoError, setVideoError] = useState('')
   const [videoStage, setVideoStage] = useState('')
 
-  // History
+  // ── History ─────────────────────────────────────────────────────────────
   const [history, setHistory] = useState<ArticleSummary[]>([])
 
-  // Sync API key to module and localStorage whenever it changes
+  // ── Bootstrap: validate stored JWT, then load user + keys ──────────────
+  useEffect(() => {
+    const stored = localStorage.getItem('jwt_token')
+    const legacyKey = localStorage.getItem('api_key') ?? ''
+    setApiKey(legacyKey)
+
+    if (!stored) {
+      setAuthLoading(false)
+      setShowAuthModal(true)
+      return
+    }
+
+    setAuthToken(stored)
+    getMe()
+      .then(user => {
+        setCurrentUser(user)
+        return getUserKeys()
+      })
+      .then(keys => {
+        setUserKeys(keys)
+        setAuthLoading(false)
+      })
+      .catch(() => {
+        // Token expired or invalid
+        localStorage.removeItem('jwt_token')
+        clearAuthToken()
+        setAuthTokenState(null)
+        setAuthLoading(false)
+        setShowAuthModal(true)
+      })
+  }, [])
+
+  // Sync legacy API key
   useEffect(() => {
     setApiKey(apiKey)
     localStorage.setItem('api_key', apiKey)
   }, [apiKey])
 
-  // Load sources + history on mount
+  // Load sources + history once authenticated
   useEffect(() => {
+    if (authLoading || showAuthModal) return
     listSources()
       .then(s => { setSources(s); if (s.length) setSourceId(String(s[0].id)) })
       .catch(e => setError(String((e as Error)?.message ?? e)))
@@ -173,17 +398,16 @@ export default function App() {
       if (pollTimer.current) window.clearTimeout(pollTimer.current)
       if (videoPollTimer.current) window.clearTimeout(videoPollTimer.current)
     }
-  }, [])
+  }, [authLoading, showAuthModal])
 
-  // Refresh history every 5 s while a task is running so badges update live
+  // Refresh history while tasks run
   useEffect(() => {
     if (!loading && !videoLoading) return
     const id = window.setInterval(loadHistory, 5000)
     return () => window.clearInterval(id)
   }, [loading, videoLoading])
 
-  // Refresh content package every 8 s during video generation so image dots update.
-  // Uses pkg?.article_id directly — when video is loading the package is always set.
+  // Refresh content package every 8s during video generation
   useEffect(() => {
     const aid = pkg?.article_id
     if (!videoLoading || !aid) return
@@ -193,12 +417,44 @@ export default function App() {
     return () => window.clearInterval(id)
   }, [videoLoading, pkg?.article_id])
 
+  // ── Auth handlers ───────────────────────────────────────────────────────
+
+  function handleAuthSuccess(token: string, user: UserResp) {
+    setAuthTokenState(token)
+    setCurrentUser(user)
+    setShowAuthModal(false)
+    // Fetch keys for this user
+    getUserKeys()
+      .then(keys => {
+        setUserKeys(keys)
+        if (!keys.has_openai_key || !keys.has_elevenlabs_key) {
+          setShowKeysModal(true)
+        }
+      })
+      .catch(() => setShowKeysModal(true))
+  }
+
+  function handleLogout() {
+    localStorage.removeItem('jwt_token')
+    clearAuthToken()
+    setAuthTokenState(null)
+    setCurrentUser(null)
+    setUserKeys(null)
+    setHistory([])
+    setPkg(null)
+    setAudioJob(null)
+    setVideoJob(null)
+    setError('')
+    setStatusText('Idle')
+    setShowAuthModal(true)
+  }
+
   async function loadHistory() {
     try {
       const articles = await listArticles({ limit: 30 })
       setHistory(articles)
     } catch {
-      // History is best-effort; swallow errors silently
+      // History is best-effort
     }
   }
 
@@ -371,10 +627,32 @@ export default function App() {
     [pkg?.images],
   )
 
+  const keysConfigured = userKeys?.has_openai_key && userKeys?.has_elevenlabs_key
+
   // ── Render ────────────────────────────────────────────────────────────────
+
+  if (authLoading) {
+    return (
+      <div className="container" style={{ textAlign: 'center', paddingTop: 80 }}>
+        <div className="small">Loading…</div>
+      </div>
+    )
+  }
 
   return (
     <div className="container">
+
+      {/* Auth modal */}
+      {showAuthModal && <AuthModal onSuccess={handleAuthSuccess} />}
+
+      {/* Keys setup modal */}
+      {showKeysModal && (
+        <KeysModal
+          existing={userKeys}
+          onSave={keys => { setUserKeys(keys); setShowKeysModal(false) }}
+          onSkip={() => setShowKeysModal(false)}
+        />
+      )}
 
       {/* Header */}
       <div className="header">
@@ -384,6 +662,26 @@ export default function App() {
         </div>
         <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
           <div className="status">{statusText}</div>
+          {currentUser && (
+            <>
+              <button
+                className="secondary settings-btn"
+                onClick={() => setShowKeysModal(true)}
+                title="Manage API Keys"
+              >
+                API Keys {keysConfigured
+                  ? <span className="key-dot key-dot-ok" />
+                  : <span className="key-dot key-dot-warn" />
+                }
+              </button>
+              <div className="user-chip" title={currentUser.email}>
+                {currentUser.email.split('@')[0]}
+              </div>
+              <button className="secondary settings-btn" onClick={handleLogout}>
+                Sign Out
+              </button>
+            </>
+          )}
           <button className="secondary settings-btn" onClick={() => setShowSettings(v => !v)}>
             {showSettings ? 'Close' : 'Settings'}
           </button>
@@ -394,15 +692,25 @@ export default function App() {
       {showSettings && (
         <div className="card" style={{ marginBottom: 12 }}>
           <label>
-            API Key <span className="small">(stored in browser, sent as X-API-Key header)</span>
+            Server API Key <span className="small">(fallback, sent as X-API-Key — only needed if server requires it)</span>
           </label>
           <input
             type="password"
-            placeholder="Leave empty if the server has no API_KEY configured"
+            placeholder="Leave empty if using account login"
             value={apiKey}
             onChange={e => setApiKeyState(e.target.value)}
             autoComplete="off"
           />
+        </div>
+      )}
+
+      {/* Keys warning banner */}
+      {currentUser && !keysConfigured && (
+        <div className="keys-banner">
+          <span>API keys not configured — generations will use server defaults.</span>
+          <button className="secondary settings-btn" style={{ marginLeft: 12 }} onClick={() => setShowKeysModal(true)}>
+            Add Keys
+          </button>
         </div>
       )}
 
@@ -430,9 +738,15 @@ export default function App() {
             )}
           </div>
           <div>
-            <label>Voice ID <span className="small">(optional)</span></label>
+            <label>
+              Voice ID <span className="small">
+                {userKeys?.elevenlabs_voice_id
+                  ? `(using account voice: ${userKeys.elevenlabs_voice_id})`
+                  : '(optional — overrides account default)'}
+              </span>
+            </label>
             <input
-              placeholder="ElevenLabs voice_id — leave empty for default"
+              placeholder={userKeys?.elevenlabs_voice_id ?? 'ElevenLabs voice_id — leave empty for default'}
               value={voiceId}
               onChange={e => setVoiceId(e.target.value)}
               disabled={loading}

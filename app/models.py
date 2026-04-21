@@ -1,10 +1,39 @@
 import uuid
 from datetime import datetime
+from typing import Optional
 from sqlalchemy import String, Text, DateTime, ForeignKey, UniqueConstraint, Integer, JSON, Index, Float
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 class Base(DeclarativeBase):
     pass
+
+
+class User(Base):
+    __tablename__ = "users"
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    email: Mapped[str] = mapped_column(String, nullable=False, unique=True, index=True)
+    hashed_password: Mapped[str] = mapped_column(String, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+
+    api_keys: Mapped[Optional["UserApiKeys"]] = relationship(
+        back_populates="user", uselist=False, cascade="all, delete-orphan"
+    )
+
+
+class UserApiKeys(Base):
+    """Stores per-user provider keys, AES-encrypted at rest."""
+    __tablename__ = "user_api_keys"
+    user_id: Mapped[str] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
+    )
+    openai_key_enc: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    elevenlabs_key_enc: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    elevenlabs_voice_id: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    elevenlabs_model_id: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+
+    user: Mapped["User"] = relationship(back_populates="api_keys")
+
 
 class Source(Base):
     __tablename__ = "sources"
@@ -19,6 +48,9 @@ class Article(Base):
     __tablename__ = "articles"
     id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
     source_id: Mapped[str] = mapped_column(ForeignKey("sources.id", ondelete="CASCADE"), nullable=False)
+    user_id: Mapped[Optional[str]] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
 
     title: Mapped[str] = mapped_column(String, nullable=False)
     url: Mapped[str] = mapped_column(String, nullable=False)
@@ -45,6 +77,7 @@ class Article(Base):
         UniqueConstraint("source_id", "url", name="uq_article_source_url"),
         Index("ix_articles_source_created", "source_id", "created_at"),
         Index("ix_articles_published_at", "published_at"),
+        Index("ix_articles_user_id", "user_id"),
     )
 
 class AudioAsset(Base):

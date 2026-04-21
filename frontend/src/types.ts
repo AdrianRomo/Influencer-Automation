@@ -1,3 +1,33 @@
+// ── Auth types ─────────────────────────────────────────────────────────────
+
+export type TokenResp = {
+  access_token: string
+  token_type: string
+  user_id: string
+  email: string
+}
+
+export type UserResp = {
+  id: string
+  email: string
+  created_at: string
+  has_keys: boolean
+}
+
+export type UserKeysIn = {
+  openai_key?: string | null
+  elevenlabs_key?: string | null
+  elevenlabs_voice_id?: string | null
+  elevenlabs_model_id?: string | null
+}
+
+export type UserKeysOut = {
+  has_openai_key: boolean
+  has_elevenlabs_key: boolean
+  elevenlabs_voice_id?: string | null
+  elevenlabs_model_id?: string | null
+}
+
 export type Source = {
   id: string
   name: string

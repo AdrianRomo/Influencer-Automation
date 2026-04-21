@@ -5,12 +5,9 @@ from typing import Optional
 from elevenlabs import VoiceSettings
 from elevenlabs.client import ElevenLabs
 
-# One client per worker process (Celery-friendly)
-ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
-if not ELEVENLABS_API_KEY:
-    raise RuntimeError("ELEVENLABS_API_KEY is not set")
-
-_client = ElevenLabs(api_key=ELEVENLABS_API_KEY)
+# Module-level client — used when no per-user key is supplied
+ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", "")
+_client: ElevenLabs | None = ElevenLabs(api_key=ELEVENLABS_API_KEY) if ELEVENLABS_API_KEY else None
 
 # Multilingual v2 supports Spanish; language_code accepts 'es' among others.
 DEFAULT_LANGUAGE_CODE = os.getenv("ELEVENLABS_LANGUAGE_CODE", "es")
@@ -36,6 +33,7 @@ def synthesize(
     text: str,
     voice_id: Optional[str] = None,
     *,
+    api_key: Optional[str] = None,
     voice_settings: Optional[VoiceSettings] = None,
     language_code: Optional[str] = DEFAULT_LANGUAGE_CODE,
     retries: int = 3,
@@ -53,11 +51,16 @@ def synthesize(
 
     vs = voice_settings or _default_voice_settings()
 
+    effective_key = api_key or ELEVENLABS_API_KEY
+    if not effective_key:
+        raise RuntimeError("No ElevenLabs API key — set ELEVENLABS_API_KEY or configure user API keys")
+    active_client = ElevenLabs(api_key=effective_key) if api_key else (_client or ElevenLabs(api_key=effective_key))
+
     last_err: Exception | None = None
     for attempt in range(retries):
         try:
             # convert returns an iterator of bytes in the SDK examples.
-            audio_stream = _client.text_to_speech.convert(
+            audio_stream = active_client.text_to_speech.convert(
                 voice_id=vid,
                 model_id=model_id,
                 output_format=output_format,

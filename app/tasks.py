@@ -100,6 +100,9 @@ def generate_latest_for_source(
     voice_id: str | None = None,
     target_seconds: int = TARGET_SECONDS,
     n_scenes: int = 8,
+    openai_api_key: str | None = None,
+    elevenlabs_api_key: str | None = None,
+    user_id: str | None = None,
 ) -> dict:
     audio_dir = os.getenv("AUDIO_DIR", "/data/audio")
     os.makedirs(audio_dir, exist_ok=True)
@@ -130,7 +133,7 @@ def generate_latest_for_source(
         logger.info("Selected RSS entry: title=%r published_at=%s url=%s", title, published_at, url)
 
         # Upsert article
-        article = Article(source_id=src.id, title=title, url=url, published_at=published_at)
+        article = Article(source_id=src.id, title=title, url=url, published_at=published_at, user_id=user_id)
         db.add(article)
         try:
             db.commit()
@@ -139,6 +142,10 @@ def generate_latest_for_source(
             article = db.execute(
                 select(Article).where(Article.source_id == src.id, Article.url == url)
             ).scalar_one()
+            # Claim ownership if not yet assigned
+            if user_id and not article.user_id:
+                article.user_id = user_id
+                db.commit()
 
         self.update_state(state="PROGRESS", meta={"stage": "extracting", "msg": "Extracting article content…"})
 
@@ -170,6 +177,7 @@ def generate_latest_for_source(
             target_words=target_words,
             tol_words=tol_words,
             wpm_estimate=wpm,
+            api_key=openai_api_key,
         )
 
         script = bundle["script"]
@@ -201,7 +209,8 @@ def generate_latest_for_source(
             )
             try:
                 audio_bytes = synthesize(
-                    script, voice_id=used_voice_id, model_id=model_id, output_format=output_format
+                    script, voice_id=used_voice_id, model_id=model_id,
+                    output_format=output_format, api_key=elevenlabs_api_key,
                 )
                 with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3", dir=audio_dir) as tmp:
                     tmp.write(audio_bytes)
@@ -223,7 +232,7 @@ def generate_latest_for_source(
                 wc = word_count or len(script.split())
                 desired = MIN_SECONDS if duration < MIN_SECONDS else MAX_SECONDS
                 target_wc = int(round(wc * (desired / max(duration, 1))))
-                script = rewrite_to_target_words(script, target_words=target_wc, tol_words=20)
+                script = rewrite_to_target_words(script, target_words=target_wc, tol_words=20, api_key=openai_api_key)
                 word_count = len(script.split())
 
                 try:
@@ -292,6 +301,7 @@ def generate_video_for_article(
     article_id: str,
     audio_asset_id: str | None = None,
     burn_subtitles: bool = True,
+    openai_api_key: str | None = None,
 ) -> dict:
     """Generate scene images with DALL-E then assemble an MP4 with FFmpeg.
 
@@ -375,7 +385,7 @@ def generate_video_for_article(
                     img_path = existing.file_path
                 else:
                     logger.info("Generating image for scene %d: %r", scene.scene_number, scene.visual_prompt[:80])
-                    success = generate_and_save(scene.visual_prompt, img_path)
+                    success = generate_and_save(scene.visual_prompt, img_path, api_key=openai_api_key)
                     img_record = ImageAsset(
                         article_id=article_id,
                         scene_number=scene.scene_number,

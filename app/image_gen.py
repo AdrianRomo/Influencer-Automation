@@ -35,9 +35,10 @@ def _safe_prompt(visual_prompt: str) -> str:
     return raw[:_MAX_PROMPT_CHARS + len(_PROMPT_PREFIX)]
 
 
-def generate_scene_image(visual_prompt: str) -> bytes:
+def generate_scene_image(visual_prompt: str, api_key: str | None = None) -> bytes:
     """Call DALL-E and return raw PNG bytes."""
-    resp = _client.images.generate(
+    c = OpenAI(api_key=api_key) if api_key else _client
+    resp = c.images.generate(
         model=IMAGE_MODEL,
         prompt=_safe_prompt(visual_prompt),
         size=IMAGE_SIZE,
@@ -62,13 +63,13 @@ def create_placeholder_image(output_path: str, width: int = 1024, height: int = 
     )
 
 
-def generate_and_save(visual_prompt: str, output_path: str) -> bool:
+def generate_and_save(visual_prompt: str, output_path: str, api_key: str | None = None) -> bool:
     """Generate an image and save to disk. Returns True on success, False on failure.
 
     On failure, writes a black placeholder so callers don't need to handle missing files.
     """
     try:
-        img_bytes = generate_scene_image(visual_prompt)
+        img_bytes = generate_scene_image(visual_prompt, api_key=api_key)
         with open(output_path, "wb") as fh:
             fh.write(img_bytes)
         return True

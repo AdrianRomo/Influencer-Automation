@@ -6,6 +6,46 @@ from typing import List, Optional
 from pydantic import BaseModel
 
 
+# ── Auth models ────────────────────────────────────────────────────────────
+
+class RegisterReq(BaseModel):
+    email: str
+    password: str
+
+
+class LoginReq(BaseModel):
+    email: str
+    password: str
+
+
+class TokenResp(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    user_id: str
+    email: str
+
+
+class UserResp(BaseModel):
+    id: str
+    email: str
+    created_at: datetime
+    has_keys: bool
+
+
+class UserKeysIn(BaseModel):
+    openai_key: Optional[str] = None
+    elevenlabs_key: Optional[str] = None
+    elevenlabs_voice_id: Optional[str] = None
+    elevenlabs_model_id: Optional[str] = None
+
+
+class UserKeysOut(BaseModel):
+    has_openai_key: bool
+    has_elevenlabs_key: bool
+    elevenlabs_voice_id: Optional[str] = None
+    elevenlabs_model_id: Optional[str] = None
+
+
 class StoryboardScene(BaseModel):
     scene_number: int
     start_time_estimate: float  # seconds from content start
