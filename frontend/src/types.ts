@@ -109,6 +109,7 @@ export type VideoAssetRef = {
   height: number
   has_subtitles: boolean
   status: string
+  error?: string | null
 }
 
 export type ContentPackage = {

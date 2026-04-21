@@ -103,6 +103,8 @@ services:
       CELERY_RESULT_BACKEND: redis://redis:6379/1
       # Set ENABLE_SCHEDULED_GENERATION=true in .env to activate the daily schedule
     depends_on:
+      db:
+        condition: service_healthy
       redis:
         condition: service_healthy
     networks:

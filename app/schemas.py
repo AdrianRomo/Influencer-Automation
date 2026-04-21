@@ -97,6 +97,7 @@ class VideoAssetRef(BaseModel):
     height: int
     has_subtitles: bool
     status: str
+    error: Optional[str] = None
 
 
 class ContentPackage(BaseModel):

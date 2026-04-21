@@ -1,8 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { ArticleSummary, ContentPackage, GenerateReq, ImageAssetRef, JobStatus, Source, StoryboardScene } from './types'
 import {
-  getArticlePackage, jobStatus, listArticles, listSources, resolveAudioUrl,
-  resolveCaptionUrl, resolveImageUrl, resolveVideoUrl, setApiKey,
+  cancelJob, getArticlePackage, jobStatus, listArticles, listSources, regenerateStage,
+  resolveAudioUrl, resolveCaptionUrl, resolveImageUrl, resolveVideoUrl, setApiKey,
   startGenerate, startGenerateVideo,
 } from './api'
 
@@ -31,11 +31,19 @@ function relativeDate(iso: string): string {
   return d.toLocaleDateString()
 }
 
+const STATE_LABELS: Record<string, string> = {
+  PENDING: 'Queued…',
+  RECEIVED: 'Starting…',
+  STARTED: 'Running…',
+  RETRY: 'Retrying…',
+  SUCCESS: 'Done',
+  FAILURE: 'Failed',
+  REVOKED: 'Cancelled',
+}
+
 function stageLabel(s: JobStatus): string {
   if (s.state === 'PROGRESS' && s.meta?.msg) return s.meta.msg
-  if (s.state === 'SUCCESS') return 'Done'
-  if (s.state === 'FAILURE') return 'Failed'
-  return s.state
+  return STATE_LABELS[s.state] ?? s.state
 }
 
 // ── Sub-components ─────────────────────────────────────────────────────────
@@ -94,8 +102,13 @@ function HistoryRow({ article, sources, onLoad }: {
 }) {
   const sourceName = sources.find(s => String(s.id) === String(article.source_id))?.name ?? article.source_id
   return (
-    <div className="history-row" onClick={() => onLoad(article.id)} role="button" tabIndex={0}
-      onKeyDown={e => e.key === 'Enter' && onLoad(article.id)}>
+    <div
+      className="history-row"
+      onClick={() => onLoad(article.id)}
+      role="button"
+      tabIndex={0}
+      onKeyDown={e => e.key === 'Enter' && onLoad(article.id)}
+    >
       <div className="history-title" title={article.title}>{article.title}</div>
       <div className="history-meta">
         <span className="small">{sourceName}</span>
@@ -127,6 +140,9 @@ export default function App() {
   const [audioJob, setAudioJob] = useState<JobStatus | null>(null)
   const [error, setError] = useState('')
   const pollTimer = useRef<number | null>(null)
+  const videoPollTimer = useRef<number | null>(null)
+  const activeAudioTaskId = useRef<string | null>(null)
+  const activeVideoTaskId = useRef<string | null>(null)
 
   // Content package
   const [pkg, setPkg] = useState<ContentPackage | null>(null)
@@ -137,37 +153,52 @@ export default function App() {
   const [videoJob, setVideoJob] = useState<JobStatus | null>(null)
   const [videoError, setVideoError] = useState('')
   const [videoStage, setVideoStage] = useState('')
-  const videoPollTimer = useRef<number | null>(null)
 
   // History
   const [history, setHistory] = useState<ArticleSummary[]>([])
 
-  // Sync API key to module and localStorage
+  // Sync API key to module and localStorage whenever it changes
   useEffect(() => {
     setApiKey(apiKey)
     localStorage.setItem('api_key', apiKey)
   }, [apiKey])
 
-  // Load sources and history on mount
+  // Load sources + history on mount
   useEffect(() => {
     listSources()
       .then(s => { setSources(s); if (s.length) setSourceId(String(s[0].id)) })
       .catch(e => setError(String((e as Error)?.message ?? e)))
-
     loadHistory()
-
     return () => {
       if (pollTimer.current) window.clearTimeout(pollTimer.current)
       if (videoPollTimer.current) window.clearTimeout(videoPollTimer.current)
     }
   }, [])
 
+  // Refresh history every 5 s while a task is running so badges update live
+  useEffect(() => {
+    if (!loading && !videoLoading) return
+    const id = window.setInterval(loadHistory, 5000)
+    return () => window.clearInterval(id)
+  }, [loading, videoLoading])
+
+  // Refresh content package every 8 s during video generation so image dots update.
+  // Uses pkg?.article_id directly — when video is loading the package is always set.
+  useEffect(() => {
+    const aid = pkg?.article_id
+    if (!videoLoading || !aid) return
+    const id = window.setInterval(async () => {
+      try { setPkg(await getArticlePackage(aid)) } catch { /* ignore */ }
+    }, 8000)
+    return () => window.clearInterval(id)
+  }, [videoLoading, pkg?.article_id])
+
   async function loadHistory() {
     try {
       const articles = await listArticles({ limit: 30 })
       setHistory(articles)
     } catch {
-      // History is best-effort; don't show an error for it
+      // History is best-effort; swallow errors silently
     }
   }
 
@@ -176,8 +207,7 @@ export default function App() {
     if (videoPollTimer.current) window.clearTimeout(videoPollTimer.current)
     setAudioJob(null); setVideoJob(null); setVideoError(''); setVideoStage('')
     setError(''); setLoading(false); setVideoLoading(false)
-    setPkg(null); setPkgLoading(true)
-    setStatusText('Loading…')
+    setPkg(null); setPkgLoading(true); setStatusText('Loading…')
     try {
       const p = await getArticlePackage(articleId)
       setPkg(p)
@@ -205,12 +235,22 @@ export default function App() {
         n_scenes: nScenes,
       }
       const resp = await startGenerate(payload)
+      activeAudioTaskId.current = resp.task_id
       setStatusText(`Queued: ${resp.task_id.slice(0, 8)}…`)
       pollAudio(resp.task_id)
     } catch (e: unknown) {
       setLoading(false); setStatusText('Error')
       setError(String((e as Error)?.message ?? e))
     }
+  }
+
+  async function cancelAudio() {
+    const tid = activeAudioTaskId.current
+    if (!tid) return
+    try { await cancelJob(tid) } catch { /* ignore */ }
+    activeAudioTaskId.current = null
+    if (pollTimer.current) window.clearTimeout(pollTimer.current)
+    setLoading(false); setStatusText('Cancelled')
   }
 
   function pollAudio(taskId: string) {
@@ -252,11 +292,35 @@ export default function App() {
     setVideoError(''); setVideoLoading(true); setVideoJob(null); setVideoStage('Queueing…')
     try {
       const resp = await startGenerateVideo(articleId, true)
+      activeVideoTaskId.current = resp.task_id
       pollVideo(resp.task_id)
     } catch (e: unknown) {
       setVideoLoading(false); setVideoStage('')
       setVideoError(String((e as Error)?.message ?? e))
     }
+  }
+
+  async function retryVideo(stage: 'video' | 'images') {
+    if (!articleId) return
+    setVideoError(''); setVideoLoading(true); setVideoJob(null)
+    setVideoStage(stage === 'images' ? 'Regenerating all images…' : 'Retrying video assembly…')
+    try {
+      const resp = await regenerateStage(articleId, stage, true)
+      activeVideoTaskId.current = resp.task_id
+      pollVideo(resp.task_id)
+    } catch (e: unknown) {
+      setVideoLoading(false); setVideoStage('')
+      setVideoError(String((e as Error)?.message ?? e))
+    }
+  }
+
+  async function cancelVideo() {
+    const tid = activeVideoTaskId.current
+    if (!tid) return
+    try { await cancelJob(tid) } catch { /* ignore */ }
+    activeVideoTaskId.current = null
+    if (videoPollTimer.current) window.clearTimeout(videoPollTimer.current)
+    setVideoLoading(false); setVideoStage('Cancelled')
   }
 
   function pollVideo(taskId: string) {
@@ -265,7 +329,7 @@ export default function App() {
       if (s.state === 'PROGRESS' && s.meta?.msg) {
         setVideoStage(s.meta.msg)
       } else if (s.state !== 'SUCCESS' && s.state !== 'FAILURE') {
-        setVideoStage(s.state)
+        setVideoStage(STATE_LABELS[s.state] ?? s.state)
       }
       if (s.state === 'SUCCESS') {
         setVideoLoading(false); setVideoStage('')
@@ -291,7 +355,7 @@ export default function App() {
     setLoading(false); setStatusText('Idle'); setPkgLoading(false)
   }
 
-  // ── Derived state ─────────────────────────────────────────────────────────
+  // ── Derived ───────────────────────────────────────────────────────────────
 
   const selectedSource = useMemo(
     () => sources.find(s => String(s.id) === String(sourceId)) ?? null,
@@ -307,8 +371,6 @@ export default function App() {
     [pkg?.images],
   )
 
-  const showResults = pkg !== null || pkgLoading
-
   // ── Render ────────────────────────────────────────────────────────────────
 
   return (
@@ -322,11 +384,7 @@ export default function App() {
         </div>
         <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
           <div className="status">{statusText}</div>
-          <button
-            className="secondary settings-btn"
-            onClick={() => setShowSettings(v => !v)}
-            title="Settings"
-          >
+          <button className="secondary settings-btn" onClick={() => setShowSettings(v => !v)}>
             {showSettings ? 'Close' : 'Settings'}
           </button>
         </div>
@@ -335,10 +393,12 @@ export default function App() {
       {/* Settings panel */}
       {showSettings && (
         <div className="card" style={{ marginBottom: 12 }}>
-          <label>API Key <span className="small">(stored in browser, sent as X-API-Key header)</span></label>
+          <label>
+            API Key <span className="small">(stored in browser, sent as X-API-Key header)</span>
+          </label>
           <input
             type="password"
-            placeholder="Leave empty if server has no API_KEY configured"
+            placeholder="Leave empty if the server has no API_KEY configured"
             value={apiKey}
             onChange={e => setApiKeyState(e.target.value)}
             autoComplete="off"
@@ -351,14 +411,20 @@ export default function App() {
         <div className="row">
           <div>
             <label>Source</label>
-            <select value={sourceId} onChange={e => setSourceId(e.target.value)} disabled={!sources.length || loading}>
+            <select
+              value={sourceId}
+              onChange={e => setSourceId(e.target.value)}
+              disabled={!sources.length || loading}
+            >
               {sources.map(s => (
                 <option key={String(s.id)} value={String(s.id)}>{s.name}</option>
               ))}
             </select>
             {selectedSource && (
               <div className="small" style={{ marginTop: 6 }}>
-                {selectedSource.language_hint && <><span className="code">{selectedSource.language_hint}</span> · </>}
+                {selectedSource.language_hint && (
+                  <><span className="code">{selectedSource.language_hint}</span> · </>
+                )}
                 <span className="code">{selectedSource.rss_url}</span>
               </div>
             )}
@@ -379,13 +445,19 @@ export default function App() {
         <div className="row">
           <div>
             <label>Target duration (seconds)</label>
-            <input type="number" min={30} max={600} value={targetSeconds}
-              onChange={e => setTargetSeconds(Number(e.target.value))} disabled={loading} />
+            <input
+              type="number" min={30} max={600} value={targetSeconds}
+              onChange={e => setTargetSeconds(Number(e.target.value))}
+              disabled={loading}
+            />
           </div>
           <div>
             <label>Storyboard scenes</label>
-            <input type="number" min={0} max={20} value={nScenes}
-              onChange={e => setNScenes(Number(e.target.value))} disabled={loading} />
+            <input
+              type="number" min={0} max={20} value={nScenes}
+              onChange={e => setNScenes(Number(e.target.value))}
+              disabled={loading}
+            />
           </div>
         </div>
 
@@ -393,10 +465,10 @@ export default function App() {
           <button onClick={startAudio} disabled={loading || !sourceId}>
             {loading ? 'Generating…' : 'Generate Audio'}
           </button>
-          <button className="secondary" onClick={reset} disabled={loading && !pkg}>Reset</button>
-          {audioDownloadUrl && (
-            <a href={audioDownloadUrl} className="link" download>Download MP3</a>
-          )}
+          {loading
+            ? <button className="secondary" onClick={cancelAudio}>Cancel</button>
+            : <button className="secondary" onClick={reset}>Reset</button>
+          }
         </div>
 
         {error && <div className="error-text">{error}</div>}
@@ -415,26 +487,33 @@ export default function App() {
         </div>
       )}
 
-      {/* Results */}
+      {/* Package loading spinner */}
       {pkgLoading && (
         <div className="card" style={{ marginTop: 12 }}>
           <div className="small">Loading article…</div>
         </div>
       )}
 
-      {showResults && pkg && (
+      {/* Results */}
+      {pkg && (
         <div className="results">
 
-          {/* Article title + audio metadata */}
+          {/* Article title + audio metadata + player */}
           <div className="result-meta card">
             <a href={pkg.url} target="_blank" rel="noreferrer" className="article-title link">
               {pkg.title}
             </a>
             {pkg.audio && (
               <div className="small" style={{ marginTop: 4 }}>
-                {fmtSeconds(pkg.audio.duration_seconds)} · {pkg.audio.word_count?.toLocaleString()} words
+                {fmtSeconds(pkg.audio.duration_seconds)}
+                {' · '}{pkg.audio.word_count?.toLocaleString()} words
                 {' · voice: '}<span className="code">{pkg.audio.voice_id}</span>
               </div>
+            )}
+            {audioDownloadUrl && (
+              <audio controls className="audio-player">
+                <source src={audioDownloadUrl} type="audio/mpeg" />
+              </audio>
             )}
             {pkg.storyboard && (
               <div className="download-row" style={{ marginTop: 8 }}>
@@ -472,32 +551,65 @@ export default function App() {
               <strong>Video</strong>
               {videoStage && <span className="small">{videoStage}</span>}
               {!videoStage && videoReady && pkg.video && (
-                <span className="small">{fmtSeconds(pkg.video.duration_seconds)} · {pkg.video.width}×{pkg.video.height}</span>
+                <span className="small">
+                  {fmtSeconds(pkg.video.duration_seconds)} · {pkg.video.width}×{pkg.video.height}
+                  {pkg.video.has_subtitles ? ' · subtitles' : ''}
+                </span>
               )}
             </div>
 
             {videoReady && pkg.video ? (
-              <div className="actions">
-                <a href={resolveVideoUrl(pkg.video.id)} className="dl-btn dl-btn-primary" download>
-                  Download MP4
-                </a>
-                {pkg.video.has_subtitles && <span className="small">with subtitles</span>}
+              <div>
+                <video controls className="video-player">
+                  <source src={resolveVideoUrl(pkg.video.id)} type="video/mp4" />
+                </video>
+                <div className="actions" style={{ marginTop: 10 }}>
+                  <a href={resolveVideoUrl(pkg.video.id)} className="dl-btn dl-btn-primary" download>
+                    Download MP4
+                  </a>
+                  {pkg.video.has_subtitles && <span className="small">subtitles burned in</span>}
+                  {articleId && (
+                    <button className="secondary" style={{ fontSize: 12, padding: '5px 10px' }}
+                      onClick={() => retryVideo('images')} disabled={videoLoading}>
+                      Regenerate Images
+                    </button>
+                  )}
+                </div>
+              </div>
+            ) : pkg.video?.status === 'failed' ? (
+              <div>
+                {pkg.video.error && (
+                  <div className="error-text" style={{ marginBottom: 10 }}>{pkg.video.error}</div>
+                )}
+                <div className="actions">
+                  <button onClick={() => retryVideo('video')} disabled={videoLoading || !articleId}>
+                    {videoLoading ? 'Retrying…' : 'Retry Video Assembly'}
+                  </button>
+                  <button className="secondary" onClick={() => retryVideo('images')}
+                    disabled={videoLoading || !articleId}>
+                    Regenerate All Images
+                  </button>
+                  {videoLoading && (
+                    <button className="secondary" onClick={cancelVideo}>Cancel</button>
+                  )}
+                </div>
               </div>
             ) : (
               <div className="actions">
                 <button onClick={startVideo} disabled={videoLoading || !articleId}>
                   {videoLoading ? 'Generating…' : 'Generate Video'}
                 </button>
-                {!videoLoading && (
-                  <span className="small">DALL-E scene images + FFmpeg assembly · ~2–5 min</span>
-                )}
+                {videoLoading
+                  ? <button className="secondary" onClick={cancelVideo}>Cancel</button>
+                  : <span className="small">DALL-E scene images + FFmpeg assembly · ~2–5 min</span>
+                }
               </div>
             )}
 
             {videoError && <div className="error-text">{videoError}</div>}
 
             {pkg.images && pkg.images.length > 0 && (
-              <div className="image-status-row small" style={{ marginTop: 8 }}>
+              <div className="image-status-row small" style={{ marginTop: 10 }}>
                 {pkg.images.map(img => (
                   <span
                     key={img.id}
@@ -505,7 +617,7 @@ export default function App() {
                     title={`Scene ${img.scene_number}: ${img.status} — ${img.visual_prompt.slice(0, 60)}`}
                   />
                 ))}
-                <span>{pkg.images.filter(i => i.status === 'ready').length}/{pkg.images.length} images</span>
+                <span>{pkg.images.filter(i => i.status === 'ready').length}/{pkg.images.length} images ready</span>
               </div>
             )}
           </div>

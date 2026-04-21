@@ -73,6 +73,21 @@ export function resolveCaptionUrl(articleId: string, format: 'srt' | 'vtt'): str
 }
 
 // Legacy helper kept for backward-compat with places that still have a JobStatus
+export function cancelJob(taskId: string): Promise<{ cancelled: string }> {
+  return http<{ cancelled: string }>(`/jobs/${encodeURIComponent(taskId)}`, { method: 'DELETE' })
+}
+
+export function regenerateStage(
+  articleId: string,
+  stage: 'video' | 'images',
+  burnSubtitles = true,
+): Promise<{ task_id: string; status: string; stage: string }> {
+  return http(`/articles/${encodeURIComponent(articleId)}/regenerate`, {
+    method: 'POST',
+    body: JSON.stringify({ stage, burn_subtitles: burnSubtitles }),
+  })
+}
+
 export function resolveDownloadUrl(status: JobStatus): string | undefined {
   const r = status.result
   if (!r) return undefined

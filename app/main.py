@@ -5,7 +5,8 @@ from fastapi.responses import FileResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from celery.result import AsyncResult
-from sqlalchemy import select, func
+from sqlalchemy import select, func, delete
+from typing import Literal
 
 from app.db import get_db, engine
 from app.models import Base, Source, AudioAsset, Article, ImageAsset, VideoAsset
@@ -274,6 +275,7 @@ def get_article_package(article_id: str, db=Depends(get_db)):
             height=video_row.height,
             has_subtitles=bool(video_row.has_subtitles),
             status=video_row.status,
+            error=video_row.error,
         )
 
     return ContentPackage(
@@ -354,6 +356,13 @@ def job_status(task_id: str):
     return payload
 
 
+@app.delete("/jobs/{task_id}", dependencies=[Depends(check_api_key)])
+def cancel_job(task_id: str):
+    """Revoke a queued or running task. Sends SIGTERM to the worker process."""
+    celery_app.control.revoke(task_id, terminate=True, signal="SIGTERM")
+    return {"cancelled": task_id}
+
+
 @app.post("/generate-video", dependencies=[Depends(check_api_key)])
 def generate_video(req: GenerateVideoReq, db=Depends(get_db)):
     article = db.get(Article, req.article_id)
@@ -402,6 +411,43 @@ def get_image(image_id: str, db=Depends(get_db)):
     if not os.path.exists(img.file_path):
         raise HTTPException(status_code=404, detail="Image file missing on disk")
     return FileResponse(img.file_path, media_type="image/png")
+
+
+class RegenerateReq(BaseModel):
+    stage: Literal["video", "images"]
+    burn_subtitles: bool = True
+
+
+@app.post("/articles/{article_id}/regenerate", dependencies=[Depends(check_api_key)])
+def regenerate_stage(article_id: str, req: RegenerateReq, db=Depends(get_db)):
+    """Re-run a specific pipeline stage for an existing article.
+
+    stage=video  — re-queue video assembly, reusing any already-generated images.
+    stage=images — delete all image records first so every scene gets a fresh
+                   DALL-E call, then assemble the video.
+    """
+    article = db.get(Article, article_id)
+    if not article:
+        raise HTTPException(status_code=404, detail="Article not found")
+    if not article.storyboard_json:
+        raise HTTPException(status_code=400, detail="Article has no storyboard — generate audio first")
+
+    if req.stage == "images":
+        db.execute(delete(ImageAsset).where(ImageAsset.article_id == article_id))
+        db.commit()
+
+    existing = _video_tasks.get(article_id)
+    if existing:
+        res = AsyncResult(existing, app=celery_app)
+        if res.state in ("PENDING", "RECEIVED", "STARTED", "PROGRESS"):
+            return {"task_id": existing, "status": "already_running"}
+
+    task = celery_app.send_task(
+        "generate_video_for_article",
+        kwargs={"article_id": article_id, "burn_subtitles": req.burn_subtitles},
+    )
+    _video_tasks[article_id] = task.id
+    return {"task_id": task.id, "status": "queued", "stage": req.stage}
 
 
 @app.get("/video/{video_id}", dependencies=[Depends(check_api_key)])

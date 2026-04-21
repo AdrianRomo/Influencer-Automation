@@ -112,6 +112,9 @@ button:disabled {
   background: #f3f4f6;
   border: 1px solid #e5e7eb;
   white-space: nowrap;
+  max-width: 280px;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .actions {
@@ -132,6 +135,7 @@ hr {
   background: #f3f4f6;
   padding: 2px 6px;
   border-radius: 8px;
+  font-size: 11px;
 }
 
 .link {
@@ -155,6 +159,7 @@ hr {
   cursor: pointer;
   gap: 12px;
   border-bottom: 1px solid #f3f4f6;
+  transition: background 0.1s, padding 0.1s;
 }
 
 .history-row:last-child {
@@ -165,8 +170,12 @@ hr {
   background: #f9fafb;
   padding-left: 8px;
   padding-right: 8px;
-  margin-left: -4px;
-  margin-right: -4px;
+}
+
+.history-row:focus {
+  outline: 2px solid #d1d5db;
+  outline-offset: 1px;
+  border-radius: 8px;
 }
 
 .history-title {
@@ -240,6 +249,27 @@ hr {
   margin-top: 8px;
   font-size: 12px;
   color: #b91c1c;
+}
+
+/* ── Audio player ───────────────────────────────────────────────────────── */
+
+.audio-player {
+  width: 100%;
+  margin-top: 10px;
+  border-radius: 10px;
+  height: 40px;
+  accent-color: #111827;
+}
+
+/* ── Video player ───────────────────────────────────────────────────────── */
+
+.video-player {
+  display: block;
+  max-width: 270px;   /* portrait phone width */
+  width: 100%;
+  border-radius: 12px;
+  background: #000;
+  margin-bottom: 4px;
 }
 
 /* ── Collapsible ────────────────────────────────────────────────────────── */
@@ -332,9 +362,9 @@ hr {
   border-radius: 6px;
   border: 1px solid #e5e7eb;
   display: block;
-  transition: opacity 0.2s;
+  transition: opacity 0.15s;
 }
-.scene-thumb:hover { opacity: 0.85; }
+.scene-thumb:hover { opacity: 0.8; }
 
 .scene-num {
   font-size: 11px;
@@ -414,6 +444,7 @@ hr {
   width: 10px;
   height: 10px;
   border-radius: 50%;
+  flex-shrink: 0;
 }
 .img-dot-ok   { background: #22c55e; }
 .img-dot-fail { background: #ef4444; }
