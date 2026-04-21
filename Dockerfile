@@ -7,6 +7,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxml2-dev \
     libxslt1-dev \
     zlib1g-dev \
+    ffmpeg \
   && rm -rf /var/lib/apt/lists/*
 
 RUN pip install --no-cache-dir uv

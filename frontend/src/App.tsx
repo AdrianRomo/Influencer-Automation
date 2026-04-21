@@ -1,148 +1,376 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import type { GenerateReq, JobStatus, Source } from './types'
-import { jobStatus, listSources, resolveDownloadUrl, startGenerate } from './api'
+import type { ArticleSummary, ContentPackage, GenerateReq, ImageAssetRef, JobStatus, Source, StoryboardScene } from './types'
+import {
+  getArticlePackage, jobStatus, listArticles, listSources, resolveAudioUrl,
+  resolveCaptionUrl, resolveImageUrl, resolveVideoUrl, setApiKey,
+  startGenerate, startGenerateVideo,
+} from './api'
+
+// ── Helpers ────────────────────────────────────────────────────────────────
+
+function fmtSeconds(s: number | null | undefined): string {
+  if (s == null) return '—'
+  const m = Math.floor(s / 60)
+  const sec = Math.round(s % 60)
+  return `${m}:${sec.toString().padStart(2, '0')}`
+}
+
+function assetBadgeClass(type: string): string {
+  if (type === 'title-card') return 'badge badge-title'
+  if (type === 'outro') return 'badge badge-outro'
+  return 'badge badge-broll'
+}
+
+function relativeDate(iso: string): string {
+  const d = new Date(iso)
+  const days = Math.floor((Date.now() - d.getTime()) / 86_400_000)
+  if (days === 0) return 'today'
+  if (days === 1) return 'yesterday'
+  if (days < 7) return `${days}d ago`
+  if (days < 30) return `${Math.floor(days / 7)}w ago`
+  return d.toLocaleDateString()
+}
+
+function stageLabel(s: JobStatus): string {
+  if (s.state === 'PROGRESS' && s.meta?.msg) return s.meta.msg
+  if (s.state === 'SUCCESS') return 'Done'
+  if (s.state === 'FAILURE') return 'Failed'
+  return s.state
+}
+
+// ── Sub-components ─────────────────────────────────────────────────────────
+
+function Collapsible({ title, children, defaultOpen = false }: {
+  title: string; children: React.ReactNode; defaultOpen?: boolean
+}) {
+  const [open, setOpen] = useState(defaultOpen)
+  return (
+    <div className="collapsible">
+      <button className="collapsible-header" onClick={() => setOpen(o => !o)}>
+        <span>{title}</span>
+        <span className="chevron">{open ? '▲' : '▼'}</span>
+      </button>
+      {open && <div className="collapsible-body">{children}</div>}
+    </div>
+  )
+}
+
+function SceneCard({ scene, imageRef }: { scene: StoryboardScene; imageRef?: ImageAssetRef }) {
+  return (
+    <div className="scene-card">
+      <div className="scene-card-header">
+        <span className="scene-num">Scene {scene.scene_number}</span>
+        <span className={assetBadgeClass(scene.asset_type)}>{scene.asset_type}</span>
+        <span className="scene-time">{fmtSeconds(scene.start_time_estimate)}</span>
+        <span className="scene-dur">{fmtSeconds(scene.duration_estimate)}</span>
+      </div>
+      <div className="scene-card-content">
+        <div className="scene-card-text">
+          {scene.on_screen_text && (
+            <div className="scene-overlay">"{scene.on_screen_text}"</div>
+          )}
+          <div className="scene-narration">{scene.narration}</div>
+          <div className="scene-visual small">{scene.visual_prompt}</div>
+        </div>
+        {imageRef?.status === 'ready' && (
+          <a href={resolveImageUrl(imageRef.id)} target="_blank" rel="noreferrer" className="scene-thumb-link">
+            <img
+              className="scene-thumb"
+              src={resolveImageUrl(imageRef.id)}
+              alt={`Scene ${scene.scene_number}`}
+              loading="lazy"
+            />
+          </a>
+        )}
+      </div>
+    </div>
+  )
+}
+
+function HistoryRow({ article, sources, onLoad }: {
+  article: ArticleSummary
+  sources: Source[]
+  onLoad: (id: string) => void
+}) {
+  const sourceName = sources.find(s => String(s.id) === String(article.source_id))?.name ?? article.source_id
+  return (
+    <div className="history-row" onClick={() => onLoad(article.id)} role="button" tabIndex={0}
+      onKeyDown={e => e.key === 'Enter' && onLoad(article.id)}>
+      <div className="history-title" title={article.title}>{article.title}</div>
+      <div className="history-meta">
+        <span className="small">{sourceName}</span>
+        <span className="small">{relativeDate(article.created_at)}</span>
+        {article.has_audio && <span className="badge badge-audio">audio</span>}
+        {article.has_video && <span className="badge badge-video">video</span>}
+      </div>
+    </div>
+  )
+}
+
+// ── Main App ───────────────────────────────────────────────────────────────
 
 export default function App() {
+  // Form state
   const [sources, setSources] = useState<Source[]>([])
-  const [sourceId, setSourceId] = useState<string>('')
-  const [voiceId, setVoiceId] = useState<string>('')
-  const [targetSeconds, setTargetSeconds] = useState<number>(180)
-  const [nScenes, setNScenes] = useState<number>(8)
+  const [sourceId, setSourceId] = useState('')
+  const [voiceId, setVoiceId] = useState('')
+  const [targetSeconds, setTargetSeconds] = useState(180)
+  const [nScenes, setNScenes] = useState(8)
 
+  // Settings
+  const [apiKey, setApiKeyState] = useState(() => localStorage.getItem('api_key') ?? '')
+  const [showSettings, setShowSettings] = useState(false)
+
+  // Audio generation
   const [loading, setLoading] = useState(false)
   const [statusText, setStatusText] = useState('Idle')
-  const [job, setJob] = useState<JobStatus | null>(null)
-  const [error, setError] = useState<string>('')
-
+  const [audioJob, setAudioJob] = useState<JobStatus | null>(null)
+  const [error, setError] = useState('')
   const pollTimer = useRef<number | null>(null)
 
-  const downloadUrl = useMemo(() => (job ? resolveDownloadUrl(job) : undefined), [job])
-  const articleUrl = useMemo(() => {
-    const articleId = job?.result?.article_id
-    if (!articleId) return undefined
-    const base = import.meta.env.VITE_API_BASE_URL ? String(import.meta.env.VITE_API_BASE_URL).replace(/\/$/, '') : ''
-    return `${base}/articles/${articleId}`
-  }, [job])
+  // Content package
+  const [pkg, setPkg] = useState<ContentPackage | null>(null)
+  const [pkgLoading, setPkgLoading] = useState(false)
 
-  async function load() {
-    setError('')
-    setStatusText('Loading sources…')
-    try {
-      const s = await listSources()
-      setSources(s)
-      if (s.length) setSourceId(String(s[0].id))
-      setStatusText('Ready')
-    } catch (e: any) {
-      setStatusText('Error')
-      setError(e?.message ?? String(e))
-    }
-  }
+  // Video generation
+  const [videoLoading, setVideoLoading] = useState(false)
+  const [videoJob, setVideoJob] = useState<JobStatus | null>(null)
+  const [videoError, setVideoError] = useState('')
+  const [videoStage, setVideoStage] = useState('')
+  const videoPollTimer = useRef<number | null>(null)
 
+  // History
+  const [history, setHistory] = useState<ArticleSummary[]>([])
+
+  // Sync API key to module and localStorage
   useEffect(() => {
-    load()
+    setApiKey(apiKey)
+    localStorage.setItem('api_key', apiKey)
+  }, [apiKey])
+
+  // Load sources and history on mount
+  useEffect(() => {
+    listSources()
+      .then(s => { setSources(s); if (s.length) setSourceId(String(s[0].id)) })
+      .catch(e => setError(String((e as Error)?.message ?? e)))
+
+    loadHistory()
+
     return () => {
       if (pollTimer.current) window.clearTimeout(pollTimer.current)
+      if (videoPollTimer.current) window.clearTimeout(videoPollTimer.current)
     }
   }, [])
 
-  async function start() {
-    if (!sourceId) return
-    setError('')
-    setLoading(true)
-    setJob(null)
-    setStatusText('Queueing job…')
-
-    const payload: GenerateReq = {
-      source_id: sourceId,
-      voice_id: voiceId.trim().length ? voiceId.trim() : null,
-      target_seconds: targetSeconds,
-      n_scenes: nScenes,
-    }
-
+  async function loadHistory() {
     try {
-      const resp = await startGenerate(payload)
-      setStatusText(`Queued: ${resp.task_id}`)
-      poll(resp.task_id)
-    } catch (e: any) {
-      setStatusText('Error')
-      setError(e?.message ?? String(e))
-      setLoading(false)
+      const articles = await listArticles({ limit: 30 })
+      setHistory(articles)
+    } catch {
+      // History is best-effort; don't show an error for it
     }
   }
 
-  async function poll(taskId: string) {
+  async function loadFromHistory(articleId: string) {
+    if (pollTimer.current) window.clearTimeout(pollTimer.current)
+    if (videoPollTimer.current) window.clearTimeout(videoPollTimer.current)
+    setAudioJob(null); setVideoJob(null); setVideoError(''); setVideoStage('')
+    setError(''); setLoading(false); setVideoLoading(false)
+    setPkg(null); setPkgLoading(true)
+    setStatusText('Loading…')
     try {
-      const s = await jobStatus(taskId)
-      setJob(s)
-      setStatusText(`State: ${s.state}`)
-
-      if (s.state === 'SUCCESS' || s.state === 'FAILURE') {
-        setLoading(false)
-        if (s.state === 'FAILURE') setError(s.error || 'Job failed (no error message provided).')
-        return
-      }
-
-      pollTimer.current = window.setTimeout(() => poll(taskId), 2000)
-    } catch (e: any) {
-      setLoading(false)
+      const p = await getArticlePackage(articleId)
+      setPkg(p)
+      setStatusText('Ready')
+    } catch (e: unknown) {
+      setError(String((e as Error)?.message ?? e))
       setStatusText('Error')
-      setError(e?.message ?? String(e))
+    } finally {
+      setPkgLoading(false)
     }
+  }
+
+  // ── Audio generation ─────────────────────────────────────────────────────
+
+  async function startAudio() {
+    if (!sourceId) return
+    setError(''); setLoading(true); setAudioJob(null); setPkg(null)
+    setVideoJob(null); setVideoError(''); setVideoStage('')
+    setStatusText('Queueing…')
+    try {
+      const payload: GenerateReq = {
+        source_id: sourceId,
+        voice_id: voiceId.trim() || null,
+        target_seconds: targetSeconds,
+        n_scenes: nScenes,
+      }
+      const resp = await startGenerate(payload)
+      setStatusText(`Queued: ${resp.task_id.slice(0, 8)}…`)
+      pollAudio(resp.task_id)
+    } catch (e: unknown) {
+      setLoading(false); setStatusText('Error')
+      setError(String((e as Error)?.message ?? e))
+    }
+  }
+
+  function pollAudio(taskId: string) {
+    jobStatus(taskId).then(s => {
+      setAudioJob(s)
+      setStatusText(stageLabel(s))
+      if (s.state === 'SUCCESS') {
+        setLoading(false)
+        const aid = s.result?.article_id as string | undefined
+        if (aid) fetchPackage(aid)
+        loadHistory()
+      } else if (s.state === 'FAILURE') {
+        setLoading(false)
+        setError(s.error || 'Audio generation failed')
+        setStatusText('Failed')
+      } else {
+        pollTimer.current = window.setTimeout(() => pollAudio(taskId), 2500)
+      }
+    }).catch(e => {
+      setLoading(false); setStatusText('Error')
+      setError(String((e as Error)?.message ?? e))
+    })
+  }
+
+  async function fetchPackage(aid: string) {
+    try {
+      const p = await getArticlePackage(aid)
+      setPkg(p)
+      setStatusText('Ready')
+    } catch {
+      setStatusText('Ready (package unavailable)')
+    }
+  }
+
+  // ── Video generation ─────────────────────────────────────────────────────
+
+  async function startVideo() {
+    if (!articleId) return
+    setVideoError(''); setVideoLoading(true); setVideoJob(null); setVideoStage('Queueing…')
+    try {
+      const resp = await startGenerateVideo(articleId, true)
+      pollVideo(resp.task_id)
+    } catch (e: unknown) {
+      setVideoLoading(false); setVideoStage('')
+      setVideoError(String((e as Error)?.message ?? e))
+    }
+  }
+
+  function pollVideo(taskId: string) {
+    jobStatus(taskId).then(s => {
+      setVideoJob(s)
+      if (s.state === 'PROGRESS' && s.meta?.msg) {
+        setVideoStage(s.meta.msg)
+      } else if (s.state !== 'SUCCESS' && s.state !== 'FAILURE') {
+        setVideoStage(s.state)
+      }
+      if (s.state === 'SUCCESS') {
+        setVideoLoading(false); setVideoStage('')
+        if (articleId) fetchPackage(articleId)
+        loadHistory()
+      } else if (s.state === 'FAILURE') {
+        setVideoLoading(false); setVideoStage('')
+        setVideoError(s.error || 'Video generation failed')
+      } else {
+        videoPollTimer.current = window.setTimeout(() => pollVideo(taskId), 3000)
+      }
+    }).catch(e => {
+      setVideoLoading(false); setVideoStage('')
+      setVideoError(String((e as Error)?.message ?? e))
+    })
   }
 
   function reset() {
-    setJob(null)
-    setError('')
-    setLoading(false)
-    setStatusText('Ready')
+    if (pollTimer.current) window.clearTimeout(pollTimer.current)
+    if (videoPollTimer.current) window.clearTimeout(videoPollTimer.current)
+    setAudioJob(null); setPkg(null); setError('')
+    setVideoJob(null); setVideoError(''); setVideoLoading(false); setVideoStage('')
+    setLoading(false); setStatusText('Idle'); setPkgLoading(false)
   }
 
-  const selectedSource = useMemo(() => sources.find(s => String(s.id) === String(sourceId)) ?? null, [sources, sourceId])
+  // ── Derived state ─────────────────────────────────────────────────────────
+
+  const selectedSource = useMemo(
+    () => sources.find(s => String(s.id) === String(sourceId)) ?? null,
+    [sources, sourceId],
+  )
+
+  const articleId = pkg?.article_id ?? (audioJob?.result?.article_id as string | undefined)
+  const videoReady = pkg?.video?.status === 'ready'
+  const audioDownloadUrl = pkg?.audio?.id ? resolveAudioUrl(pkg.audio.id) : undefined
+
+  const imageMap = useMemo(
+    () => Object.fromEntries((pkg?.images ?? []).map(img => [img.scene_number, img])),
+    [pkg?.images],
+  )
+
+  const showResults = pkg !== null || pkgLoading
+
+  // ── Render ────────────────────────────────────────────────────────────────
 
   return (
     <div className="container">
+
+      {/* Header */}
       <div className="header">
         <div>
-          <div className="h1">Medical RSS → Summary → ElevenLabs (MVP)</div>
-          <div className="small">Select source → Generate → Download MP3 when ready</div>
+          <div className="h1">Medical Content Generator</div>
+          <div className="small">RSS → Script → Audio → Storyboard → Video</div>
         </div>
-        <div className="status">{statusText}</div>
+        <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+          <div className="status">{statusText}</div>
+          <button
+            className="secondary settings-btn"
+            onClick={() => setShowSettings(v => !v)}
+            title="Settings"
+          >
+            {showSettings ? 'Close' : 'Settings'}
+          </button>
+        </div>
       </div>
 
+      {/* Settings panel */}
+      {showSettings && (
+        <div className="card" style={{ marginBottom: 12 }}>
+          <label>API Key <span className="small">(stored in browser, sent as X-API-Key header)</span></label>
+          <input
+            type="password"
+            placeholder="Leave empty if server has no API_KEY configured"
+            value={apiKey}
+            onChange={e => setApiKeyState(e.target.value)}
+            autoComplete="off"
+          />
+        </div>
+      )}
+
+      {/* Generation form */}
       <div className="card">
         <div className="row">
           <div>
             <label>Source</label>
-            <select
-              value={sourceId}
-              onChange={(e) => setSourceId(e.target.value)}
-              disabled={sources.length === 0 || loading}
-            >
+            <select value={sourceId} onChange={e => setSourceId(e.target.value)} disabled={!sources.length || loading}>
               {sources.map(s => (
-                <option key={String(s.id)} value={String(s.id)}>
-                  {s.name}
-                </option>
+                <option key={String(s.id)} value={String(s.id)}>{s.name}</option>
               ))}
             </select>
             {selectedSource && (
               <div className="small" style={{ marginTop: 6 }}>
-                RSS: <span className="code">{selectedSource.rss_url}</span>
-                {selectedSource.language_hint ? <> · Lang: <span className="code">{selectedSource.language_hint}</span></> : null}
+                {selectedSource.language_hint && <><span className="code">{selectedSource.language_hint}</span> · </>}
+                <span className="code">{selectedSource.rss_url}</span>
               </div>
             )}
           </div>
-
           <div>
-            <label>Voice ID (optional)</label>
+            <label>Voice ID <span className="small">(optional)</span></label>
             <input
-              placeholder="ElevenLabs voice_id (optional)"
+              placeholder="ElevenLabs voice_id — leave empty for default"
               value={voiceId}
-              onChange={(e) => setVoiceId(e.target.value)}
+              onChange={e => setVoiceId(e.target.value)}
               disabled={loading}
             />
-            <div className="small" style={{ marginTop: 6 }}>
-              Leave empty to use backend default.
-            </div>
           </div>
         </div>
 
@@ -150,67 +378,141 @@ export default function App() {
 
         <div className="row">
           <div>
-            <label>Target seconds</label>
-            <input
-              type="number"
-              min={30}
-              max={600}
-              value={targetSeconds}
-              onChange={(e) => setTargetSeconds(Number(e.target.value))}
-              disabled={loading}
-            />
+            <label>Target duration (seconds)</label>
+            <input type="number" min={30} max={600} value={targetSeconds}
+              onChange={e => setTargetSeconds(Number(e.target.value))} disabled={loading} />
           </div>
           <div>
             <label>Storyboard scenes</label>
-            <input
-              type="number"
-              min={0}
-              max={20}
-              value={nScenes}
-              onChange={(e) => setNScenes(Number(e.target.value))}
-              disabled={loading}
-            />
+            <input type="number" min={0} max={20} value={nScenes}
+              onChange={e => setNScenes(Number(e.target.value))} disabled={loading} />
           </div>
         </div>
 
         <div className="actions" style={{ marginTop: 14 }}>
-          <button onClick={start} disabled={loading || !sourceId}>
-            {loading ? 'Working…' : 'Generate MP3'}
+          <button onClick={startAudio} disabled={loading || !sourceId}>
+            {loading ? 'Generating…' : 'Generate Audio'}
           </button>
-
-          <button className="secondary" onClick={reset} disabled={loading}>
-            Reset
-          </button>
-
-          {downloadUrl && (
-            <a href={downloadUrl} className="link" download>
-              Download MP3
-            </a>
+          <button className="secondary" onClick={reset} disabled={loading && !pkg}>Reset</button>
+          {audioDownloadUrl && (
+            <a href={audioDownloadUrl} className="link" download>Download MP3</a>
           )}
         </div>
 
-        {job?.result?.audio_id && (
-          <div className="small" style={{ marginTop: 10 }}>
-            audio_id: <span className="code">{String(job.result.audio_id)}</span>
-          </div>
-        )}
-
-        {articleUrl && (
-          <div className="small" style={{ marginTop: 6 }}>
-            article: <a className="link" href={articleUrl} target="_blank" rel="noreferrer">{articleUrl}</a>
-          </div>
-        )}
-
-        {error && (
-          <div className="small" style={{ marginTop: 10 }}>
-            <b>Error:</b> {error}
-          </div>
-        )}
+        {error && <div className="error-text">{error}</div>}
       </div>
 
-      <div className="small" style={{ marginTop: 14 }}>
-        Config: set <span className="code">VITE_API_BASE_URL</span> to your FastAPI base URL (example: <span className="code">http://localhost:8000</span>).
-      </div>
+      {/* History */}
+      {history.length > 0 && (
+        <div style={{ marginTop: 12 }}>
+          <Collapsible title={`History · ${history.length} articles`}>
+            <div className="history-list">
+              {history.map(a => (
+                <HistoryRow key={a.id} article={a} sources={sources} onLoad={loadFromHistory} />
+              ))}
+            </div>
+          </Collapsible>
+        </div>
+      )}
+
+      {/* Results */}
+      {pkgLoading && (
+        <div className="card" style={{ marginTop: 12 }}>
+          <div className="small">Loading article…</div>
+        </div>
+      )}
+
+      {showResults && pkg && (
+        <div className="results">
+
+          {/* Article title + audio metadata */}
+          <div className="result-meta card">
+            <a href={pkg.url} target="_blank" rel="noreferrer" className="article-title link">
+              {pkg.title}
+            </a>
+            {pkg.audio && (
+              <div className="small" style={{ marginTop: 4 }}>
+                {fmtSeconds(pkg.audio.duration_seconds)} · {pkg.audio.word_count?.toLocaleString()} words
+                {' · voice: '}<span className="code">{pkg.audio.voice_id}</span>
+              </div>
+            )}
+            {pkg.storyboard && (
+              <div className="download-row" style={{ marginTop: 8 }}>
+                <span className="small">Subtitles:</span>
+                <a href={resolveCaptionUrl(pkg.article_id, 'srt')} className="dl-btn" download>SRT</a>
+                <a href={resolveCaptionUrl(pkg.article_id, 'vtt')} className="dl-btn" download>VTT</a>
+              </div>
+            )}
+          </div>
+
+          {/* Script */}
+          {pkg.script && (
+            <Collapsible title={`Script · ${pkg.script.word_count} words · ${pkg.script.language}`}>
+              <pre className="script-pre">{pkg.script.text}</pre>
+            </Collapsible>
+          )}
+
+          {/* Storyboard */}
+          {pkg.storyboard && pkg.storyboard.scenes.length > 0 && (
+            <Collapsible
+              title={`Storyboard · ${pkg.storyboard.scenes.length} scenes · ${fmtSeconds(pkg.storyboard.total_duration_estimate)}`}
+              defaultOpen
+            >
+              <div className="scene-list">
+                {pkg.storyboard.scenes.map(s => (
+                  <SceneCard key={s.scene_number} scene={s} imageRef={imageMap[s.scene_number]} />
+                ))}
+              </div>
+            </Collapsible>
+          )}
+
+          {/* Video */}
+          <div className="video-section card">
+            <div className="video-section-header">
+              <strong>Video</strong>
+              {videoStage && <span className="small">{videoStage}</span>}
+              {!videoStage && videoReady && pkg.video && (
+                <span className="small">{fmtSeconds(pkg.video.duration_seconds)} · {pkg.video.width}×{pkg.video.height}</span>
+              )}
+            </div>
+
+            {videoReady && pkg.video ? (
+              <div className="actions">
+                <a href={resolveVideoUrl(pkg.video.id)} className="dl-btn dl-btn-primary" download>
+                  Download MP4
+                </a>
+                {pkg.video.has_subtitles && <span className="small">with subtitles</span>}
+              </div>
+            ) : (
+              <div className="actions">
+                <button onClick={startVideo} disabled={videoLoading || !articleId}>
+                  {videoLoading ? 'Generating…' : 'Generate Video'}
+                </button>
+                {!videoLoading && (
+                  <span className="small">DALL-E scene images + FFmpeg assembly · ~2–5 min</span>
+                )}
+              </div>
+            )}
+
+            {videoError && <div className="error-text">{videoError}</div>}
+
+            {pkg.images && pkg.images.length > 0 && (
+              <div className="image-status-row small" style={{ marginTop: 8 }}>
+                {pkg.images.map(img => (
+                  <span
+                    key={img.id}
+                    className={`img-dot ${img.status === 'ready' ? 'img-dot-ok' : 'img-dot-fail'}`}
+                    title={`Scene ${img.scene_number}: ${img.status} — ${img.visual_prompt.slice(0, 60)}`}
+                  />
+                ))}
+                <span>{pkg.images.filter(i => i.status === 'ready').length}/{pkg.images.length} images</span>
+              </div>
+            )}
+          </div>
+
+        </div>
+      )}
+
     </div>
   )
 }

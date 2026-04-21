@@ -86,3 +86,46 @@ class VoiceCalibration(Base):
 
     wpm_estimate: Mapped[float] = mapped_column(Float, nullable=False, default=140.0)
     samples: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+
+class ImageAsset(Base):
+    __tablename__ = "image_assets"
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    article_id: Mapped[str] = mapped_column(ForeignKey("articles.id", ondelete="CASCADE"), nullable=False)
+
+    scene_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    visual_prompt: Mapped[str] = mapped_column(Text, nullable=False)
+    file_path: Mapped[str] = mapped_column(String, nullable=False)
+    provider: Mapped[str] = mapped_column(String, default="openai", nullable=False)
+    model: Mapped[str] = mapped_column(String, default="dall-e-3", nullable=False)
+    status: Mapped[str] = mapped_column(String, default="created", nullable=False)  # created|ready|failed
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+
+    __table_args__ = (
+        Index("ix_image_assets_article_scene", "article_id", "scene_number"),
+    )
+
+
+class VideoAsset(Base):
+    __tablename__ = "video_assets"
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    article_id: Mapped[str] = mapped_column(ForeignKey("articles.id", ondelete="CASCADE"), nullable=False)
+    audio_asset_id: Mapped[str | None] = mapped_column(
+        ForeignKey("audio_assets.id", ondelete="SET NULL"), nullable=True
+    )
+
+    file_path: Mapped[str] = mapped_column(String, nullable=False)
+    format: Mapped[str] = mapped_column(String, default="mp4", nullable=False)
+    duration_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)
+    width: Mapped[int] = mapped_column(Integer, default=1080, nullable=False)
+    height: Mapped[int] = mapped_column(Integer, default=1920, nullable=False)
+    has_subtitles: Mapped[bool] = mapped_column(Integer, default=True, nullable=False)  # SQLite-safe bool
+
+    status: Mapped[str] = mapped_column(String, default="created", nullable=False)  # created|ready|failed
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+
+    __table_args__ = (
+        Index("ix_video_assets_article_created", "article_id", "created_at"),
+    )

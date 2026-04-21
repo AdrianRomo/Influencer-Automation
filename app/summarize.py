@@ -10,8 +10,8 @@ client = OpenAI()
 DEFAULT_TARGET_SECONDS = int(os.getenv("TTS_TARGET_SECONDS", "180"))
 
 # Output languages
-OUTPUT_LANGUAGE = os.getenv("TTS_OUTPUT_LANGUAGE", "es-MX")          # force narration language
-IMAGE_PROMPT_LANGUAGE = os.getenv("IMAGE_PROMPT_LANGUAGE", "en")    # prompts for image generation
+OUTPUT_LANGUAGE = os.getenv("TTS_OUTPUT_LANGUAGE", "es-MX")  # force narration language
+IMAGE_PROMPT_LANGUAGE = os.getenv("IMAGE_PROMPT_LANGUAGE", "en")  # prompts for image generation
 
 # Typical narration pacing; tune per your voice later
 WPM_EN = int(os.getenv("TTS_WPM_EN", "140"))
@@ -51,31 +51,70 @@ End with the brief medical disclaimer in Spanish.
 """
 
 SYSTEM_STORYBOARD = """You create a compact storyboard for short-form narrated news videos.
-Return JSON only. No markdown. No extra text.
+Return a JSON array only. No markdown fences. No extra text outside the array.
 """
+
+
+def _normalize_scene(raw: dict, index: int) -> dict:
+    """Coerce an LLM-returned scene dict into the canonical field set.
+
+    Handles both old format (scene/image_prompt) and new format
+    (scene_number/visual_prompt) so the pipeline degrades gracefully.
+    """
+    return {
+        "scene_number": raw.get("scene_number") or raw.get("scene") or (index + 1),
+        "narration": raw.get("narration", ""),
+        "visual_prompt": raw.get("visual_prompt") or raw.get("image_prompt", ""),
+        "on_screen_text": raw.get("on_screen_text", ""),
+        "asset_type": raw.get("asset_type", "b-roll"),
+        "transition": raw.get("transition", "cut"),
+        "notes": raw.get("notes"),
+    }
+
+
+def _compute_scene_timing(scenes: list[dict], wpm: float) -> list[dict]:
+    """Add start_time_estimate and duration_estimate to each scene.
+
+    Uses calibrated WPM from voice synthesis so estimates match actual audio.
+    """
+    enriched = []
+    start = 0.0
+    for s in scenes:
+        words = _count_words(s.get("narration", ""))
+        duration = round((words / max(wpm, 1)) * 60.0, 1)
+        enriched.append({**s, "start_time_estimate": round(start, 1), "duration_estimate": duration})
+        start += duration
+    return enriched
+
 
 def _count_words(text: str) -> int:
     tokens = re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ0-9]+(?:'[A-Za-z]+)?", text)
     return len(tokens)
 
+
 def _is_spanish(lang: Optional[str]) -> bool:
     return bool(lang) and lang.lower().startswith("es")
 
+
 def _pick_wpm(output_language: Optional[str]) -> int:
     return WPM_ES if _is_spanish(output_language) else WPM_EN
+
 
 def _estimate_seconds(word_count: int, output_language: Optional[str]) -> int:
     wpm = _pick_wpm(output_language)
     return int(round((word_count / max(wpm, 1)) * 60))
 
+
 def _target_words(target_seconds: int, output_language: Optional[str]) -> int:
     wpm = _pick_wpm(output_language)
     return int(round(target_seconds * (wpm / 60.0)))
 
-def _tolerance_words(target_seconds: int, output_language: Optional[str]) -> int:
+
+def _tolerance_words(tolerance_seconds=TOLERANCE_SECONDS, output_language=None) -> int:
     wpm = _pick_wpm(output_language)
     # words spoken in tolerance window (e.g., 30s)
-    return int(round(TOLERANCE_SECONDS * (wpm / 60.0)))
+    return int(round(tolerance_seconds * (wpm / 60.0)))
+
 
 def _call_llm(system: str, user: str, model: str, temperature: float = 0.3) -> str:
     resp = client.responses.create(
@@ -89,14 +128,15 @@ def _call_llm(system: str, user: str, model: str, temperature: float = 0.3) -> s
     )
     return (resp.output_text or "").strip()
 
+
 def make_tts_script(
-    title: str,
-    body: str,
-    language_hint: str | None = None,
-    target_seconds: int = DEFAULT_TARGET_SECONDS,
-    output_language: str = OUTPUT_LANGUAGE,
-    target_words: int | None = None,
-    tol_words: int | None = None,
+        title: str,
+        body: str,
+        language_hint: str | None = None,
+        target_seconds: int = DEFAULT_TARGET_SECONDS,
+        output_language: str = OUTPUT_LANGUAGE,
+        target_words: int | None = None,
+        tol_words: int | None = None,
 ) -> str:
     """
     Returns a narration-ready script aimed at ~target_seconds, always in Spanish by default.
@@ -105,11 +145,13 @@ def make_tts_script(
     model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
     target = target_words or _target_words(target_seconds, output_language)
     tol = tol_words or _tolerance_words(target_seconds, output_language)
-
+    src_hint = language_hint or "auto-detect"
     prompt = f"""TITLE: {title}
 
 ARTICLE TEXT:
 {body}
+
+Input Language (hint): {src_hint}
 
 Output language:
 - Spanish ({output_language}) only.
@@ -141,16 +183,21 @@ SCRIPT:
 
     return script.strip()
 
+
 def make_storyboard(
-    title: str,
-    script: str,
-    language_hint: str | None = None,
-    n_scenes: int = DEFAULT_SCENES,
-    image_prompt_language: str = IMAGE_PROMPT_LANGUAGE,
+        title: str,
+        script: str,
+        language_hint: str | None = None,
+        n_scenes: int = DEFAULT_SCENES,
+        image_prompt_language: str = IMAGE_PROMPT_LANGUAGE,
+        wpm_estimate: float | None = None,
 ) -> List[Dict[str, Any]]:
-    """
-    Returns a list of scenes with image prompts aligned to the narration.
-    narration stays in Spanish (from script); image prompts can be English for better image-gen.
+    """Return timing-enriched scene list aligned to the narration script.
+
+    Narration stays in Spanish; visual_prompt and on_screen_text are in
+    image_prompt_language (English by default) for better image-gen compatibility.
+    Timing is computed in Python from word counts + WPM so it matches the actual
+    voice synthesis cadence rather than relying on LLM guesses.
     """
     if n_scenes <= 0:
         return []
@@ -158,14 +205,14 @@ def make_storyboard(
 
     user = f"""
 Create {n_scenes} scenes for a narrated video based on the script.
-Rules:
-- "narration" must be Spanish, aligned to the script (1–2 sentences; no new facts).
-- "image_prompt" language must be: {image_prompt_language}.
-- Each scene has:
-  - scene (int starting at 1)
-  - narration
-  - image_prompt (visual description; no text overlays; no logos; avoid gore; medical-appropriate)
-Return JSON only: an array of objects.
+
+Return a JSON array where each object has exactly these fields:
+- scene_number: integer starting at 1
+- narration: Spanish, 1-2 sentences directly from the script. No new facts.
+- visual_prompt: {image_prompt_language} description for image/video generation. No text overlays. No logos. Medical-appropriate.
+- on_screen_text: a 1-4 word {image_prompt_language} phrase to show as a text overlay on the video frame.
+- asset_type: one of "b-roll", "title-card", or "outro". Use "title-card" for scene 1 and "outro" for the last scene.
+- transition: always "cut" for this content type.
 
 TITLE: {title}
 
@@ -177,24 +224,28 @@ SCRIPT:
     try:
         data = json.loads(raw)
         if isinstance(data, list):
-            return data
+            scenes = [_normalize_scene(s, i) for i, s in enumerate(data)]
+        else:
+            scenes = []
     except Exception:
-        pass
-    return []
+        scenes = []
+
+    wpm = wpm_estimate or float(_pick_wpm(OUTPUT_LANGUAGE))
+    return _compute_scene_timing(scenes, wpm)
+
 
 def make_tts_bundle(
-    title: str,
-    body: str,
-    language_hint: str | None = None,
-    target_seconds: int = DEFAULT_TARGET_SECONDS,
-    n_scenes: int = DEFAULT_SCENES,
-    output_language: str = OUTPUT_LANGUAGE,
-    target_words: int | None = None,
-    tol_words: int | None = None,
+        title: str,
+        body: str,
+        language_hint: str | None = None,
+        target_seconds: int = DEFAULT_TARGET_SECONDS,
+        n_scenes: int = DEFAULT_SCENES,
+        output_language: str = OUTPUT_LANGUAGE,
+        target_words: int | None = None,
+        tol_words: int | None = None,
+        wpm_estimate: float | None = None,
 ) -> Dict[str, Any]:
-    """
-    Convenience: script + metadata + storyboard in one call.
-    """
+    """Convenience: script + metadata + timing-enriched storyboard in one call."""
     script = make_tts_script(
         title, body,
         language_hint=language_hint,
@@ -205,7 +256,13 @@ def make_tts_bundle(
     )
     wc = _count_words(script)
     est = _estimate_seconds(wc, output_language)
-    scenes = make_storyboard(title, script, language_hint=language_hint, n_scenes=n_scenes)
+    scenes = make_storyboard(
+        title, script,
+        language_hint=language_hint,
+        n_scenes=n_scenes,
+        wpm_estimate=wpm_estimate,
+    )
+    total_duration = sum(s.get("duration_estimate", 0.0) for s in scenes)
 
     return {
         "script": script,
@@ -213,11 +270,14 @@ def make_tts_bundle(
         "estimated_seconds": est,
         "target_seconds": target_seconds,
         "scenes": scenes,
+        "total_duration_estimate": round(total_duration, 1),
         "output_language": output_language,
     }
 
+
 def _words_for_seconds(seconds: int, wpm: float) -> int:
     return int(round(seconds * (wpm / 60.0)))
+
 
 def rewrite_to_target_words(script: str, target_words: int, tol_words: int = 10) -> str:
     model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
