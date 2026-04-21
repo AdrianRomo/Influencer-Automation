@@ -7,18 +7,13 @@ import os
 from datetime import datetime, timedelta
 from typing import Optional
 
+import bcrypt
 from cryptography.fernet import Fernet
 from jose import JWTError, jwt
-from passlib.context import CryptContext
 
 SECRET_KEY = os.getenv("SECRET_KEY", "INSECURE-please-set-SECRET_KEY-in-env")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("JWT_EXPIRE_MINUTES", "10080"))  # 7 days
-
-# bcrypt_sha256 pre-hashes with HMAC-SHA256 before bcrypt, bypassing bcrypt's
-# 72-byte limit while also preventing password-length side-channels.
-_pwd_context = CryptContext(schemes=["bcrypt_sha256"], deprecated="auto")
-
 
 _fernet_instance: Fernet | None = None
 
@@ -32,13 +27,19 @@ def _fernet() -> Fernet:
 
 
 # ── Passwords ──────────────────────────────────────────────────────────────
+# SHA-256 pre-hash keeps the bcrypt input at exactly 32 bytes, safely under
+# bcrypt's 72-byte limit regardless of password length or bcrypt version.
+
+def _prehash(password: str) -> bytes:
+    return hashlib.sha256(password.encode("utf-8")).digest()
+
 
 def hash_password(password: str) -> str:
-    return _pwd_context.hash(password)
+    return bcrypt.hashpw(_prehash(password), bcrypt.gensalt(rounds=12)).decode("utf-8")
 
 
 def verify_password(plain: str, hashed: str) -> bool:
-    return _pwd_context.verify(plain, hashed)
+    return bcrypt.checkpw(_prehash(plain), hashed.encode("utf-8"))
 
 
 # ── JWT ────────────────────────────────────────────────────────────────────
