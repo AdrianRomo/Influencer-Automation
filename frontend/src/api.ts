@@ -1,5 +1,5 @@
 import type {
-  ArticleSummary, Source, GenerateReq, GenerateResp, JobStatus, ContentPackage,
+  ArticleSummary, PaginatedArticles, Source, GenerateReq, GenerateResp, JobStatus, ContentPackage,
   TokenResp, UserResp, UserKeysIn, UserKeysOut,
 } from './types'
 
@@ -64,13 +64,13 @@ export function listSources(): Promise<Source[]> {
   return http<Source[]>('/sources')
 }
 
-export function listArticles(params?: { source_id?: string; limit?: number; offset?: number }): Promise<ArticleSummary[]> {
+export function listArticles(params?: { source_id?: string; limit?: number; offset?: number }): Promise<PaginatedArticles> {
   const q = new URLSearchParams()
   if (params?.source_id) q.set('source_id', params.source_id)
   if (params?.limit != null) q.set('limit', String(params.limit))
   if (params?.offset != null) q.set('offset', String(params.offset))
   const qs = q.toString()
-  return http<ArticleSummary[]>(`/articles${qs ? `?${qs}` : ''}`)
+  return http<PaginatedArticles>(`/articles${qs ? `?${qs}` : ''}`)
 }
 
 export function startGenerate(req: GenerateReq): Promise<GenerateResp> {

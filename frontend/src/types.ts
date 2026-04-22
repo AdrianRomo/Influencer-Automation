@@ -48,6 +48,12 @@ export type ArticleSummary = {
   analysis_impact?: number | null
 }
 
+export type PaginatedArticles = {
+  items: ArticleSummary[]
+  total: number
+  has_more: boolean
+}
+
 export type GenerateReq = {
   source_id: string
   voice_id?: string | null

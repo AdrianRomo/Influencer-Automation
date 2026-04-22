@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type {
   AnalysisResult, ArticleSummary, ContentPackage, GenerateReq, ImageAssetRef,
   JobStatus, Source, StoryboardScene, UserResp, UserKeysOut,
@@ -50,6 +50,25 @@ const STATE_LABELS: Record<string, string> = {
 function stageLabel(s: JobStatus): string {
   if (s.state === 'PROGRESS' && s.meta?.msg) return s.meta.msg
   return STATE_LABELS[s.state] ?? s.state
+}
+
+// ── Toast system ───────────────────────────────────────────────────────────
+
+type ToastKind = 'success' | 'error' | 'info'
+type Toast = { id: number; kind: ToastKind; msg: string }
+
+let _toastSeq = 0
+
+function ToastContainer({ toasts, onDismiss }: { toasts: Toast[]; onDismiss: (id: number) => void }) {
+  return (
+    <div className="toast-container">
+      {toasts.map(t => (
+        <div key={t.id} className={`toast toast-${t.kind}`} onClick={() => onDismiss(t.id)}>
+          {t.msg}
+        </div>
+      ))}
+    </div>
+  )
 }
 
 // ── Auth Modal ─────────────────────────────────────────────────────────────
@@ -257,6 +276,7 @@ function SceneCard({
   onMoveDown,
   isFirst,
   isLast,
+  onToast,
 }: {
   scene: StoryboardScene
   imageRef?: ImageAssetRef
@@ -266,6 +286,7 @@ function SceneCard({
   onMoveDown?: () => void
   isFirst?: boolean
   isLast?: boolean
+  onToast?: (kind: ToastKind, msg: string) => void
 }) {
   const fileRef = useRef<HTMLInputElement>(null)
   const [uploading, setUploading] = useState(false)
@@ -278,6 +299,7 @@ function SceneCard({
     setUploadErr('')
     try {
       await uploadSceneImage(articleId, scene.scene_number, file)
+      onToast?.('success', `Image uploaded for scene ${scene.scene_number}`)
       onImageUploaded?.()
     } catch (err: unknown) {
       setUploadErr(String((err as Error)?.message ?? err))
@@ -462,8 +484,25 @@ export default function App() {
   const [scriptSaveError, setScriptSaveError] = useState('')
   const [regenScriptLoading, setRegenScriptLoading] = useState(false)
 
-  // ── History ─────────────────────────────────────────────────────────────
+  // ── History + pagination ─────────────────────────────────────────────────
   const [history, setHistory] = useState<ArticleSummary[]>([])
+  const [historyTotal, setHistoryTotal] = useState(0)
+  const [historyHasMore, setHistoryHasMore] = useState(false)
+  const [historyLoadingMore, setHistoryLoadingMore] = useState(false)
+  const HISTORY_PAGE = 20
+
+  // ── Toasts ───────────────────────────────────────────────────────────────
+  const [toasts, setToasts] = useState<Toast[]>([])
+
+  const addToast = useCallback((kind: ToastKind, msg: string) => {
+    const id = ++_toastSeq
+    setToasts(prev => [...prev, { id, kind, msg }])
+    window.setTimeout(() => setToasts(prev => prev.filter(t => t.id !== id)), 3000)
+  }, [])
+
+  const dismissToast = useCallback((id: number) => {
+    setToasts(prev => prev.filter(t => t.id !== id))
+  }, [])
 
   // ── Bootstrap: validate stored JWT, then load user + keys ──────────────
   useEffect(() => {
@@ -567,10 +606,25 @@ export default function App() {
 
   async function loadHistory() {
     try {
-      const articles = await listArticles({ limit: 30 })
-      setHistory(articles)
+      const resp = await listArticles({ limit: HISTORY_PAGE, offset: 0 })
+      setHistory(resp.items)
+      setHistoryTotal(resp.total)
+      setHistoryHasMore(resp.has_more)
     } catch {
       // History is best-effort
+    }
+  }
+
+  async function loadMoreHistory() {
+    setHistoryLoadingMore(true)
+    try {
+      const resp = await listArticles({ limit: HISTORY_PAGE, offset: history.length })
+      setHistory(prev => [...prev, ...resp.items])
+      setHistoryHasMore(resp.has_more)
+    } catch {
+      // best-effort
+    } finally {
+      setHistoryLoadingMore(false)
     }
   }
 
@@ -728,13 +782,47 @@ export default function App() {
     setScriptEditing(false); setScriptSaveError('')
   }
 
+  // ── Side effects ───────────────────────────────────────────────────────────
+
+  // Page title
+  useEffect(() => {
+    document.title = pkg?.title
+      ? `${pkg.title.slice(0, 50)} — Medical Content Generator`
+      : 'Medical Content Generator'
+  }, [pkg?.title])
+
+  // Cmd/Ctrl+Enter → generate audio
+  useEffect(() => {
+    function onKey(e: KeyboardEvent) {
+      if ((e.metaKey || e.ctrlKey) && e.key === 'Enter' && !loading && sourceId && !showAuthModal) {
+        e.preventDefault()
+        startAudio()
+      }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [loading, sourceId, showAuthModal])
+
+  // Warn before leaving when script has unsaved edits
+  useEffect(() => {
+    if (!scriptEditing) return
+    function onBeforeUnload(e: BeforeUnloadEvent) {
+      e.preventDefault()
+      e.returnValue = ''
+    }
+    window.addEventListener('beforeunload', onBeforeUnload)
+    return () => window.removeEventListener('beforeunload', onBeforeUnload)
+  }, [scriptEditing])
+
   // ── Pin / reorder ──────────────────────────────────────────────────────────
 
   async function handlePinArticle(id: string, pinned: boolean) {
     try {
       await pinArticle(id, pinned)
       setHistory(h => h.map(a => a.id === id ? { ...a, is_pinned: pinned } : a))
-    } catch { /* pin failure is non-fatal */ }
+      addToast('success', pinned ? 'Article pinned' : 'Article unpinned')
+    } catch { addToast('error', 'Failed to update pin') }
   }
 
   async function handleReorderScene(fromIdx: number, toIdx: number) {
@@ -773,6 +861,7 @@ export default function App() {
       const updated = await getArticlePackage(articleId)
       setPkg(updated)
       setScriptEditing(false)
+      addToast('success', 'Script saved')
     } catch (e: unknown) {
       setScriptSaveError(String((e as Error)?.message ?? e))
     } finally {
@@ -996,23 +1085,40 @@ export default function App() {
       </div>
 
       {/* History */}
-      {history.length > 0 && (
-        <div style={{ marginTop: 12 }}>
-          <Collapsible title={`History · ${history.length} articles`}>
-            <div className="history-list">
-              {history.map(a => (
-                <HistoryRow
-                  key={a.id}
-                  article={a}
-                  sources={sources}
-                  onLoad={loadFromHistory}
-                  onPin={handlePinArticle}
-                />
-              ))}
+      <div style={{ marginTop: 12 }}>
+        <Collapsible title={`History · ${historyTotal} article${historyTotal !== 1 ? 's' : ''}`}>
+          {history.length === 0 ? (
+            <div className="history-empty">
+              No articles yet. Generate your first one above.
             </div>
-          </Collapsible>
-        </div>
-      )}
+          ) : (
+            <>
+              <div className="history-list">
+                {history.map(a => (
+                  <HistoryRow
+                    key={a.id}
+                    article={a}
+                    sources={sources}
+                    onLoad={loadFromHistory}
+                    onPin={handlePinArticle}
+                  />
+                ))}
+              </div>
+              {historyHasMore && (
+                <div style={{ textAlign: 'center', padding: '10px 0' }}>
+                  <button
+                    className="secondary settings-btn"
+                    onClick={loadMoreHistory}
+                    disabled={historyLoadingMore}
+                  >
+                    {historyLoadingMore ? 'Loading…' : `Load More (${historyTotal - history.length} remaining)`}
+                  </button>
+                </div>
+              )}
+            </>
+          )}
+        </Collapsible>
+      </div>
 
       {/* Package loading spinner */}
       {pkgLoading && (
@@ -1073,7 +1179,9 @@ export default function App() {
                   </button>
                   <button
                     className="secondary settings-btn"
-                    onClick={() => pkg?.script?.text && navigator.clipboard.writeText(pkg.script.text).catch(() => {})}
+                    onClick={() => pkg?.script?.text && navigator.clipboard.writeText(pkg.script.text)
+                      .then(() => addToast('success', 'Script copied to clipboard'))
+                      .catch(() => addToast('error', 'Clipboard access denied'))}
                     title="Copy script to clipboard"
                   >Copy</button>
                 </div>
@@ -1091,7 +1199,13 @@ export default function App() {
                       {scriptSaving ? 'Saving…' : 'Save Script'}
                     </button>
                     <button className="secondary" onClick={handleScriptCancel}>Cancel</button>
-                    <span className="small">{scriptDraft.split(/\s+/).filter(Boolean).length} words</span>
+                    <span className="small">
+                      {(() => {
+                        const wc = scriptDraft.split(/\s+/).filter(Boolean).length
+                        const estSec = Math.round(wc / 2.5)
+                        return `${wc} words · ~${fmtSeconds(estSec)}`
+                      })()}
+                    </span>
                   </div>
                   {scriptSaveError && <div className="error-text">{scriptSaveError}</div>}
                 </div>
@@ -1119,6 +1233,7 @@ export default function App() {
                     onMoveDown={idx < pkg.storyboard!.scenes.length - 1 ? () => handleReorderScene(idx, idx + 1) : undefined}
                     isFirst={idx === 0}
                     isLast={idx === pkg.storyboard!.scenes.length - 1}
+                    onToast={addToast}
                   />
                 ))}
               </div>
@@ -1205,6 +1320,7 @@ export default function App() {
         </div>
       )}
 
+      <ToastContainer toasts={toasts} onDismiss={dismissToast} />
     </div>
   )
 }

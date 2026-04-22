@@ -1,16 +1,42 @@
 import io
+import json
+import logging
 import os
 import zipfile
+from collections import defaultdict
 from contextlib import asynccontextmanager
 from datetime import datetime
-from fastapi import FastAPI, Depends, File, HTTPException, Header, Query, UploadFile
-from fastapi.responses import FileResponse, Response
+from time import time as _time
+from fastapi import FastAPI, Depends, File, HTTPException, Header, Query, Request, UploadFile
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from celery.result import AsyncResult
+from redis import Redis as RedisClient
 from sqlalchemy import select, func, delete
 from sqlalchemy.orm import Session
 from typing import Literal, Optional
+
+logger = logging.getLogger(__name__)
+
+# ── Auth rate limiting (in-memory, single-instance) ────────────────────────
+# For multi-worker deployments, replace with Redis-backed rate limiting.
+_auth_attempts: dict[str, list[float]] = defaultdict(list)
+_AUTH_WINDOW = 60   # seconds
+_AUTH_MAX = 10      # max attempts per window per IP
+
+
+def _check_auth_rate(request: Request) -> None:
+    ip = (request.client.host if request.client else None) or "unknown"
+    now = _time()
+    recent = [t for t in _auth_attempts[ip] if now - t < _AUTH_WINDOW]
+    if len(recent) >= _AUTH_MAX:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Too many authentication attempts — please wait {_AUTH_WINDOW}s",
+        )
+    recent.append(now)
+    _auth_attempts[ip] = recent
 
 from app.auth import (
     create_access_token, decode_access_token,
@@ -129,14 +155,47 @@ class GenerateVideoReq(BaseModel):
 # ── Health ─────────────────────────────────────────────────────────────────
 
 @app.get("/health")
-def health():
-    return {"ok": True}
+def health(db: Session = Depends(get_db)):
+    """Returns service health including DB and Redis reachability."""
+    status = "ok"
+    db_status = "ok"
+    redis_status = "ok"
+
+    try:
+        db.execute(func.now())
+    except Exception as exc:
+        logger.error("Health check DB error: %s", exc)
+        db_status = "error"
+        status = "degraded"
+
+    try:
+        redis_url = os.getenv("CELERY_BROKER_URL", "redis://redis:6379/0")
+        rc = RedisClient.from_url(redis_url, socket_connect_timeout=1)
+        rc.ping()
+    except Exception as exc:
+        logger.error("Health check Redis error: %s", exc)
+        redis_status = "error"
+        status = "degraded"
+
+    return JSONResponse(
+        status_code=200 if status == "ok" else 503,
+        content={"status": status, "db": db_status, "redis": redis_status},
+    )
+
+
+# ── Global exception handler ───────────────────────────────────────────────
+
+@app.exception_handler(Exception)
+async def _unhandled_exception(request: Request, exc: Exception):
+    logger.exception("Unhandled error on %s %s", request.method, request.url.path)
+    return JSONResponse(status_code=500, content={"detail": "Internal server error"})
 
 
 # ── Auth ───────────────────────────────────────────────────────────────────
 
 @app.post("/auth/register", response_model=TokenResp)
-def register(req: RegisterReq, db: Session = Depends(get_db)):
+def register(req: RegisterReq, request: Request, db: Session = Depends(get_db)):
+    _check_auth_rate(request)
     email = req.email.lower().strip()
     if db.execute(select(User).where(User.email == email)).scalar_one_or_none():
         raise HTTPException(status_code=409, detail="Email already registered")
@@ -153,7 +212,8 @@ def register(req: RegisterReq, db: Session = Depends(get_db)):
 
 
 @app.post("/auth/login", response_model=TokenResp)
-def login(req: LoginReq, db: Session = Depends(get_db)):
+def login(req: LoginReq, request: Request, db: Session = Depends(get_db)):
+    _check_auth_rate(request)
     email = req.email.lower().strip()
     user = db.execute(select(User).where(User.email == email)).scalar_one_or_none()
     if not user or not verify_password(req.password, user.hashed_password):
@@ -275,8 +335,18 @@ def list_articles(
     if pinned is not None:
         q = q.where(Article.is_pinned == pinned)
 
+    # Count total matching rows (ignoring limit/offset)
+    count_q = select(func.count(Article.id))
+    if source_id:
+        count_q = count_q.where(Article.source_id == source_id)
+    if current_user:
+        count_q = count_q.where(Article.user_id == current_user.id)
+    if pinned is not None:
+        count_q = count_q.where(Article.is_pinned == pinned)
+    total: int = db.execute(count_q).scalar_one()
+
     rows = db.execute(q).all()
-    return [
+    items = [
         {
             "id": r.Article.id,
             "title": r.Article.title,
@@ -291,6 +361,7 @@ def list_articles(
         }
         for r in rows
     ]
+    return {"items": items, "total": total, "has_more": (offset + len(items)) < total}
 
 
 @app.get("/articles/{article_id}", response_model=ArticleResponse, dependencies=[Depends(check_api_key)])
@@ -583,7 +654,7 @@ async def upload_scene_image(
 
 
 class ScriptEditReq(BaseModel):
-    text: str
+    text: str = Field(..., min_length=1, max_length=20000)
 
 
 @app.patch("/articles/{article_id}/script", dependencies=[Depends(check_api_key)])
