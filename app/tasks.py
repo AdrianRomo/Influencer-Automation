@@ -69,6 +69,33 @@ def _speed_key(speed: float) -> float:
     return round(speed, 2)
 
 
+def _score_entry(entry, now: datetime) -> float:
+    """Score an RSS entry for content richness. Higher score = better pick.
+
+    Combines recency, title quality, and summary length so the pipeline
+    prefers substantive recent articles over stale or thin ones.
+    """
+    score = 0.0
+    # Recency (0–5): linear decay over 5 days
+    dt = _parse_dt(entry)
+    if dt:
+        age_days = max((now - dt).total_seconds() / 86_400, 0)
+        score += max(0.0, 5.0 - age_days)
+    # Title quality (0–3): prefer informative titles in the 30–150 char range
+    title = (entry.get("title") or "").strip()
+    if 30 <= len(title) <= 150:
+        score += 3
+    elif len(title) > 10:
+        score += 1
+    # Summary richness (0–2): longer fallback text = richer source content available
+    summary = (entry.get("summary") or entry.get("description") or "").strip()
+    if len(summary) > 300:
+        score += 2
+    elif len(summary) > 80:
+        score += 1
+    return score
+
+
 @celery_app.task(name="generate_all_sources_daily")
 def generate_all_sources_daily() -> dict:
     """Dispatch audio generation for every source. Triggered by Celery Beat."""
@@ -122,7 +149,8 @@ def generate_latest_for_source(
         cutoff = datetime.utcnow() - timedelta(days=lookback_days)
 
         candidates = [e for e in feed.entries if _parse_dt(e) and _parse_dt(e) >= cutoff]
-        entry = candidates[0] if candidates else feed.entries[0]
+        now = datetime.utcnow()
+        entry = max(candidates, key=lambda e: _score_entry(e, now)) if candidates else feed.entries[0]
         title = (entry.get("title") or "").strip() or "Untitled"
         url = (entry.get("link") or "").strip()
         if not url:

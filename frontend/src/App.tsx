@@ -5,8 +5,9 @@ import type {
 } from './types'
 import {
   cancelJob, editScript, getArticlePackage, getExportZipUrl, jobStatus, listArticles,
-  listSources, regenerateStage, resolveAudioUrl, resolveCaptionUrl, resolveImageUrl,
-  resolveVideoUrl, setApiKey, startGenerate, startGenerateVideo, startRegenerateScript,
+  listSources, pinArticle, regenerateStage, reorderStoryboard, resolveAudioUrl,
+  resolveCaptionUrl, resolveImageUrl, resolveVideoUrl, setApiKey, startGenerate,
+  startGenerateVideo, startRegenerateScript, uploadSceneImage,
   register, login, getMe, getUserKeys, saveUserKeys,
   setAuthToken, clearAuthToken,
 } from './api'
@@ -247,7 +248,45 @@ function Collapsible({ title, children, defaultOpen = false }: {
   )
 }
 
-function SceneCard({ scene, imageRef }: { scene: StoryboardScene; imageRef?: ImageAssetRef }) {
+function SceneCard({
+  scene,
+  imageRef,
+  articleId,
+  onImageUploaded,
+  onMoveUp,
+  onMoveDown,
+  isFirst,
+  isLast,
+}: {
+  scene: StoryboardScene
+  imageRef?: ImageAssetRef
+  articleId?: string
+  onImageUploaded?: () => void
+  onMoveUp?: () => void
+  onMoveDown?: () => void
+  isFirst?: boolean
+  isLast?: boolean
+}) {
+  const fileRef = useRef<HTMLInputElement>(null)
+  const [uploading, setUploading] = useState(false)
+  const [uploadErr, setUploadErr] = useState('')
+
+  async function handleFile(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0]
+    if (!file || !articleId) return
+    setUploading(true)
+    setUploadErr('')
+    try {
+      await uploadSceneImage(articleId, scene.scene_number, file)
+      onImageUploaded?.()
+    } catch (err: unknown) {
+      setUploadErr(String((err as Error)?.message ?? err))
+    } finally {
+      setUploading(false)
+      if (fileRef.current) fileRef.current.value = ''
+    }
+  }
+
   return (
     <div className="scene-card">
       <div className="scene-card-header">
@@ -255,6 +294,24 @@ function SceneCard({ scene, imageRef }: { scene: StoryboardScene; imageRef?: Ima
         <span className={assetBadgeClass(scene.asset_type)}>{scene.asset_type}</span>
         <span className="scene-time">{fmtSeconds(scene.start_time_estimate)}</span>
         <span className="scene-dur">{fmtSeconds(scene.duration_estimate)}</span>
+        {(onMoveUp || onMoveDown) && (
+          <div className="scene-reorder">
+            <button
+              className="secondary settings-btn"
+              style={{ padding: '2px 7px', fontSize: 11, opacity: isFirst ? 0.3 : 1 }}
+              onClick={onMoveUp}
+              disabled={isFirst}
+              title="Move up"
+            >↑</button>
+            <button
+              className="secondary settings-btn"
+              style={{ padding: '2px 7px', fontSize: 11, opacity: isLast ? 0.3 : 1 }}
+              onClick={onMoveDown}
+              disabled={isLast}
+              title="Move down"
+            >↓</button>
+          </div>
+        )}
       </div>
       <div className="scene-card-content">
         <div className="scene-card-text">
@@ -263,6 +320,20 @@ function SceneCard({ scene, imageRef }: { scene: StoryboardScene; imageRef?: Ima
           )}
           <div className="scene-narration">{scene.narration}</div>
           <div className="scene-visual small">{scene.visual_prompt}</div>
+          {articleId && (
+            <div style={{ marginTop: 6 }}>
+              <input ref={fileRef} type="file" accept="image/*" style={{ display: 'none' }} onChange={handleFile} />
+              <button
+                className="secondary settings-btn"
+                style={{ fontSize: 11, padding: '3px 8px' }}
+                onClick={() => fileRef.current?.click()}
+                disabled={uploading}
+              >
+                {uploading ? 'Uploading…' : imageRef?.status === 'ready' ? 'Replace Image' : 'Upload Image'}
+              </button>
+              {uploadErr && <div className="error-text" style={{ fontSize: 11, marginTop: 2 }}>{uploadErr}</div>}
+            </div>
+          )}
         </div>
         {imageRef?.status === 'ready' && (
           <a href={resolveImageUrl(imageRef.id)} target="_blank" rel="noreferrer" className="scene-thumb-link">
@@ -299,10 +370,11 @@ function AnalysisCard({ analysis }: { analysis: AnalysisResult }) {
   )
 }
 
-function HistoryRow({ article, sources, onLoad }: {
+function HistoryRow({ article, sources, onLoad, onPin }: {
   article: ArticleSummary
   sources: Source[]
   onLoad: (id: string) => void
+  onPin?: (id: string, pinned: boolean) => void
 }) {
   const sourceName = sources.find(s => String(s.id) === String(article.source_id))?.name ?? article.source_id
   return (
@@ -319,6 +391,23 @@ function HistoryRow({ article, sources, onLoad }: {
         <span className="small">{relativeDate(article.created_at)}</span>
         {article.has_audio && <span className="badge badge-audio">audio</span>}
         {article.has_video && <span className="badge badge-video">video</span>}
+        {article.analysis_sentiment && (
+          <span className={`analysis-badge analysis-${article.analysis_sentiment}`} style={{ fontSize: 9 }}>
+            {article.analysis_sentiment}
+          </span>
+        )}
+        {article.analysis_impact != null && (
+          <span className="small" style={{ fontSize: 9 }}>{article.analysis_impact}/10</span>
+        )}
+        {onPin && (
+          <button
+            className="pin-btn"
+            title={article.is_pinned ? 'Unpin' : 'Pin'}
+            onClick={e => { e.stopPropagation(); onPin(article.id, !article.is_pinned) }}
+          >
+            {article.is_pinned ? '★' : '☆'}
+          </button>
+        )}
       </div>
     </div>
   )
@@ -639,6 +728,29 @@ export default function App() {
     setScriptEditing(false); setScriptSaveError('')
   }
 
+  // ── Pin / reorder ──────────────────────────────────────────────────────────
+
+  async function handlePinArticle(id: string, pinned: boolean) {
+    try {
+      await pinArticle(id, pinned)
+      setHistory(h => h.map(a => a.id === id ? { ...a, is_pinned: pinned } : a))
+    } catch { /* pin failure is non-fatal */ }
+  }
+
+  async function handleReorderScene(fromIdx: number, toIdx: number) {
+    if (!pkg?.storyboard || !articleId) return
+    const newOrder = pkg.storyboard.scenes.map(s => s.scene_number)
+    const [moved] = newOrder.splice(fromIdx, 1)
+    newOrder.splice(toIdx, 0, moved)
+    try {
+      await reorderStoryboard(articleId, newOrder)
+      const updated = await getArticlePackage(articleId)
+      setPkg(updated)
+    } catch (e: unknown) {
+      setError(String((e as Error)?.message ?? e))
+    }
+  }
+
   // ── Script editing ────────────────────────────────────────────────────────
 
   function handleEditScript() {
@@ -674,28 +786,34 @@ export default function App() {
     setScriptSaveError('')
     setRegenScriptLoading(true)
     setError('')
+    setStatusText('Queuing re-summarize…')
     try {
       const resp = await startRegenerateScript(articleId, nScenes)
       pollRegenScript(resp.task_id)
     } catch (e: unknown) {
       setRegenScriptLoading(false)
+      setStatusText('Error')
       setError(String((e as Error)?.message ?? e))
     }
   }
 
   function pollRegenScript(taskId: string) {
     jobStatus(taskId).then(s => {
+      if (s.state === 'PROGRESS' && s.meta?.msg) setStatusText(s.meta.msg)
       if (s.state === 'SUCCESS') {
         setRegenScriptLoading(false)
+        setStatusText('Ready')
         if (articleId) fetchPackage(articleId)
       } else if (s.state === 'FAILURE') {
         setRegenScriptLoading(false)
+        setStatusText('Failed')
         setError(s.error || 'Script regeneration failed')
       } else {
         window.setTimeout(() => pollRegenScript(taskId), 2500)
       }
     }).catch(e => {
       setRegenScriptLoading(false)
+      setStatusText('Error')
       setError(String((e as Error)?.message ?? e))
     })
   }
@@ -883,7 +1001,13 @@ export default function App() {
           <Collapsible title={`History · ${history.length} articles`}>
             <div className="history-list">
               {history.map(a => (
-                <HistoryRow key={a.id} article={a} sources={sources} onLoad={loadFromHistory} />
+                <HistoryRow
+                  key={a.id}
+                  article={a}
+                  sources={sources}
+                  onLoad={loadFromHistory}
+                  onPin={handlePinArticle}
+                />
               ))}
             </div>
           </Collapsible>
@@ -947,6 +1071,11 @@ export default function App() {
                   >
                     {regenScriptLoading ? 'Re-summarizing…' : 'Re-summarize'}
                   </button>
+                  <button
+                    className="secondary settings-btn"
+                    onClick={() => pkg?.script?.text && navigator.clipboard.writeText(pkg.script.text).catch(() => {})}
+                    title="Copy script to clipboard"
+                  >Copy</button>
                 </div>
               )}
               {scriptEditing ? (
@@ -979,8 +1108,18 @@ export default function App() {
               defaultOpen
             >
               <div className="scene-list">
-                {pkg.storyboard.scenes.map(s => (
-                  <SceneCard key={s.scene_number} scene={s} imageRef={imageMap[s.scene_number]} />
+                {pkg.storyboard.scenes.map((s, idx) => (
+                  <SceneCard
+                    key={s.scene_number}
+                    scene={s}
+                    imageRef={imageMap[s.scene_number]}
+                    articleId={articleId}
+                    onImageUploaded={() => articleId && fetchPackage(articleId)}
+                    onMoveUp={idx > 0 ? () => handleReorderScene(idx, idx - 1) : undefined}
+                    onMoveDown={idx < pkg.storyboard!.scenes.length - 1 ? () => handleReorderScene(idx, idx + 1) : undefined}
+                    isFirst={idx === 0}
+                    isLast={idx === pkg.storyboard!.scenes.length - 1}
+                  />
                 ))}
               </div>
             </Collapsible>

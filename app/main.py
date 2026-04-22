@@ -3,7 +3,7 @@ import os
 import zipfile
 from contextlib import asynccontextmanager
 from datetime import datetime
-from fastapi import FastAPI, Depends, HTTPException, Header, Query
+from fastapi import FastAPI, Depends, File, HTTPException, Header, Query, UploadFile
 from fastapi.responses import FileResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -241,6 +241,7 @@ def list_sources(db=Depends(get_db)):
 @app.get("/articles", dependencies=[Depends(check_api_key)])
 def list_articles(
     source_id: str | None = Query(default=None),
+    pinned: bool | None = Query(default=None),
     limit: int = Query(default=20, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
     db: Session = Depends(get_db),
@@ -263,7 +264,7 @@ def list_articles(
         select(Article, audio_sq.c.cnt.label("audio_count"), video_sq.c.cnt.label("video_count"))
         .outerjoin(audio_sq, Article.id == audio_sq.c.article_id)
         .outerjoin(video_sq, Article.id == video_sq.c.article_id)
-        .order_by(Article.created_at.desc())
+        .order_by(Article.is_pinned.desc(), Article.created_at.desc())
         .limit(limit)
         .offset(offset)
     )
@@ -271,6 +272,8 @@ def list_articles(
         q = q.where(Article.source_id == source_id)
     if current_user:
         q = q.where(Article.user_id == current_user.id)
+    if pinned is not None:
+        q = q.where(Article.is_pinned == pinned)
 
     rows = db.execute(q).all()
     return [
@@ -282,6 +285,9 @@ def list_articles(
             "created_at": r.Article.created_at,
             "has_audio": bool(r.audio_count),
             "has_video": bool(r.video_count),
+            "is_pinned": bool(r.Article.is_pinned),
+            "analysis_sentiment": (r.Article.analysis_json or {}).get("sentiment"),
+            "analysis_impact": (r.Article.analysis_json or {}).get("impact_score"),
         }
         for r in rows
     ]
@@ -452,6 +458,128 @@ def list_article_images(article_id: str, db=Depends(get_db)):
          "status": r.status, "created_at": r.created_at}
         for r in rows
     ]
+
+
+class PinReq(BaseModel):
+    pinned: bool = True
+
+
+@app.patch("/articles/{article_id}/pin", dependencies=[Depends(check_api_key)])
+def toggle_pin(article_id: str, req: PinReq, db: Session = Depends(get_db)):
+    """Pin or unpin an article for quick access."""
+    article = db.get(Article, article_id)
+    if not article:
+        raise HTTPException(status_code=404, detail="Article not found")
+    article.is_pinned = req.pinned
+    db.commit()
+    return {"article_id": article_id, "is_pinned": bool(article.is_pinned)}
+
+
+class StoryboardReorderReq(BaseModel):
+    scene_order: list[int]  # original scene_numbers in the desired new sequence
+
+
+@app.patch("/articles/{article_id}/storyboard", dependencies=[Depends(check_api_key)])
+def reorder_storyboard(
+    article_id: str,
+    req: StoryboardReorderReq,
+    db: Session = Depends(get_db),
+):
+    """Reorder storyboard scenes. scene_order is the list of original scene_numbers in new sequence."""
+    article = db.get(Article, article_id)
+    if not article:
+        raise HTTPException(status_code=404, detail="Article not found")
+    storyboard = _load_storyboard(article)
+    if not storyboard:
+        raise HTTPException(status_code=400, detail="Article has no storyboard")
+
+    existing_nums = {s.scene_number for s in storyboard.scenes}
+    if set(req.scene_order) != existing_nums or len(req.scene_order) != len(existing_nums):
+        raise HTTPException(status_code=422, detail="scene_order must be a permutation of existing scene numbers")
+
+    scene_map = {s.scene_number: s for s in storyboard.scenes}
+    reordered = []
+    start = 0.0
+    for original_num in req.scene_order:
+        s = scene_map[original_num]
+        data = s.model_dump()
+        data["start_time_estimate"] = round(start, 1)
+        reordered.append(data)
+        start += s.duration_estimate
+
+    article.storyboard_json = {
+        "scenes": reordered,
+        "total_duration_estimate": storyboard.total_duration_estimate,
+    }
+    db.commit()
+    return {"article_id": article_id, "scene_count": len(reordered)}
+
+
+_ALLOWED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/webp", "image/gif"}
+_IMAGE_EXT_MAP = {"image/jpeg": "jpg", "image/png": "png", "image/webp": "webp", "image/gif": "gif"}
+
+
+@app.post("/articles/{article_id}/scenes/{scene_number}/image", dependencies=[Depends(check_api_key)])
+async def upload_scene_image(
+    article_id: str,
+    scene_number: int,
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+):
+    """Replace a scene's image with a user-uploaded file (PNG/JPEG/WEBP, max 20 MB)."""
+    article = db.get(Article, article_id)
+    if not article:
+        raise HTTPException(status_code=404, detail="Article not found")
+
+    content_type = (file.content_type or "").lower()
+    if content_type not in _ALLOWED_IMAGE_TYPES:
+        raise HTTPException(status_code=422, detail="Only PNG, JPEG, WEBP, or GIF images are accepted")
+
+    contents = await file.read()
+    if len(contents) > 20 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="File too large — maximum 20 MB")
+
+    image_dir = os.getenv("IMAGE_DIR", "/data/images")
+    os.makedirs(image_dir, exist_ok=True)
+    ext = _IMAGE_EXT_MAP.get(content_type, "png")
+    save_path = os.path.join(image_dir, f"{article_id}_scene_{scene_number}_upload.{ext}")
+
+    with open(save_path, "wb") as fh:
+        fh.write(contents)
+
+    existing = db.execute(
+        select(ImageAsset).where(
+            ImageAsset.article_id == article_id,
+            ImageAsset.scene_number == scene_number,
+        )
+    ).scalar_one_or_none()
+
+    if existing:
+        if existing.file_path != save_path and os.path.exists(existing.file_path):
+            try:
+                os.remove(existing.file_path)
+            except OSError:
+                pass
+        existing.file_path = save_path
+        existing.provider = "upload"
+        existing.model = "user"
+        existing.status = "ready"
+        existing.error = None
+        img = existing
+    else:
+        img = ImageAsset(
+            article_id=article_id,
+            scene_number=scene_number,
+            visual_prompt="[User upload]",
+            file_path=save_path,
+            provider="upload",
+            model="user",
+            status="ready",
+        )
+        db.add(img)
+
+    db.commit()
+    return {"id": img.id, "scene_number": scene_number, "status": "ready", "url": f"/image/{img.id}"}
 
 
 class ScriptEditReq(BaseModel):

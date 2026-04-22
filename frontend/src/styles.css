@@ -649,3 +649,29 @@ hr {
   color: #374151;
   line-height: 1.5;
 }
+
+/* ── Pin button ─────────────────────────────────────────────────────────── */
+
+.pin-btn {
+  background: none;
+  border: none;
+  padding: 0 4px;
+  font-size: 14px;
+  color: #9ca3af;
+  cursor: pointer;
+  border-radius: 4px;
+  line-height: 1;
+}
+
+.pin-btn:hover {
+  color: #f59e0b;
+  background: #fefce8;
+}
+
+/* ── Scene reorder controls ─────────────────────────────────────────────── */
+
+.scene-reorder {
+  display: flex;
+  gap: 2px;
+  margin-left: auto;
+}

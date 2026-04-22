@@ -127,6 +127,50 @@ export function regenerateStage(
   })
 }
 
+export function pinArticle(
+  articleId: string,
+  pinned: boolean,
+): Promise<{ article_id: string; is_pinned: boolean }> {
+  return http(`/articles/${encodeURIComponent(articleId)}/pin`, {
+    method: 'PATCH',
+    body: JSON.stringify({ pinned }),
+  })
+}
+
+export function reorderStoryboard(
+  articleId: string,
+  sceneOrder: number[],
+): Promise<{ article_id: string; scene_count: number }> {
+  return http(`/articles/${encodeURIComponent(articleId)}/storyboard`, {
+    method: 'PATCH',
+    body: JSON.stringify({ scene_order: sceneOrder }),
+  })
+}
+
+export async function uploadSceneImage(
+  articleId: string,
+  sceneNumber: number,
+  file: File,
+): Promise<{ id: string; scene_number: number; status: string; url: string }> {
+  // FormData upload — cannot use http() helper (no Content-Type header; browser sets multipart boundary)
+  const headers: Record<string, string> = {}
+  if (_jwtToken) headers['Authorization'] = `Bearer ${_jwtToken}`
+  else if (_apiKey) headers['X-API-Key'] = _apiKey
+
+  const form = new FormData()
+  form.append('file', file)
+
+  const res = await fetch(
+    `${API_BASE}/articles/${encodeURIComponent(articleId)}/scenes/${sceneNumber}/image`,
+    { method: 'POST', headers, body: form },
+  )
+  if (!res.ok) {
+    const text = await res.text().catch(() => '')
+    throw new Error(`HTTP ${res.status} ${res.statusText}${text ? `: ${text}` : ''}`)
+  }
+  return res.json()
+}
+
 export function editScript(
   articleId: string,
   text: string,

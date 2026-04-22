@@ -68,6 +68,9 @@ class Article(Base):
     # Sentiment + impact analysis output
     analysis_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
+    # User content management
+    is_pinned: Mapped[bool] = mapped_column(Integer, default=False, nullable=False)
+
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
 
     source: Mapped["Source"] = relationship(back_populates="articles")

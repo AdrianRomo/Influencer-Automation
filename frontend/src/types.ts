@@ -43,6 +43,9 @@ export type ArticleSummary = {
   created_at: string
   has_audio: boolean
   has_video: boolean
+  is_pinned?: boolean
+  analysis_sentiment?: string | null
+  analysis_impact?: number | null
 }
 
 export type GenerateReq = {
