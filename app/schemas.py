@@ -140,6 +140,14 @@ class VideoAssetRef(BaseModel):
     error: Optional[str] = None
 
 
+class AnalysisResult(BaseModel):
+    sentiment: str  # positive | neutral | cautionary | urgent
+    impact_score: int
+    medical_urgency: str  # routine | informational | important | critical
+    key_claims: List[str] = []
+    audience_relevance: Optional[str] = None
+
+
 class ContentPackage(BaseModel):
     article_id: str
     title: str
@@ -153,3 +161,4 @@ class ContentPackage(BaseModel):
     visual_prompts: Optional[List[VisualPromptEntry]] = None
     images: Optional[List[ImageAssetRef]] = None
     video: Optional[VideoAssetRef] = None
+    analysis: Optional[AnalysisResult] = None

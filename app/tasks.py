@@ -248,6 +248,14 @@ def generate_latest_for_source(
             raise RuntimeError(f"TTS out of range after retries. duration={duration}, error={last_error}")
 
         article.tts_script = script
+
+        try:
+            from app.analysis import analyze_article as _analyze
+            self.update_state(state="PROGRESS", meta={"stage": "analyzing", "msg": "Analyzing content…"})
+            article.analysis_json = _analyze(script, api_key=openai_api_key)
+        except Exception as exc:
+            logger.warning("Analysis failed (non-fatal): %s", exc)
+
         observed_wpm = (word_count / max(duration, 1)) * 60.0
 
         cal = db.get(VoiceCalibration, (used_voice_id, model_id, speed))
@@ -444,3 +452,66 @@ def generate_video_for_article(
                 except OSError:
                     pass
             raise
+
+
+@celery_app.task(name="regenerate_script_for_article", bind=True)
+def regenerate_script_for_article(
+    self,
+    article_id: str,
+    n_scenes: int = 8,
+    openai_api_key: str | None = None,
+) -> dict:
+    """Regenerate the TTS script and storyboard from the article's existing raw_text."""
+    with SessionLocal() as db:
+        article = db.get(Article, article_id)
+        if not article:
+            raise ValueError(f"Unknown article_id: {article_id}")
+        if not article.raw_text:
+            raise RuntimeError("Article has no raw_text — cannot regenerate script")
+
+        self.update_state(state="PROGRESS", meta={"stage": "scripting", "msg": "Regenerating script & storyboard…"})
+
+        voice_id = os.getenv("ELEVENLABS_VOICE_ID", "")
+        model_id = os.getenv("ELEVENLABS_MODEL_ID", "eleven_multilingual_v2")
+        speed = round(float(os.getenv("ELEVENLABS_SPEED", "1.0")), 2)
+
+        cal = db.get(VoiceCalibration, (voice_id, model_id, speed)) if voice_id else None
+        wpm = cal.wpm_estimate if cal else 140.0
+
+        target_seconds = int(os.getenv("TTS_TARGET_SECONDS", "180"))
+        tol_seconds = int(os.getenv("TTS_TOLERANCE_SECONDS", "30"))
+        target_words = _words_for_seconds(target_seconds, wpm)
+        tol_words = _words_for_seconds(tol_seconds, wpm)
+
+        bundle = make_tts_bundle(
+            title=article.title,
+            body=article.raw_text,
+            language_hint=None,
+            target_seconds=target_seconds,
+            n_scenes=n_scenes,
+            target_words=target_words,
+            tol_words=tol_words,
+            wpm_estimate=wpm,
+            api_key=openai_api_key,
+        )
+
+        article.tts_script = bundle["script"]
+        article.storyboard_json = {
+            "scenes": bundle.get("scenes") or [],
+            "total_duration_estimate": bundle.get("total_duration_estimate", 0),
+        }
+
+        try:
+            from app.analysis import analyze_article as _analyze
+            self.update_state(state="PROGRESS", meta={"stage": "analyzing", "msg": "Analyzing content…"})
+            article.analysis_json = _analyze(bundle["script"], api_key=openai_api_key)
+        except Exception as exc:
+            logger.warning("Analysis failed (non-fatal): %s", exc)
+
+        db.commit()
+
+        return {
+            "article_id": article_id,
+            "word_count": bundle.get("word_count"),
+            "scene_count": len(bundle.get("scenes") or []),
+        }

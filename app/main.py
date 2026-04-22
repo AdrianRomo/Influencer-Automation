@@ -1,4 +1,6 @@
+import io
 import os
+import zipfile
 from contextlib import asynccontextmanager
 from datetime import datetime
 from fastapi import FastAPI, Depends, HTTPException, Header, Query
@@ -21,7 +23,7 @@ from app.rss_sources import SOURCES
 from app.schemas import (
     ArticleResponse, Storyboard,
     AudioAssetRef, ScriptAsset, VisualPromptEntry, ContentPackage,
-    ImageAssetRef, VideoAssetRef,
+    ImageAssetRef, VideoAssetRef, AnalysisResult,
     RegisterReq, LoginReq, TokenResp, UserResp, UserKeysIn, UserKeysOut,
 )
 from app.captions import storyboard_to_captions, captions_to_srt, captions_to_vtt
@@ -412,6 +414,13 @@ def get_article_package(article_id: str, db=Depends(get_db)):
             error=video_row.error,
         )
 
+    analysis: AnalysisResult | None = None
+    if article.analysis_json:
+        try:
+            analysis = AnalysisResult(**article.analysis_json)
+        except Exception:
+            pass
+
     return ContentPackage(
         article_id=article.id,
         title=article.title,
@@ -425,6 +434,7 @@ def get_article_package(article_id: str, db=Depends(get_db)):
         visual_prompts=visual_prompts,
         images=images,
         video=video_ref,
+        analysis=analysis,
     )
 
 
@@ -442,6 +452,109 @@ def list_article_images(article_id: str, db=Depends(get_db)):
          "status": r.status, "created_at": r.created_at}
         for r in rows
     ]
+
+
+class ScriptEditReq(BaseModel):
+    text: str
+
+
+@app.patch("/articles/{article_id}/script", dependencies=[Depends(check_api_key)])
+def update_article_script(
+    article_id: str,
+    req: ScriptEditReq,
+    db: Session = Depends(get_db),
+):
+    """Replace the article's TTS script. Existing audio/video assets are preserved."""
+    article = db.get(Article, article_id)
+    if not article:
+        raise HTTPException(status_code=404, detail="Article not found")
+    text = req.text.strip()
+    if not text:
+        raise HTTPException(status_code=422, detail="Script text cannot be empty")
+    article.tts_script = text
+    db.commit()
+    return {"article_id": article_id, "word_count": len(text.split())}
+
+
+class RegenerateScriptReq(BaseModel):
+    n_scenes: int = Field(default=8, ge=0, le=20)
+
+
+@app.post("/articles/{article_id}/regenerate-script", dependencies=[Depends(check_api_key)])
+def trigger_regenerate_script(
+    article_id: str,
+    req: RegenerateScriptReq,
+    db: Session = Depends(get_db),
+    current_user: Optional[User] = Depends(get_optional_user),
+):
+    """Re-run script + storyboard generation from the article's existing raw_text."""
+    article = db.get(Article, article_id)
+    if not article:
+        raise HTTPException(status_code=404, detail="Article not found")
+    if not article.raw_text:
+        raise HTTPException(status_code=400, detail="Article has no raw text — cannot regenerate script")
+    openai_key, _, _ = _resolve_user_keys(current_user, db)
+    task = celery_app.send_task(
+        "regenerate_script_for_article",
+        kwargs={
+            "article_id": article_id,
+            "n_scenes": req.n_scenes,
+            "openai_api_key": openai_key,
+        },
+    )
+    return {"task_id": task.id, "status": "queued"}
+
+
+@app.get("/articles/{article_id}/export.zip", dependencies=[Depends(check_api_key)])
+def export_article_zip(article_id: str, db: Session = Depends(get_db)):
+    """Download a ZIP bundle: script, audio, video, captions, and scene images."""
+    article = db.get(Article, article_id)
+    if not article:
+        raise HTTPException(status_code=404, detail="Article not found")
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        if article.tts_script:
+            zf.writestr("script.txt", article.tts_script)
+
+        audio = _latest_audio(article_id, db)
+        if audio and os.path.exists(audio.file_path):
+            zf.write(audio.file_path, "audio.mp3")
+
+        storyboard = _load_storyboard(article)
+        if storyboard:
+            caps = storyboard_to_captions(storyboard)
+            zf.writestr("captions.srt", captions_to_srt(caps))
+            zf.writestr("captions.vtt", captions_to_vtt(caps))
+
+        video_row = db.execute(
+            select(VideoAsset)
+            .where(VideoAsset.article_id == article_id, VideoAsset.status == "ready")
+            .order_by(VideoAsset.created_at.desc())
+            .limit(1)
+        ).scalar_one_or_none()
+        if video_row and os.path.exists(video_row.file_path):
+            zf.write(video_row.file_path, "video.mp4")
+
+        image_rows = db.execute(
+            select(ImageAsset)
+            .where(ImageAsset.article_id == article_id, ImageAsset.status == "ready")
+            .order_by(ImageAsset.scene_number)
+        ).scalars().all()
+        for img in image_rows:
+            if os.path.exists(img.file_path):
+                zf.write(img.file_path, f"images/scene_{img.scene_number:02d}.png")
+
+    buf.seek(0)
+    safe_title = "".join(
+        c if c.isalnum() or c in "-_" else "_"
+        for c in (article.title or article_id)[:40]
+    )
+    return Response(
+        content=buf.read(),
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{safe_title}.zip"'},
+    )
 
 
 # ── Jobs ───────────────────────────────────────────────────────────────────

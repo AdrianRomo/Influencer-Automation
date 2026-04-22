@@ -573,3 +573,79 @@ hr {
   flex-wrap: wrap;
   gap: 4px;
 }
+
+/* ── Script editor ──────────────────────────────────────────────────────── */
+
+.script-toolbar {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.script-editor {
+  width: 100%;
+  padding: 10px 12px;
+  border: 1px solid #d1d5db;
+  border-radius: 12px;
+  font-family: ui-sans-serif, system-ui, sans-serif;
+  font-size: 13px;
+  line-height: 1.7;
+  resize: vertical;
+  min-height: 200px;
+  color: #374151;
+  outline: none;
+}
+
+.script-editor:focus {
+  border-color: #9ca3af;
+}
+
+/* ── Analysis card ──────────────────────────────────────────────────────── */
+
+.analysis-section {
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid #f3f4f6;
+}
+
+.analysis-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.analysis-badge {
+  font-size: 10px;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 999px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.analysis-positive    { background: #d1fae5; color: #065f46; }
+.analysis-neutral     { background: #f3f4f6; color: #374151; }
+.analysis-cautionary  { background: #fef3c7; color: #92400e; }
+.analysis-urgent      { background: #fee2e2; color: #991b1b; }
+
+.analysis-urgency-routine       { background: #eff6ff; color: #1d4ed8; }
+.analysis-urgency-informational { background: #f0fdf4; color: #15803d; }
+.analysis-urgency-important     { background: #fefce8; color: #854d0e; }
+.analysis-urgency-critical      { background: #fef2f2; color: #b91c1c; }
+
+.analysis-score {
+  font-weight: 600;
+}
+
+.analysis-claims {
+  margin-top: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.analysis-claim {
+  color: #374151;
+  line-height: 1.5;
+}

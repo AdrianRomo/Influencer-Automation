@@ -142,6 +142,14 @@ export type VideoAssetRef = {
   error?: string | null
 }
 
+export type AnalysisResult = {
+  sentiment: 'positive' | 'neutral' | 'cautionary' | 'urgent'
+  impact_score: number
+  medical_urgency: 'routine' | 'informational' | 'important' | 'critical'
+  key_claims: string[]
+  audience_relevance?: string | null
+}
+
 export type ContentPackage = {
   article_id: string
   title: string
@@ -155,4 +163,5 @@ export type ContentPackage = {
   visual_prompts?: VisualPromptEntry[] | null
   images?: ImageAssetRef[] | null
   video?: VideoAssetRef | null
+  analysis?: AnalysisResult | null
 }

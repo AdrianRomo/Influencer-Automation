@@ -65,6 +65,9 @@ class Article(Base):
     # Future-proof for video/images (store scene plan)
     storyboard_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
+    # Sentiment + impact analysis output
+    analysis_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
 
     source: Mapped["Source"] = relationship(back_populates="articles")

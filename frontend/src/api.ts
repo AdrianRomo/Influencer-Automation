@@ -127,6 +127,30 @@ export function regenerateStage(
   })
 }
 
+export function editScript(
+  articleId: string,
+  text: string,
+): Promise<{ article_id: string; word_count: number }> {
+  return http(`/articles/${encodeURIComponent(articleId)}/script`, {
+    method: 'PATCH',
+    body: JSON.stringify({ text }),
+  })
+}
+
+export function startRegenerateScript(
+  articleId: string,
+  nScenes = 8,
+): Promise<{ task_id: string; status: string }> {
+  return http(`/articles/${encodeURIComponent(articleId)}/regenerate-script`, {
+    method: 'POST',
+    body: JSON.stringify({ n_scenes: nScenes }),
+  })
+}
+
+export function getExportZipUrl(articleId: string): string {
+  return `${API_BASE}/articles/${encodeURIComponent(articleId)}/export.zip`
+}
+
 export function resolveDownloadUrl(status: JobStatus): string | undefined {
   const r = status.result
   if (!r) return undefined

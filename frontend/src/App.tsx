@@ -1,12 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type {
-  ArticleSummary, ContentPackage, GenerateReq, ImageAssetRef,
+  AnalysisResult, ArticleSummary, ContentPackage, GenerateReq, ImageAssetRef,
   JobStatus, Source, StoryboardScene, UserResp, UserKeysOut,
 } from './types'
 import {
-  cancelJob, getArticlePackage, jobStatus, listArticles, listSources, regenerateStage,
-  resolveAudioUrl, resolveCaptionUrl, resolveImageUrl, resolveVideoUrl, setApiKey,
-  startGenerate, startGenerateVideo,
+  cancelJob, editScript, getArticlePackage, getExportZipUrl, jobStatus, listArticles,
+  listSources, regenerateStage, resolveAudioUrl, resolveCaptionUrl, resolveImageUrl,
+  resolveVideoUrl, setApiKey, startGenerate, startGenerateVideo, startRegenerateScript,
   register, login, getMe, getUserKeys, saveUserKeys,
   setAuthToken, clearAuthToken,
 } from './api'
@@ -279,6 +279,26 @@ function SceneCard({ scene, imageRef }: { scene: StoryboardScene; imageRef?: Ima
   )
 }
 
+function AnalysisCard({ analysis }: { analysis: AnalysisResult }) {
+  return (
+    <div className="analysis-section">
+      <div className="analysis-row">
+        <span className={`analysis-badge analysis-${analysis.sentiment}`}>{analysis.sentiment}</span>
+        <span className={`analysis-badge analysis-urgency-${analysis.medical_urgency}`}>{analysis.medical_urgency}</span>
+        <span className="analysis-score small">impact {analysis.impact_score}/10</span>
+        {analysis.audience_relevance && (
+          <span className="small" style={{ color: '#6b7280' }}>{analysis.audience_relevance}</span>
+        )}
+      </div>
+      {analysis.key_claims.length > 0 && (
+        <div className="analysis-claims small">
+          {analysis.key_claims.map((c, i) => <div key={i} className="analysis-claim">• {c}</div>)}
+        </div>
+      )}
+    </div>
+  )
+}
+
 function HistoryRow({ article, sources, onLoad }: {
   article: ArticleSummary
   sources: Source[]
@@ -345,6 +365,13 @@ export default function App() {
   const [videoJob, setVideoJob] = useState<JobStatus | null>(null)
   const [videoError, setVideoError] = useState('')
   const [videoStage, setVideoStage] = useState('')
+
+  // ── Script editing ─────────────────────────────────────────────────────
+  const [scriptEditing, setScriptEditing] = useState(false)
+  const [scriptDraft, setScriptDraft] = useState('')
+  const [scriptSaving, setScriptSaving] = useState(false)
+  const [scriptSaveError, setScriptSaveError] = useState('')
+  const [regenScriptLoading, setRegenScriptLoading] = useState(false)
 
   // ── History ─────────────────────────────────────────────────────────────
   const [history, setHistory] = useState<ArticleSummary[]>([])
@@ -609,6 +636,68 @@ export default function App() {
     setAudioJob(null); setPkg(null); setError('')
     setVideoJob(null); setVideoError(''); setVideoLoading(false); setVideoStage('')
     setLoading(false); setStatusText('Idle'); setPkgLoading(false)
+    setScriptEditing(false); setScriptSaveError('')
+  }
+
+  // ── Script editing ────────────────────────────────────────────────────────
+
+  function handleEditScript() {
+    setScriptDraft(pkg?.script?.text ?? '')
+    setScriptEditing(true)
+    setScriptSaveError('')
+  }
+
+  function handleScriptCancel() {
+    setScriptEditing(false)
+    setScriptSaveError('')
+  }
+
+  async function handleScriptSave() {
+    if (!articleId) return
+    setScriptSaving(true)
+    setScriptSaveError('')
+    try {
+      await editScript(articleId, scriptDraft)
+      const updated = await getArticlePackage(articleId)
+      setPkg(updated)
+      setScriptEditing(false)
+    } catch (e: unknown) {
+      setScriptSaveError(String((e as Error)?.message ?? e))
+    } finally {
+      setScriptSaving(false)
+    }
+  }
+
+  async function startRegenScript() {
+    if (!articleId) return
+    setScriptEditing(false)
+    setScriptSaveError('')
+    setRegenScriptLoading(true)
+    setError('')
+    try {
+      const resp = await startRegenerateScript(articleId, nScenes)
+      pollRegenScript(resp.task_id)
+    } catch (e: unknown) {
+      setRegenScriptLoading(false)
+      setError(String((e as Error)?.message ?? e))
+    }
+  }
+
+  function pollRegenScript(taskId: string) {
+    jobStatus(taskId).then(s => {
+      if (s.state === 'SUCCESS') {
+        setRegenScriptLoading(false)
+        if (articleId) fetchPackage(articleId)
+      } else if (s.state === 'FAILURE') {
+        setRegenScriptLoading(false)
+        setError(s.error || 'Script regeneration failed')
+      } else {
+        window.setTimeout(() => pollRegenScript(taskId), 2500)
+      }
+    }).catch(e => {
+      setRegenScriptLoading(false)
+      setError(String((e as Error)?.message ?? e))
+    })
   }
 
   // ── Derived ───────────────────────────────────────────────────────────────
@@ -829,6 +918,7 @@ export default function App() {
                 <source src={audioDownloadUrl} type="audio/mpeg" />
               </audio>
             )}
+            {pkg.analysis && <AnalysisCard analysis={pkg.analysis} />}
             {pkg.storyboard && (
               <div className="download-row" style={{ marginTop: 8 }}>
                 <span className="small">Subtitles:</span>
@@ -836,12 +926,49 @@ export default function App() {
                 <a href={resolveCaptionUrl(pkg.article_id, 'vtt')} className="dl-btn" download>VTT</a>
               </div>
             )}
+            <div className="download-row" style={{ marginTop: 8 }}>
+              <span className="small">Export:</span>
+              <a href={getExportZipUrl(pkg.article_id)} className="dl-btn" download>ZIP Package</a>
+            </div>
           </div>
 
           {/* Script */}
           {pkg.script && (
-            <Collapsible title={`Script · ${pkg.script.word_count} words · ${pkg.script.language}`}>
-              <pre className="script-pre">{pkg.script.text}</pre>
+            <Collapsible
+              title={`Script · ${scriptEditing ? scriptDraft.split(/\s+/).filter(Boolean).length + ' words (editing)' : pkg.script.word_count + ' words'} · ${pkg.script.language}`}
+            >
+              {!scriptEditing && (
+                <div className="script-toolbar">
+                  <button className="secondary settings-btn" onClick={handleEditScript}>Edit</button>
+                  <button
+                    className="secondary settings-btn"
+                    onClick={startRegenScript}
+                    disabled={regenScriptLoading || loading}
+                  >
+                    {regenScriptLoading ? 'Re-summarizing…' : 'Re-summarize'}
+                  </button>
+                </div>
+              )}
+              {scriptEditing ? (
+                <div>
+                  <textarea
+                    className="script-editor"
+                    value={scriptDraft}
+                    onChange={e => setScriptDraft(e.target.value)}
+                    rows={14}
+                  />
+                  <div className="actions" style={{ marginTop: 8 }}>
+                    <button onClick={handleScriptSave} disabled={scriptSaving || !scriptDraft.trim()}>
+                      {scriptSaving ? 'Saving…' : 'Save Script'}
+                    </button>
+                    <button className="secondary" onClick={handleScriptCancel}>Cancel</button>
+                    <span className="small">{scriptDraft.split(/\s+/).filter(Boolean).length} words</span>
+                  </div>
+                  {scriptSaveError && <div className="error-text">{scriptSaveError}</div>}
+                </div>
+              ) : (
+                <pre className="script-pre">{pkg.script.text}</pre>
+              )}
             </Collapsible>
           )}
 
