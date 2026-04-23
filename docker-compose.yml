@@ -57,15 +57,12 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-    # Run alembic migrations before starting the API.
-    # If the DB has pre-existing tables but no alembic_version (create_all bootstrap),
-    # stamp at baseline (001) so only the newer column-adding migrations run.
+    # Bootstrap: inspect existing schema, stamp alembic at the right revision,
+    # then run any outstanding migrations before starting the API.
     command: >
-      sh -c "alembic upgrade head 2>&1 ||
-             (echo '[INFO] alembic upgrade head failed — attempting stamp-then-upgrade for existing schema' &&
-              alembic stamp 001 &&
-              alembic upgrade head) ||
-             echo '[WARNING] Migration failed — relying on create_all fallback' &&
+      sh -c "python /app/scripts/migrate_bootstrap.py &&
+             alembic upgrade head ||
+             echo '[WARNING] alembic upgrade head failed — API will rely on create_all fallback';
              uvicorn app.main:app --host 0.0.0.0 --port 8085 --reload
              --proxy-headers --forwarded-allow-ips '*'"
 
