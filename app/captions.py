@@ -9,7 +9,7 @@ storyboard generation. Accuracy improves as voice calibration accumulates sample
 from __future__ import annotations
 
 import re
-from typing import List
+from typing import List, Optional
 
 from app.schemas import CaptionEntry, Storyboard
 
@@ -40,12 +40,19 @@ def _vtt_time(seconds: float) -> str:
     return f"{h:02d}:{m:02d}:{s:02d}.{ms:03d}"
 
 
-def storyboard_to_captions(storyboard: Storyboard) -> List[CaptionEntry]:
+def storyboard_to_captions(
+    storyboard: Storyboard,
+    actual_audio_duration: Optional[float] = None,
+) -> List[CaptionEntry]:
     """Convert storyboard scenes into caption entries.
 
     Each scene's narration is split at sentence boundaries. Timing within the
     scene is distributed proportionally by word count so shorter sentences get
     less screen time than longer ones.
+
+    When ``actual_audio_duration`` is provided, all caption timestamps are
+    rescaled so the final caption ends exactly at the audio end — avoiding
+    drift from accumulated floating-point proportions or stale WPM estimates.
     """
     entries: List[CaptionEntry] = []
     index = 1
@@ -75,6 +82,15 @@ def storyboard_to_captions(storyboard: Storyboard) -> List[CaptionEntry]:
             ))
             cursor += duration
             index += 1
+
+    if actual_audio_duration and entries:
+        estimated_end = entries[-1].end_time
+        if estimated_end > 0 and abs(estimated_end - actual_audio_duration) > 0.1:
+            scale = actual_audio_duration / estimated_end
+            for e in entries:
+                e.start_time = round(e.start_time * scale, 3)
+                e.end_time = round(e.end_time * scale, 3)
+            entries[-1].end_time = round(actual_audio_duration, 3)
 
     return entries
 

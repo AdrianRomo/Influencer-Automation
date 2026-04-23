@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import asyncio
 import io
 import json
@@ -14,26 +16,13 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from celery.result import AsyncResult
-from redis import Redis as RedisClient
 from sqlalchemy import select, func, delete
 from sqlalchemy.orm import Session
 from typing import Literal, Optional
 
+from app.redis_client import get_redis as _get_rl_redis
+
 logger = logging.getLogger(__name__)
-
-# ── Redis client (shared for rate limiting + task ownership) ────────────────
-
-_rl_redis: Optional[RedisClient] = None
-
-
-def _get_rl_redis() -> RedisClient:
-    global _rl_redis
-    if _rl_redis is None:
-        _rl_redis = RedisClient.from_url(
-            os.getenv("CELERY_BROKER_URL", "redis://redis:6379/0"),
-            decode_responses=True, socket_connect_timeout=1, socket_timeout=1,
-        )
-    return _rl_redis
 
 
 def _rate_limit(key: str, limit: int, window: int = 60) -> None:
@@ -374,9 +363,7 @@ def health(db: Session = Depends(get_db)):
         status = "degraded"
 
     try:
-        redis_url = os.getenv("CELERY_BROKER_URL", "redis://redis:6379/0")
-        rc = RedisClient.from_url(redis_url, socket_connect_timeout=1)
-        rc.ping()
+        _get_rl_redis().ping()
     except Exception as exc:
         logger.error("Health check Redis error: %s", exc)
         redis_status = "error"

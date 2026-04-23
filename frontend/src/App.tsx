@@ -304,7 +304,9 @@ function SceneCard({
       onToast?.('success', `Image uploaded for scene ${scene.scene_number}`)
       onImageUploaded?.()
     } catch (err: unknown) {
-      setUploadErr(String((err as Error)?.message ?? err))
+      const msg = String((err as Error)?.message ?? err)
+      setUploadErr(msg)
+      onToast?.('error', `Scene ${scene.scene_number}: ${msg}`)
     } finally {
       setUploading(false)
       if (fileRef.current) fileRef.current.value = ''
@@ -792,7 +794,10 @@ export default function App() {
         if (!localStorage.getItem('gen_language')) setLanguage(p.defaults.language)
         if (!localStorage.getItem('gen_animationPrompt')) setAnimationPrompt(p.defaults.animation_prompt)
       })
-      .catch(() => {})
+      .catch(e => {
+        console.warn('getPlatforms failed; falling back to hardcoded defaults', e)
+        addToast('error', 'Could not load platform list — using defaults')
+      })
     loadHistory()
     return () => {
       if (pollTimer.current) window.clearTimeout(pollTimer.current)
@@ -807,15 +812,27 @@ export default function App() {
     return () => window.clearInterval(id)
   }, [loading, videoLoading])
 
-  // Refresh content package every 8s during video generation
+  // Refresh content package every 8s during video generation. Skip the refresh
+  // while the user is editing the script so we don't blow away their draft.
   useEffect(() => {
     const aid = pkg?.article_id
     if (!videoLoading || !aid) return
+    let consecutiveErrors = 0
     const id = window.setInterval(async () => {
-      try { setPkg(await getArticlePackage(aid)) } catch { /* ignore */ }
+      if (scriptEditing) return
+      try {
+        setPkg(await getArticlePackage(aid))
+        consecutiveErrors = 0
+      } catch (e) {
+        consecutiveErrors++
+        if (consecutiveErrors === 3) {
+          console.warn('Package refresh failing repeatedly:', e)
+          addToast('error', 'Live progress updates are stalled — check your connection')
+        }
+      }
     }, 8000)
     return () => window.clearInterval(id)
-  }, [videoLoading, pkg?.article_id])
+  }, [videoLoading, pkg?.article_id, scriptEditing, addToast])
 
   // ── Auth handlers ───────────────────────────────────────────────────────
 
@@ -956,10 +973,14 @@ export default function App() {
   async function fetchPackage(aid: string) {
     try {
       const p = await getArticlePackage(aid)
+      // Don't clobber in-progress edits — the save flow will refetch on commit.
+      if (scriptEditing) return
       setPkg(p)
       setStatusText('Ready')
-    } catch {
+    } catch (e) {
+      console.warn('getArticlePackage failed', e)
       setStatusText('Ready (package unavailable)')
+      addToast('error', 'Could not load article package — open the article from history to retry')
     }
   }
 
@@ -1032,9 +1053,10 @@ export default function App() {
         videoPollTimer.current = window.setTimeout(() => pollVideo(taskId, platform), 3000)
       }
     }).catch(e => {
-      _setPlatVideo(platform, { loading: false, stage: '', error: String((e as Error)?.message ?? e) })
-
-      })
+      const msg = String((e as Error)?.message ?? e)
+      _setPlatVideo(platform, { loading: false, stage: '', error: msg })
+      addToast('error', `${platform}: ${msg}`)
+    })
   }
 
   function reset() {
@@ -1180,19 +1202,19 @@ export default function App() {
       : 'Medical Content Generator'
   }, [pkg?.title])
 
-  // Cmd/Ctrl+Enter → generate audio (only in step 2 with a selected article)
+  // Cmd/Ctrl+Enter → preview script (only in configure step with a selected article)
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
       if ((e.metaKey || e.ctrlKey) && e.key === 'Enter'
-          && !loading && selectedCandidate && flowStep === 'configure' && !showAuthModal) {
+          && !loading && !prepareLoading && selectedCandidate && flowStep === 'configure' && !showAuthModal) {
         e.preventDefault()
-        startAudio()
+        handlePrepareArticle()
       }
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [loading, selectedCandidate, flowStep, showAuthModal])
+  }, [loading, prepareLoading, selectedCandidate, flowStep, showAuthModal])
 
   // Warn before leaving when script has unsaved edits
   useEffect(() => {
@@ -1593,6 +1615,7 @@ export default function App() {
                 className="generate-btn"
                 onClick={handlePrepareArticle}
                 disabled={loading || prepareLoading}
+                title="Preview Script (⌘/Ctrl + Enter)"
               >
                 {prepareLoading ? (
                   <><span className="spinner spinner-light" />Generating script…</>

@@ -1,5 +1,6 @@
 import os
 import json
+import logging
 import re
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 from openai import OpenAI
@@ -7,7 +8,19 @@ from openai import OpenAI
 if TYPE_CHECKING:
     from app.usage import UsageCollector
 
+logger = logging.getLogger(__name__)
+
 client = OpenAI()
+
+
+def _extract_json(raw: str) -> str:
+    """Strip common LLM artifacts (markdown fences, prose wrappers) before parsing."""
+    s = raw.strip()
+    # Strip ```json ... ``` or ``` ... ``` fences
+    if s.startswith("```"):
+        s = re.sub(r"^```(?:json)?\s*", "", s)
+        s = re.sub(r"\s*```\s*$", "", s)
+    return s.strip()
 
 # --- Tuning knobs ---
 DEFAULT_TARGET_SECONDS = int(os.getenv("TTS_TARGET_SECONDS", "180"))
@@ -275,17 +288,45 @@ SCRIPT:
 
     raw = _call_llm(SYSTEM_STORYBOARD, user, model=model, temperature=0.2, api_key=api_key,
                     collector=collector, operation="storyboard")
-    try:
-        data = json.loads(raw)
-        if isinstance(data, list):
-            scenes = [_normalize_scene(s, i) for i, s in enumerate(data)]
-        else:
-            scenes = []
-    except Exception:
-        scenes = []
+    scenes = _parse_scenes_with_retry(
+        raw, user_prompt=user, model=model, api_key=api_key, collector=collector,
+    )
 
     wpm = wpm_estimate or float(_pick_wpm(OUTPUT_LANGUAGE))
     return _compute_scene_timing(scenes, wpm)
+
+
+def _parse_scenes_with_retry(
+    raw: str,
+    user_prompt: str,
+    model: str,
+    api_key: str | None,
+    collector: "UsageCollector | None",
+) -> List[Dict[str, Any]]:
+    """Parse storyboard JSON; on failure, retry once with a corrective prompt."""
+    for attempt in range(2):
+        try:
+            data = json.loads(_extract_json(raw))
+            if isinstance(data, list) and data:
+                return [_normalize_scene(s, i) for i, s in enumerate(data)]
+        except Exception as exc:
+            logger.warning(
+                "Storyboard JSON parse failed (attempt %d): %s; raw[:200]=%r",
+                attempt + 1, exc, (raw or "")[:200],
+            )
+        if attempt == 0:
+            correction = (
+                "Your previous response was not valid JSON. Return ONLY a JSON array "
+                "(no markdown fences, no prose). Each element must be an object with: "
+                "scene_number, narration, visual_prompt, on_screen_text, asset_type, transition.\n\n"
+                f"{user_prompt}"
+            )
+            raw = _call_llm(
+                SYSTEM_STORYBOARD, correction, model=model, temperature=0.1,
+                api_key=api_key, collector=collector, operation="storyboard_retry",
+            )
+    logger.error("Storyboard generation failed after retry; returning empty list")
+    return []
 
 
 def make_tts_bundle(
@@ -401,11 +442,29 @@ Return ONLY a JSON object with the platform IDs as keys."""
         model=model, temperature=0.4,
         api_key=api_key, collector=collector, operation="captions",
     )
-    try:
-        cleaned = raw.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
-        return json.loads(cleaned)
-    except Exception:
-        return {}
+    for attempt in range(2):
+        try:
+            data = json.loads(_extract_json(raw))
+            if isinstance(data, dict):
+                return data
+        except Exception as exc:
+            logger.warning(
+                "Social captions JSON parse failed (attempt %d): %s; raw[:200]=%r",
+                attempt + 1, exc, (raw or "")[:200],
+            )
+        if attempt == 0:
+            correction = (
+                "Your previous response was not valid JSON. Return ONLY a JSON object "
+                "(no markdown, no prose) mapping each platform id to an object with "
+                "`caption` and `hashtags` keys.\n\n" + prompt
+            )
+            raw = _call_llm(
+                _SYSTEM_CAPTIONS, correction,
+                model=model, temperature=0.2,
+                api_key=api_key, collector=collector, operation="captions_retry",
+            )
+    logger.error("Social caption generation failed after retry; returning empty dict")
+    return {}
 
 
 def rewrite_to_target_words(

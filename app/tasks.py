@@ -55,7 +55,8 @@ MAX_SECONDS = int(os.getenv("TTS_DURATION_MAX_SECONDS", "210"))
 
 import hashlib
 from contextlib import contextmanager
-from redis import Redis as _RedisClient
+
+from app.redis_client import get_redis as _get_redis
 
 
 @contextmanager
@@ -68,12 +69,7 @@ def _article_lock(source_id: str, url: str, ttl: int = 120):
     acquired = False
     r = None
     try:
-        r = _RedisClient.from_url(
-            os.environ["CELERY_BROKER_URL"],
-            decode_responses=True,
-            socket_connect_timeout=1,
-            socket_timeout=1,
-        )
+        r = _get_redis()
         acquired = bool(r.set(key, "1", nx=True, ex=ttl))
     except Exception:
         acquired = True  # fail open — allow the task to proceed
@@ -100,12 +96,7 @@ def _on_task_postrun(sender=None, task_id=None, kwargs=None, **_extra):
     if not user_id:
         return
     try:
-        r = _RedisClient.from_url(
-            os.environ["CELERY_BROKER_URL"],
-            decode_responses=True,
-            socket_connect_timeout=1,
-            socket_timeout=1,
-        )
+        r = _get_redis()
         key = f"user_tasks:{user_id}"
         count = r.decr(key)
         if int(count) < 0:
@@ -522,6 +513,8 @@ def generate_latest_for_source(
                 state="PROGRESS",
                 meta={"stage": "synthesizing", "msg": f"Synthesizing audio (attempt {attempt}/{MAX_TTS_ATTEMPTS})…"},
             )
+            tmp_path: str | None = None
+            accepted = False
             try:
                 audio_bytes = synthesize(
                     script, voice_id=used_voice_id, model_id=model_id,
@@ -537,13 +530,11 @@ def generate_latest_for_source(
 
                 if accept_min <= duration <= accept_max:
                     os.replace(tmp_path, final_path)
+                    tmp_path = None  # promoted to final_path — no cleanup needed
+                    accepted = True
                     break
 
                 if attempt >= MAX_TTS_ATTEMPTS:
-                    try:
-                        os.remove(tmp_path)
-                    except Exception:
-                        pass
                     break
 
                 wc = word_count or len(script.split())
@@ -555,14 +546,16 @@ def generate_latest_for_source(
                 )
                 word_count = len(script.split())
 
-                try:
-                    os.remove(tmp_path)
-                except Exception:
-                    pass
-
             except Exception as e:
                 last_error = str(e)
                 duration = None
+            finally:
+                # Clean up temp file if it exists and wasn't promoted to final
+                if tmp_path and not accepted:
+                    try:
+                        os.remove(tmp_path)
+                    except Exception:
+                        pass
 
         if duration is None or not (accept_min <= duration <= accept_max):
             raise RuntimeError(f"TTS out of range after retries. duration={duration}, error={last_error}")
@@ -738,11 +731,20 @@ def generate_video_for_article(
                     db.add(img_record)
                     db.commit()
 
+                if not os.path.exists(img_path):
+                    raise RuntimeError(
+                        f"Scene {scene.scene_number} image missing from disk ({img_path}) — aborting video assembly"
+                    )
                 scene_inputs.append({"image_path": img_path, "duration": max(scene.duration_estimate, 1.0)})
 
             # ── SRT captions ─────────────────────────────────────────────────
             if burn_subtitles:
-                captions = storyboard_to_captions(storyboard)
+                audio_seconds: float | None = None
+                try:
+                    audio_seconds = float(_mp3_duration_seconds(audio.file_path))
+                except Exception:
+                    audio_seconds = None
+                captions = storyboard_to_captions(storyboard, actual_audio_duration=audio_seconds)
                 srt_content = captions_to_srt(captions)
                 srt_path = os.path.join(video_dir, f"{article_id}.srt")
                 with open(srt_path, "w", encoding="utf-8") as fh:
@@ -782,13 +784,15 @@ def generate_video_for_article(
             video_record.error = str(exc)[:500]
             db.commit()
             collector.flush(db, video_asset_id=video_record.id)
-            # Clean up orphaned SRT
+            raise
+        finally:
+            # SRT is temporary — subtitles get burned into the MP4, so the file
+            # itself is not needed after FFmpeg completes (success or failure).
             if srt_path and os.path.exists(srt_path):
                 try:
                     os.remove(srt_path)
                 except OSError:
                     pass
-            raise
 
 
 @celery_app.task(name="regenerate_script_for_article", bind=True)
@@ -1155,7 +1159,12 @@ def generate_animated_video_for_article(
             # ── Step 5: SRT captions ───────────────────────────────────────────
             if burn_subtitles:
                 from app.captions import storyboard_to_captions, captions_to_srt
-                captions    = storyboard_to_captions(storyboard)
+                audio_seconds: float | None = None
+                try:
+                    audio_seconds = float(_mp3_duration_seconds(audio.file_path))
+                except Exception:
+                    audio_seconds = None
+                captions    = storyboard_to_captions(storyboard, actual_audio_duration=audio_seconds)
                 srt_content = captions_to_srt(captions)
                 srt_path    = os.path.join(video_dir, f"{article_id}.srt")
                 with open(srt_path, "w", encoding="utf-8") as fh:
@@ -1216,9 +1225,10 @@ def generate_animated_video_for_article(
             video_record.error  = str(exc)[:500]
             db.commit()
             anim_collector.flush(db, video_asset_id=video_record.id)
+            raise
+        finally:
             if srt_path and os.path.exists(srt_path):
                 try:
                     os.remove(srt_path)
                 except OSError:
                     pass
-            raise
