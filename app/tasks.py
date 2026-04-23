@@ -10,8 +10,8 @@ from sqlalchemy.exc import IntegrityError
 
 from mutagen.mp3 import MP3
 
-from app.db import SessionLocal, engine
-from app.models import Base, Source, Article, AudioAsset, VoiceCalibration, ImageAsset, VideoAsset
+from app.db import SessionLocal
+from app.models import Source, Article, AudioAsset, VoiceCalibration, ImageAsset, VideoAsset
 from app.extract import extract_article_text
 from app.summarize import make_tts_bundle, rewrite_to_target_words
 from app.tts import synthesize
@@ -37,8 +37,6 @@ if os.getenv("ENABLE_SCHEDULED_GENERATION", "false").lower() == "true":
             ),
         }
     }
-
-Base.metadata.create_all(bind=engine)
 
 TARGET_SECONDS = int(os.getenv("TTS_TARGET_SECONDS", "180"))
 TOLERANCE_SECONDS = int(os.getenv("TTS_TOLERANCE_SECONDS", "30"))
