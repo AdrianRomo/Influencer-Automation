@@ -54,11 +54,25 @@ export type PaginatedArticles = {
   has_more: boolean
 }
 
+export type RssCandidate = {
+  title: string
+  url: string
+  summary?: string | null
+  published_at?: string | null
+  score: number
+  source_id: string
+  source_name: string
+}
+
 export type GenerateReq = {
   source_id: string
   voice_id?: string | null
   target_seconds: number
   n_scenes: number
+  article_url?: string | null
+  article_title?: string | null
+  article_summary?: string | null
+  article_published_at?: string | null
 }
 
 export type GenerateResp = {

@@ -1,13 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type {
   AnalysisResult, ArticleSummary, ContentPackage, GenerateReq, ImageAssetRef,
-  JobStatus, Source, StoryboardScene, UserResp, UserKeysOut,
+  JobStatus, RssCandidate, Source, StoryboardScene, UserResp, UserKeysOut,
 } from './types'
 import {
-  cancelJob, editScript, getArticlePackage, getExportZipUrl, jobStatus, listArticles,
-  listSources, pinArticle, regenerateStage, reorderStoryboard, resolveAudioUrl,
-  resolveCaptionUrl, resolveImageUrl, resolveVideoUrl, setApiKey, startGenerate,
-  startGenerateVideo, startRegenerateScript, uploadSceneImage,
+  cancelJob, editScript, fetchRssCandidates, getArticlePackage, getExportZipUrl,
+  jobStatus, listArticles, listSources, pinArticle, regenerateStage, reorderStoryboard,
+  resolveAudioUrl, resolveCaptionUrl, resolveImageUrl, resolveVideoUrl, setApiKey,
+  startGenerate, startGenerateVideo, startRegenerateScript, uploadSceneImage,
   register, login, getMe, getUserKeys, saveUserKeys,
   setAuthToken, clearAuthToken,
 } from './api'
@@ -435,6 +435,65 @@ function HistoryRow({ article, sources, onLoad, onPin }: {
   )
 }
 
+function ScoreBar({ score }: { score: number }) {
+  const pct = Math.round(Math.min(score / 10, 1) * 100)
+  return (
+    <div className="score-bar-wrap" title={`Relevance: ${score.toFixed(1)} / 10`}>
+      <div className="score-bar-track">
+        <div className="score-bar-fill" style={{ width: `${pct}%` }} />
+      </div>
+      <span className="score-label">{score.toFixed(1)}</span>
+    </div>
+  )
+}
+
+function ArticleCard({
+  candidate,
+  rank,
+  onSelect,
+}: {
+  candidate: RssCandidate
+  rank: number
+  onSelect: () => void
+}) {
+  return (
+    <div className="candidate-card">
+      <div className="candidate-rank-badge">#{rank}</div>
+      <div className="candidate-body">
+        <div className="candidate-title">{candidate.title}</div>
+        <div className="candidate-meta">
+          <span className="small">{candidate.source_name}</span>
+          {candidate.published_at && (
+            <span className="small">{relativeDate(candidate.published_at)}</span>
+          )}
+          <ScoreBar score={candidate.score} />
+        </div>
+        {candidate.summary && (
+          <div className="candidate-summary small">
+            {candidate.summary.length > 220
+              ? candidate.summary.slice(0, 220) + '…'
+              : candidate.summary}
+          </div>
+        )}
+        <div className="candidate-footer">
+          <a
+            href={candidate.url}
+            target="_blank"
+            rel="noreferrer"
+            className="small link"
+            onClick={e => e.stopPropagation()}
+          >
+            {new URL(candidate.url).hostname}
+          </a>
+          <button className="candidate-select-btn" onClick={onSelect}>
+            Use This Article →
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 // ── Main App ───────────────────────────────────────────────────────────────
 
 export default function App() {
@@ -483,6 +542,14 @@ export default function App() {
   const [scriptSaving, setScriptSaving] = useState(false)
   const [scriptSaveError, setScriptSaveError] = useState('')
   const [regenScriptLoading, setRegenScriptLoading] = useState(false)
+
+  // ── Article picker flow ──────────────────────────────────────────────────
+  type FlowStep = 'pick' | 'configure'
+  const [flowStep, setFlowStep] = useState<FlowStep>('pick')
+  const [candidates, setCandidates] = useState<RssCandidate[]>([])
+  const [candidatesLoading, setCandidatesLoading] = useState(false)
+  const [candidatesError, setCandidatesError] = useState('')
+  const [selectedCandidate, setSelectedCandidate] = useState<RssCandidate | null>(null)
 
   // ── History + pagination ─────────────────────────────────────────────────
   const [history, setHistory] = useState<ArticleSummary[]>([])
@@ -634,6 +701,7 @@ export default function App() {
     setAudioJob(null); setVideoJob(null); setVideoError(''); setVideoStage('')
     setError(''); setLoading(false); setVideoLoading(false)
     setPkg(null); setPkgLoading(true); setStatusText('Loading…')
+    setSelectedCandidate(null); setCandidates([])
     try {
       const p = await getArticlePackage(articleId)
       setPkg(p)
@@ -649,16 +717,20 @@ export default function App() {
   // ── Audio generation ─────────────────────────────────────────────────────
 
   async function startAudio() {
-    if (!sourceId) return
+    if (!selectedCandidate) return
     setError(''); setLoading(true); setAudioJob(null); setPkg(null)
     setVideoJob(null); setVideoError(''); setVideoStage('')
     setStatusText('Queueing…')
     try {
       const payload: GenerateReq = {
-        source_id: sourceId,
+        source_id: selectedCandidate.source_id,
         voice_id: voiceId.trim() || null,
         target_seconds: targetSeconds,
         n_scenes: nScenes,
+        article_url: selectedCandidate.url,
+        article_title: selectedCandidate.title,
+        article_summary: selectedCandidate.summary ?? null,
+        article_published_at: selectedCandidate.published_at ?? null,
       }
       const resp = await startGenerate(payload)
       activeAudioTaskId.current = resp.task_id
@@ -780,6 +852,49 @@ export default function App() {
     setVideoJob(null); setVideoError(''); setVideoLoading(false); setVideoStage('')
     setLoading(false); setStatusText('Idle'); setPkgLoading(false)
     setScriptEditing(false); setScriptSaveError('')
+    setFlowStep('pick'); setCandidates([]); setCandidatesError('')
+    setSelectedCandidate(null)
+  }
+
+  // ── Article picker handlers ───────────────────────────────────────────────
+
+  async function handlePullCandidates() {
+    setCandidatesError('')
+    setCandidates([])
+    setCandidatesLoading(true)
+    try {
+      // sourceId '_all' means fetch across all sources
+      const sid = sourceId === '_all' ? undefined : sourceId
+      const results = await fetchRssCandidates(sid, 10)
+      if (results.length === 0) {
+        setCandidatesError('No articles found. Try a different source or check back later.')
+      } else {
+        setCandidates(results)
+      }
+    } catch (e: unknown) {
+      setCandidatesError(String((e as Error)?.message ?? e))
+    } finally {
+      setCandidatesLoading(false)
+    }
+  }
+
+  function handleSelectCandidate(c: RssCandidate) {
+    setSelectedCandidate(c)
+    setFlowStep('configure')
+    setCandidates([])
+    setCandidatesError('')
+    window.scrollTo({ top: 0, behavior: 'smooth' })
+  }
+
+  function handleChangeArticle() {
+    setSelectedCandidate(null)
+    setFlowStep('pick')
+    setCandidates([])
+    setCandidatesError('')
+    setPkg(null)
+    setAudioJob(null); setVideoJob(null)
+    setError(''); setVideoError(''); setStatusText('Idle')
+    setLoading(false); setVideoLoading(false)
   }
 
   // ── Side effects ───────────────────────────────────────────────────────────
@@ -791,10 +906,11 @@ export default function App() {
       : 'Medical Content Generator'
   }, [pkg?.title])
 
-  // Cmd/Ctrl+Enter → generate audio
+  // Cmd/Ctrl+Enter → generate audio (only in step 2 with a selected article)
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
-      if ((e.metaKey || e.ctrlKey) && e.key === 'Enter' && !loading && sourceId && !showAuthModal) {
+      if ((e.metaKey || e.ctrlKey) && e.key === 'Enter'
+          && !loading && selectedCandidate && flowStep === 'configure' && !showAuthModal) {
         e.preventDefault()
         startAudio()
       }
@@ -802,7 +918,7 @@ export default function App() {
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [loading, sourceId, showAuthModal])
+  }, [loading, selectedCandidate, flowStep, showAuthModal])
 
   // Warn before leaving when script has unsaved edits
   useEffect(() => {
@@ -909,11 +1025,6 @@ export default function App() {
 
   // ── Derived ───────────────────────────────────────────────────────────────
 
-  const selectedSource = useMemo(
-    () => sources.find(s => String(s.id) === String(sourceId)) ?? null,
-    [sources, sourceId],
-  )
-
   const articleId = pkg?.article_id ?? (audioJob?.result?.article_id as string | undefined)
   const videoReady = pkg?.video?.status === 'ready'
   const audioDownloadUrl = pkg?.audio?.id ? resolveAudioUrl(pkg.audio.id) : undefined
@@ -1010,79 +1121,159 @@ export default function App() {
         </div>
       )}
 
-      {/* Generation form */}
-      <div className="card">
-        <div className="row">
-          <div>
-            <label>Source</label>
-            <select
-              value={sourceId}
-              onChange={e => setSourceId(e.target.value)}
-              disabled={!sources.length || loading}
-            >
-              {sources.map(s => (
-                <option key={String(s.id)} value={String(s.id)}>{s.name}</option>
-              ))}
-            </select>
-            {selectedSource && (
-              <div className="small" style={{ marginTop: 6 }}>
-                {selectedSource.language_hint && (
-                  <><span className="code">{selectedSource.language_hint}</span> · </>
-                )}
-                <span className="code">{selectedSource.rss_url}</span>
+      {/* ── Step 1: Article Picker ───────────────────────────────────── */}
+      {!pkg && flowStep === 'pick' && (
+        <div className="card flow-card">
+          <div className="flow-step-header">
+            <span className="flow-step-pill">1</span>
+            <span className="flow-step-title">Choose an Article</span>
+          </div>
+
+          <div className="picker-source-row">
+            <div style={{ flex: 1 }}>
+              <label>Source</label>
+              <select
+                value={sourceId}
+                onChange={e => setSourceId(e.target.value)}
+                disabled={candidatesLoading || !sources.length}
+              >
+                <option value="_all">All Sources</option>
+                {sources.map(s => (
+                  <option key={String(s.id)} value={String(s.id)}>{s.name}</option>
+                ))}
+              </select>
+            </div>
+            <div className="picker-pull-wrap">
+              <button
+                onClick={handlePullCandidates}
+                disabled={candidatesLoading || !sources.length}
+                className="pull-btn"
+              >
+                {candidatesLoading ? (
+                  <><span className="spinner" />Fetching articles…</>
+                ) : 'Pull Latest Articles'}
+              </button>
+            </div>
+          </div>
+
+          {candidatesError && (
+            <div className="error-text" style={{ marginTop: 10 }}>{candidatesError}</div>
+          )}
+
+          {candidates.length > 0 && (
+            <div className="candidate-list">
+              <div className="candidate-list-header small">
+                {candidates.length} article{candidates.length !== 1 ? 's' : ''} found — pick one to continue
               </div>
-            )}
-          </div>
-          <div>
-            <label>
-              Voice ID <span className="small">
-                {userKeys?.elevenlabs_voice_id
-                  ? `(using account voice: ${userKeys.elevenlabs_voice_id})`
-                  : '(optional — overrides account default)'}
-              </span>
-            </label>
-            <input
-              placeholder={userKeys?.elevenlabs_voice_id ?? 'ElevenLabs voice_id — leave empty for default'}
-              value={voiceId}
-              onChange={e => setVoiceId(e.target.value)}
-              disabled={loading}
-            />
-          </div>
+              {candidates.map((c, i) => (
+                <ArticleCard
+                  key={c.url}
+                  candidate={c}
+                  rank={i + 1}
+                  onSelect={() => handleSelectCandidate(c)}
+                />
+              ))}
+            </div>
+          )}
+
+          {candidates.length === 0 && !candidatesLoading && !candidatesError && (
+            <div className="picker-empty">
+              Select a source above and click <strong>Pull Latest Articles</strong> to browse available content.
+            </div>
+          )}
         </div>
+      )}
 
-        <hr />
-
-        <div className="row">
-          <div>
-            <label>Target duration (seconds)</label>
-            <input
-              type="number" min={30} max={600} value={targetSeconds}
-              onChange={e => setTargetSeconds(Number(e.target.value))}
-              disabled={loading}
-            />
+      {/* ── Step 2: Selected article + generation settings ───────────── */}
+      {!pkg && flowStep === 'configure' && selectedCandidate && (
+        <>
+          {/* Selected article banner */}
+          <div className="selected-article-card">
+            <div className="selected-check">✓</div>
+            <div className="selected-article-info">
+              <div className="selected-article-title">{selectedCandidate.title}</div>
+              <div className="selected-article-meta">
+                <span className="small">{selectedCandidate.source_name}</span>
+                {selectedCandidate.published_at && (
+                  <span className="small">{relativeDate(selectedCandidate.published_at)}</span>
+                )}
+                <a
+                  href={selectedCandidate.url}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="small link"
+                >
+                  {(() => { try { return new URL(selectedCandidate.url).hostname } catch { return selectedCandidate.url.slice(0, 40) } })()}
+                </a>
+              </div>
+            </div>
+            <button className="secondary settings-btn change-article-btn" onClick={handleChangeArticle}>
+              ← Change
+            </button>
           </div>
-          <div>
-            <label>Storyboard scenes</label>
-            <input
-              type="number" min={0} max={20} value={nScenes}
-              onChange={e => setNScenes(Number(e.target.value))}
-              disabled={loading}
-            />
+
+          {/* Generation settings */}
+          <div className="card flow-card">
+            <div className="flow-step-header">
+              <span className="flow-step-pill">2</span>
+              <span className="flow-step-title">Generation Settings</span>
+              <span className="small" style={{ marginLeft: 'auto', color: '#9ca3af' }}>⌘↵ to generate</span>
+            </div>
+
+            <div className="row">
+              <div>
+                <label>
+                  Voice ID <span className="small">
+                    {userKeys?.elevenlabs_voice_id
+                      ? `(account: ${userKeys.elevenlabs_voice_id})`
+                      : '(optional override)'}
+                  </span>
+                </label>
+                <input
+                  placeholder={userKeys?.elevenlabs_voice_id ?? 'ElevenLabs voice_id — leave blank for default'}
+                  value={voiceId}
+                  onChange={e => setVoiceId(e.target.value)}
+                  disabled={loading}
+                />
+              </div>
+            </div>
+
+            <div className="row" style={{ marginTop: 12 }}>
+              <div>
+                <label>Target duration (seconds)</label>
+                <input
+                  type="number" min={30} max={600} value={targetSeconds}
+                  onChange={e => setTargetSeconds(Number(e.target.value))}
+                  disabled={loading}
+                />
+              </div>
+              <div>
+                <label>Storyboard scenes</label>
+                <input
+                  type="number" min={0} max={20} value={nScenes}
+                  onChange={e => setNScenes(Number(e.target.value))}
+                  disabled={loading}
+                />
+              </div>
+            </div>
+
+            <div className="actions" style={{ marginTop: 16 }}>
+              <button
+                className="generate-btn"
+                onClick={startAudio}
+                disabled={loading}
+              >
+                {loading ? 'Generating…' : 'Generate Script · Audio · Video'}
+              </button>
+              {loading && (
+                <button className="secondary" onClick={cancelAudio}>Cancel</button>
+              )}
+            </div>
+
+            {error && <div className="error-text">{error}</div>}
           </div>
-        </div>
-
-        <div className="actions" style={{ marginTop: 14 }}>
-          <button onClick={startAudio} disabled={loading || !sourceId}>
-            {loading ? 'Generating…' : 'Generate Audio'}
-          </button>
-          {loading
-            ? <button className="secondary" onClick={cancelAudio}>Cancel</button>
-            : <button className="secondary" onClick={reset}>Reset</button>
-          }
-        </div>
-
-        {error && <div className="error-text">{error}</div>}
-      </div>
+        </>
+      )}
 
       {/* History */}
       <div style={{ marginTop: 12 }}>
@@ -1124,6 +1315,18 @@ export default function App() {
       {pkgLoading && (
         <div className="card" style={{ marginTop: 12 }}>
           <div className="small">Loading article…</div>
+        </div>
+      )}
+
+      {/* Results toolbar */}
+      {pkg && (
+        <div className="results-toolbar">
+          <button className="secondary settings-btn" onClick={reset}>
+            ← New Article
+          </button>
+          <span className="small" style={{ color: '#9ca3af' }}>
+            {pkg.title.length > 60 ? pkg.title.slice(0, 60) + '…' : pkg.title}
+          </span>
         </div>
       )}
 

@@ -130,6 +130,10 @@ def generate_latest_for_source(
     openai_api_key: str | None = None,
     elevenlabs_api_key: str | None = None,
     user_id: str | None = None,
+    article_url: str | None = None,
+    article_title: str | None = None,
+    article_summary: str | None = None,
+    article_published_at: str | None = None,
 ) -> dict:
     audio_dir = os.getenv("AUDIO_DIR", "/data/audio")
     os.makedirs(audio_dir, exist_ok=True)
@@ -139,26 +143,40 @@ def generate_latest_for_source(
         if not src:
             raise ValueError(f"Unknown source_id: {source_id}")
 
-        self.update_state(state="PROGRESS", meta={"stage": "fetching", "msg": "Fetching latest RSS entry…"})
+        if article_url:
+            # User pre-selected this article from the RSS picker — skip feed fetch entirely
+            title = (article_title or "").strip() or "Untitled"
+            url = article_url.strip()
+            fallback = (article_summary or "").strip()
+            published_at = None
+            if article_published_at:
+                try:
+                    published_at = datetime.fromisoformat(article_published_at)
+                except Exception:
+                    pass
+            logger.info("Using pre-selected article: title=%r url=%s", title, url)
+        else:
+            # Auto-pick best entry from the RSS feed (scheduled / legacy path)
+            self.update_state(state="PROGRESS", meta={"stage": "fetching", "msg": "Fetching latest RSS entry…"})
 
-        feed = feedparser.parse(src.rss_url)
-        if not feed.entries:
-            raise RuntimeError("No RSS entries found")
+            feed = feedparser.parse(src.rss_url)
+            if not feed.entries:
+                raise RuntimeError("No RSS entries found")
 
-        lookback_days = int(os.getenv("RSS_LOOKBACK_DAYS", "7"))
-        cutoff = datetime.utcnow() - timedelta(days=lookback_days)
+            lookback_days = int(os.getenv("RSS_LOOKBACK_DAYS", "7"))
+            cutoff = datetime.utcnow() - timedelta(days=lookback_days)
 
-        candidates = [e for e in feed.entries if _parse_dt(e) and _parse_dt(e) >= cutoff]
-        now = datetime.utcnow()
-        entry = max(candidates, key=lambda e: _score_entry(e, now)) if candidates else feed.entries[0]
-        title = (entry.get("title") or "").strip() or "Untitled"
-        url = (entry.get("link") or "").strip()
-        if not url:
-            raise RuntimeError("RSS entry has no link/url")
-        fallback = (entry.get("summary") or entry.get("description") or "").strip()
-        published_at = _parse_dt(entry)
+            candidates = [e for e in feed.entries if _parse_dt(e) and _parse_dt(e) >= cutoff]
+            now = datetime.utcnow()
+            entry = max(candidates, key=lambda e: _score_entry(e, now)) if candidates else feed.entries[0]
+            title = (entry.get("title") or "").strip() or "Untitled"
+            url = (entry.get("link") or "").strip()
+            if not url:
+                raise RuntimeError("RSS entry has no link/url")
+            fallback = (entry.get("summary") or entry.get("description") or "").strip()
+            published_at = _parse_dt(entry)
 
-        logger.info("Selected RSS entry: title=%r published_at=%s url=%s", title, published_at, url)
+            logger.info("Selected RSS entry: title=%r published_at=%s url=%s", title, published_at, url)
 
         # Upsert article
         article = Article(source_id=src.id, title=title, url=url, published_at=published_at, user_id=user_id)

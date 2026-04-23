@@ -1,3 +1,4 @@
+import asyncio
 import io
 import json
 import logging
@@ -7,6 +8,7 @@ from collections import defaultdict
 from contextlib import asynccontextmanager
 from datetime import datetime
 from time import time as _time
+import feedparser as _fp
 from fastapi import FastAPI, Depends, File, HTTPException, Header, Query, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -139,11 +141,26 @@ app.add_middleware(
 )
 
 
+class RssCandidateOut(BaseModel):
+    title: str
+    url: str
+    summary: str | None = None
+    published_at: str | None = None
+    score: float
+    source_id: str
+    source_name: str
+
+
 class GenerateReq(BaseModel):
     source_id: str
     voice_id: str | None = None
     target_seconds: int = Field(default=DEFAULT_TARGET_SECONDS, ge=30, le=600)
     n_scenes: int = Field(default=DEFAULT_SCENES, ge=0, le=20)
+    # Pre-selected article from the RSS picker — when set, the task skips RSS auto-pick
+    article_url: str | None = None
+    article_title: str | None = None
+    article_summary: str | None = None
+    article_published_at: str | None = None
 
 
 class GenerateVideoReq(BaseModel):
@@ -181,6 +198,107 @@ def health(db: Session = Depends(get_db)):
         status_code=200 if status == "ok" else 503,
         content={"status": status, "db": db_status, "redis": redis_status},
     )
+
+
+# ── RSS candidate picker ───────────────────────────────────────────────────
+
+def _rss_parse_dt(entry) -> datetime | None:
+    for k in ("published_parsed", "updated_parsed"):
+        t = getattr(entry, k, None)
+        if t:
+            return datetime(*t[:6])
+    return None
+
+
+def _rss_score_entry(entry, now: datetime) -> float:
+    score = 0.0
+    dt = _rss_parse_dt(entry)
+    if dt:
+        age_days = max((now - dt).total_seconds() / 86_400, 0)
+        score += max(0.0, 5.0 - age_days)
+    title = (entry.get("title") or "").strip()
+    if 30 <= len(title) <= 150:
+        score += 3
+    elif len(title) > 10:
+        score += 1
+    summary = (entry.get("summary") or entry.get("description") or "").strip()
+    if len(summary) > 300:
+        score += 2
+    elif len(summary) > 80:
+        score += 1
+    return score
+
+
+@app.get("/rss/candidates", response_model=list[RssCandidateOut], dependencies=[Depends(check_api_key)])
+async def get_rss_candidates(
+    source_id: str | None = Query(default=None, description="Filter to a single source; omit for all sources"),
+    limit: int = Query(default=10, ge=1, le=30),
+    db: Session = Depends(get_db),
+):
+    """Fetch and score RSS candidates for the article picker — no DB writes, no generation."""
+    if source_id:
+        src = db.get(Source, source_id)
+        if not src:
+            raise HTTPException(status_code=404, detail="Source not found")
+        sources_to_fetch: list[Source] = [src]
+    else:
+        sources_to_fetch = list(db.execute(select(Source)).scalars().all())
+
+    now = datetime.utcnow()
+
+    def _fetch_one(src_obj: Source) -> list[dict]:
+        try:
+            feed = _fp.parse(src_obj.rss_url)
+            results = []
+            for entry in feed.entries[:20]:
+                title = (entry.get("title") or "").strip()
+                url = (entry.get("link") or "").strip()
+                if not url or not title:
+                    continue
+                summary = (entry.get("summary") or entry.get("description") or "").strip()
+                dt = _rss_parse_dt(entry)
+                results.append({
+                    "title": title,
+                    "url": url,
+                    "summary": summary[:500] if summary else None,
+                    "published_at": dt.isoformat() if dt else None,
+                    "score": round(_rss_score_entry(entry, now), 2),
+                    "source_id": src_obj.id,
+                    "source_name": src_obj.name,
+                })
+            results.sort(key=lambda c: -c["score"])
+            return results
+        except Exception as exc:
+            logger.warning("RSS candidates fetch failed for '%s': %s", src_obj.name, exc)
+            return []
+
+    loop = asyncio.get_event_loop()
+    per_source = await asyncio.gather(
+        *[loop.run_in_executor(None, _fetch_one, s) for s in sources_to_fetch],
+        return_exceptions=True,
+    )
+
+    all_candidates: list[dict] = []
+    for result in per_source:
+        if isinstance(result, list):
+            all_candidates.extend(result)
+
+    all_candidates.sort(key=lambda c: -c["score"])
+
+    if source_id:
+        return all_candidates[:limit]
+
+    # Multi-source: cap at 3 per source to keep results diverse
+    seen: dict[str, int] = {}
+    diverse: list[dict] = []
+    for c in all_candidates:
+        sid = c["source_id"]
+        if seen.get(sid, 0) < 3:
+            diverse.append(c)
+            seen[sid] = seen.get(sid, 0) + 1
+        if len(diverse) >= limit:
+            break
+    return diverse
 
 
 # ── Global exception handler ───────────────────────────────────────────────
@@ -788,6 +906,10 @@ def generate(
             "openai_api_key": openai_key,
             "elevenlabs_api_key": el_key,
             "user_id": current_user.id if current_user else None,
+            "article_url": req.article_url,
+            "article_title": req.article_title,
+            "article_summary": req.article_summary,
+            "article_published_at": req.article_published_at,
         },
     )
     _audio_tasks[task_key] = task.id

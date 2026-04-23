@@ -1,6 +1,6 @@
 import type {
-  ArticleSummary, PaginatedArticles, Source, GenerateReq, GenerateResp, JobStatus, ContentPackage,
-  TokenResp, UserResp, UserKeysIn, UserKeysOut,
+  ArticleSummary, PaginatedArticles, RssCandidate, Source, GenerateReq, GenerateResp,
+  JobStatus, ContentPackage, TokenResp, UserResp, UserKeysIn, UserKeysOut,
 } from './types'
 
 const rawBase = import.meta.env.VITE_API_BASE_URL as string | undefined
@@ -62,6 +62,13 @@ export function saveUserKeys(keys: UserKeysIn): Promise<UserKeysOut> {
 
 export function listSources(): Promise<Source[]> {
   return http<Source[]>('/sources')
+}
+
+export function fetchRssCandidates(sourceId?: string, limit = 10): Promise<RssCandidate[]> {
+  const q = new URLSearchParams()
+  if (sourceId) q.set('source_id', sourceId)
+  q.set('limit', String(limit))
+  return http<RssCandidate[]>(`/rss/candidates?${q.toString()}`)
 }
 
 export function listArticles(params?: { source_id?: string; limit?: number; offset?: number }): Promise<PaginatedArticles> {
