@@ -1,6 +1,7 @@
 import type {
-  ArticleSummary, PaginatedArticles, RssCandidate, Source, GenerateReq, GenerateResp,
-  JobStatus, ContentPackage, TokenResp, UserResp, UserKeysIn, UserKeysOut,
+  ArticleSummary, PaginatedArticles, PrepareArticleReq, RssCandidate, Source,
+  GenerateReq, GenerateResp, JobStatus, ContentPackage,
+  TokenResp, UserResp, UserKeysIn, UserKeysOut,
 } from './types'
 
 const rawBase = import.meta.env.VITE_API_BASE_URL as string | undefined
@@ -78,6 +79,10 @@ export function listArticles(params?: { source_id?: string; limit?: number; offs
   if (params?.offset != null) q.set('offset', String(params.offset))
   const qs = q.toString()
   return http<PaginatedArticles>(`/articles${qs ? `?${qs}` : ''}`)
+}
+
+export function prepareArticle(req: PrepareArticleReq): Promise<GenerateResp> {
+  return http<GenerateResp>('/articles/prepare', { method: 'POST', body: JSON.stringify(req) })
 }
 
 export function startGenerate(req: GenerateReq): Promise<GenerateResp> {

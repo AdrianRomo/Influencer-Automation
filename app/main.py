@@ -151,6 +151,16 @@ class RssCandidateOut(BaseModel):
     source_name: str
 
 
+class PrepareArticleReq(BaseModel):
+    source_id: str
+    article_url: str
+    article_title: str = ""
+    article_summary: str | None = None
+    article_published_at: str | None = None
+    n_scenes: int = Field(default=DEFAULT_SCENES, ge=0, le=20)
+    target_seconds: int = Field(default=DEFAULT_TARGET_SECONDS, ge=30, le=600)
+
+
 class GenerateReq(BaseModel):
     source_id: str
     voice_id: str | None = None
@@ -161,6 +171,8 @@ class GenerateReq(BaseModel):
     article_title: str | None = None
     article_summary: str | None = None
     article_published_at: str | None = None
+    # Pre-prepared article with script — when set, the task skips straight to TTS
+    article_id: str | None = None
 
 
 class GenerateVideoReq(BaseModel):
@@ -876,6 +888,37 @@ def export_article_zip(article_id: str, db: Session = Depends(get_db)):
 
 # ── Jobs ───────────────────────────────────────────────────────────────────
 
+@app.post("/articles/prepare", dependencies=[Depends(check_api_key)])
+def prepare_article_endpoint(
+    req: PrepareArticleReq,
+    db: Session = Depends(get_db),
+    current_user: Optional[User] = Depends(get_optional_user),
+):
+    """Queue script + storyboard generation without TTS. Returns a task_id to poll.
+
+    The resulting article_id can then be passed to POST /generate to run TTS
+    on the user-reviewed (and optionally edited) script.
+    """
+    if not db.get(Source, req.source_id):
+        raise HTTPException(status_code=404, detail="Unknown source_id")
+    openai_key, _, _ = _resolve_user_keys(current_user, db)
+    task = celery_app.send_task(
+        "prepare_article",
+        kwargs={
+            "source_id": req.source_id,
+            "article_url": req.article_url,
+            "article_title": req.article_title,
+            "article_summary": req.article_summary,
+            "article_published_at": req.article_published_at,
+            "n_scenes": req.n_scenes,
+            "target_seconds": req.target_seconds,
+            "openai_api_key": openai_key,
+            "user_id": current_user.id if current_user else None,
+        },
+    )
+    return {"task_id": task.id, "status": "queued"}
+
+
 @app.post("/generate", dependencies=[Depends(check_api_key)])
 def generate(
     req: GenerateReq,
@@ -910,6 +953,7 @@ def generate(
             "article_title": req.article_title,
             "article_summary": req.article_summary,
             "article_published_at": req.article_published_at,
+            "article_id": req.article_id,
         },
     )
     _audio_tasks[task_key] = task.id

@@ -5,9 +5,9 @@ import type {
 } from './types'
 import {
   cancelJob, editScript, fetchRssCandidates, getArticlePackage, getExportZipUrl,
-  jobStatus, listArticles, listSources, pinArticle, regenerateStage, reorderStoryboard,
-  resolveAudioUrl, resolveCaptionUrl, resolveImageUrl, resolveVideoUrl, setApiKey,
-  startGenerate, startGenerateVideo, startRegenerateScript, uploadSceneImage,
+  jobStatus, listArticles, listSources, pinArticle, prepareArticle, regenerateStage,
+  reorderStoryboard, resolveAudioUrl, resolveCaptionUrl, resolveImageUrl, resolveVideoUrl,
+  setApiKey, startGenerate, startGenerateVideo, startRegenerateScript, uploadSceneImage,
   register, login, getMe, getUserKeys, saveUserKeys,
   setAuthToken, clearAuthToken,
 } from './api'
@@ -536,6 +536,9 @@ export default function App() {
   const [videoError, setVideoError] = useState('')
   const [videoStage, setVideoStage] = useState('')
 
+  // ── Script prepare (preview-before-audio) ──────────────────────────────
+  const [prepareLoading, setPrepareLoading] = useState(false)
+
   // ── Script editing ─────────────────────────────────────────────────────
   const [scriptEditing, setScriptEditing] = useState(false)
   const [scriptDraft, setScriptDraft] = useState('')
@@ -850,7 +853,7 @@ export default function App() {
     if (videoPollTimer.current) window.clearTimeout(videoPollTimer.current)
     setAudioJob(null); setPkg(null); setError('')
     setVideoJob(null); setVideoError(''); setVideoLoading(false); setVideoStage('')
-    setLoading(false); setStatusText('Idle'); setPkgLoading(false)
+    setLoading(false); setPrepareLoading(false); setStatusText('Idle'); setPkgLoading(false)
     setScriptEditing(false); setScriptSaveError('')
     setFlowStep('pick'); setCandidates([]); setCandidatesError('')
     setSelectedCandidate(null)
@@ -895,6 +898,86 @@ export default function App() {
     setAudioJob(null); setVideoJob(null)
     setError(''); setVideoError(''); setStatusText('Idle')
     setLoading(false); setVideoLoading(false)
+  }
+
+  // ── Script preview (prepare_article task) ────────────────────────────────
+
+  async function handlePrepareArticle() {
+    if (!selectedCandidate) return
+    setPrepareLoading(true)
+    setError('')
+    setPkg(null)
+    setAudioJob(null)
+    setStatusText('Generating script preview…')
+    try {
+      const resp = await prepareArticle({
+        source_id: selectedCandidate.source_id,
+        article_url: selectedCandidate.url,
+        article_title: selectedCandidate.title,
+        article_summary: selectedCandidate.summary ?? null,
+        article_published_at: selectedCandidate.published_at ?? null,
+        n_scenes: nScenes,
+        target_seconds: targetSeconds,
+      })
+      activeAudioTaskId.current = resp.task_id
+      pollPrepare(resp.task_id)
+    } catch (e: unknown) {
+      setPrepareLoading(false)
+      setStatusText('Error')
+      setError(String((e as Error)?.message ?? e))
+    }
+  }
+
+  function pollPrepare(taskId: string) {
+    jobStatus(taskId).then(s => {
+      setAudioJob(s)
+      setStatusText(stageLabel(s))
+      if (s.state === 'SUCCESS') {
+        setPrepareLoading(false)
+        setStatusText('Script ready')
+        const aid = s.result?.article_id as string | undefined
+        if (aid) {
+          fetchPackage(aid)
+          addToast('success', 'Script generated — review below before generating audio')
+        }
+        loadHistory()
+      } else if (s.state === 'FAILURE') {
+        setPrepareLoading(false)
+        setStatusText('Failed')
+        setError(s.error || 'Script generation failed')
+      } else {
+        pollTimer.current = window.setTimeout(() => pollPrepare(taskId), 2500)
+      }
+    }).catch(e => {
+      setPrepareLoading(false)
+      setStatusText('Error')
+      setError(String((e as Error)?.message ?? e))
+    })
+  }
+
+  async function startAudioFromPreview() {
+    if (!pkg?.article_id || !selectedCandidate) return
+    setError('')
+    setLoading(true)
+    setAudioJob(null)
+    setStatusText('Queueing audio synthesis…')
+    try {
+      const payload: GenerateReq = {
+        source_id: selectedCandidate.source_id,
+        article_id: pkg.article_id,
+        voice_id: voiceId.trim() || null,
+        target_seconds: targetSeconds,
+        n_scenes: nScenes,
+      }
+      const resp = await startGenerate(payload)
+      activeAudioTaskId.current = resp.task_id
+      setStatusText(`Queued: ${resp.task_id.slice(0, 8)}…`)
+      pollAudio(resp.task_id)
+    } catch (e: unknown) {
+      setLoading(false)
+      setStatusText('Error')
+      setError(String((e as Error)?.message ?? e))
+    }
   }
 
   // ── Side effects ───────────────────────────────────────────────────────────
@@ -1260,13 +1343,25 @@ export default function App() {
             <div className="actions" style={{ marginTop: 16 }}>
               <button
                 className="generate-btn"
-                onClick={startAudio}
-                disabled={loading}
+                onClick={handlePrepareArticle}
+                disabled={loading || prepareLoading}
               >
-                {loading ? 'Generating…' : 'Generate Script · Audio · Video'}
+                {prepareLoading ? (
+                  <><span className="spinner spinner-light" />Generating script…</>
+                ) : 'Preview Script First'}
               </button>
-              {loading && (
-                <button className="secondary" onClick={cancelAudio}>Cancel</button>
+              <button
+                className="secondary"
+                onClick={startAudio}
+                disabled={loading || prepareLoading}
+                title="Skip preview and run the full pipeline in one step"
+              >
+                {loading ? 'Generating…' : 'Generate Everything'}
+              </button>
+              {(loading || prepareLoading) && (
+                <button className="secondary" onClick={() => { cancelAudio(); setPrepareLoading(false) }}>
+                  Cancel
+                </button>
               )}
             </div>
 
@@ -1364,6 +1459,61 @@ export default function App() {
               <a href={getExportZipUrl(pkg.article_id)} className="dl-btn" download>ZIP Package</a>
             </div>
           </div>
+
+          {/* Script-preview approval gate — shows when article is prepared but audio not yet generated */}
+          {pkg.script && !pkg.audio && (
+            <div className="card approve-card">
+              <div className="flow-step-header" style={{ marginBottom: 12 }}>
+                <span className="flow-step-pill" style={{ background: '#7c3aed' }}>3</span>
+                <span className="flow-step-title">Generate Voiceover + Video</span>
+              </div>
+              <p className="small" style={{ color: '#4b5563', margin: '0 0 14px' }}>
+                Review the script below. Edit it if needed, then synthesize the voiceover and assemble the video.
+              </p>
+              <div className="row">
+                <div>
+                  <label>
+                    Voice ID <span className="small">
+                      {userKeys?.elevenlabs_voice_id
+                        ? `(account: ${userKeys.elevenlabs_voice_id})`
+                        : '(optional override)'}
+                    </span>
+                  </label>
+                  <input
+                    placeholder={userKeys?.elevenlabs_voice_id ?? 'ElevenLabs voice_id'}
+                    value={voiceId}
+                    onChange={e => setVoiceId(e.target.value)}
+                    disabled={loading}
+                  />
+                </div>
+                <div className="row">
+                  <div>
+                    <label>Duration (s)</label>
+                    <input
+                      type="number" min={30} max={600} value={targetSeconds}
+                      onChange={e => setTargetSeconds(Number(e.target.value))}
+                      disabled={loading}
+                    />
+                  </div>
+                  <div>
+                    <label>Scenes</label>
+                    <input
+                      type="number" min={0} max={20} value={nScenes}
+                      onChange={e => setNScenes(Number(e.target.value))}
+                      disabled={loading}
+                    />
+                  </div>
+                </div>
+              </div>
+              <div className="actions" style={{ marginTop: 14 }}>
+                <button className="generate-btn" onClick={startAudioFromPreview} disabled={loading}>
+                  {loading ? 'Generating audio…' : 'Generate Audio + Video'}
+                </button>
+                {loading && <button className="secondary" onClick={cancelAudio}>Cancel</button>}
+              </div>
+              {error && <div className="error-text">{error}</div>}
+            </div>
+          )}
 
           {/* Script */}
           {pkg.script && (

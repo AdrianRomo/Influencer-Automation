@@ -1004,3 +1004,21 @@ hr {
   gap: 12px;
   margin: 12px 0 8px;
 }
+
+/* ── Spinner variant for dark backgrounds ───────────────────────────────── */
+
+.spinner-light {
+  border-color: rgba(255,255,255,0.3);
+  border-top-color: white;
+}
+
+/* ── Script approval card ────────────────────────────────────────────────── */
+
+.approve-card {
+  border: 2px solid #ddd6fe;
+  background: #faf5ff;
+}
+
+.approve-card .flow-step-pill {
+  background: #7c3aed;
+}

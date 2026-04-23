@@ -64,6 +64,16 @@ export type RssCandidate = {
   source_name: string
 }
 
+export type PrepareArticleReq = {
+  source_id: string
+  article_url: string
+  article_title?: string
+  article_summary?: string | null
+  article_published_at?: string | null
+  n_scenes?: number
+  target_seconds?: number
+}
+
 export type GenerateReq = {
   source_id: string
   voice_id?: string | null
@@ -73,6 +83,7 @@ export type GenerateReq = {
   article_title?: string | null
   article_summary?: string | null
   article_published_at?: string | null
+  article_id?: string | null
 }
 
 export type GenerateResp = {

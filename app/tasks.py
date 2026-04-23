@@ -120,6 +120,105 @@ def generate_all_sources_daily() -> dict:
     return {"dispatched": dispatched, "total_sources": len(sources)}
 
 
+@celery_app.task(name="prepare_article", bind=True)
+def prepare_article(
+    self,
+    source_id: str,
+    article_url: str,
+    article_title: str = "",
+    article_summary: str | None = None,
+    article_published_at: str | None = None,
+    n_scenes: int = 8,
+    target_seconds: int = TARGET_SECONDS,
+    openai_api_key: str | None = None,
+    user_id: str | None = None,
+) -> dict:
+    """Extract article content and generate script + storyboard WITHOUT audio synthesis.
+
+    Returns article_id so the frontend can display a script preview before the user
+    commits to TTS synthesis.
+    """
+    with SessionLocal() as db:
+        src = db.get(Source, source_id)
+        if not src:
+            raise ValueError(f"Unknown source_id: {source_id}")
+
+        title = (article_title or "").strip() or "Untitled"
+        url = article_url.strip()
+        fallback = (article_summary or "").strip()
+        published_at = None
+        if article_published_at:
+            try:
+                published_at = datetime.fromisoformat(article_published_at)
+            except Exception:
+                pass
+
+        article = Article(source_id=src.id, title=title, url=url, published_at=published_at, user_id=user_id)
+        db.add(article)
+        try:
+            db.commit()
+        except IntegrityError:
+            db.rollback()
+            article = db.execute(
+                select(Article).where(Article.source_id == src.id, Article.url == url)
+            ).scalar_one()
+            if user_id and not article.user_id:
+                article.user_id = user_id
+                db.commit()
+
+        self.update_state(state="PROGRESS", meta={"stage": "extracting", "msg": "Extracting article content…"})
+        raw = extract_article_text(url, fallback_text=fallback)
+        if not raw:
+            raw = fallback or title
+
+        wpm_estimate = 140.0
+        target_words = _words_for_seconds(target_seconds, wpm_estimate)
+        tol_words = _words_for_seconds(TOLERANCE_SECONDS, wpm_estimate)
+
+        self.update_state(state="PROGRESS", meta={"stage": "scripting", "msg": "Generating script & storyboard…"})
+        bundle = make_tts_bundle(
+            title=title,
+            body=raw,
+            language_hint=src.language_hint,
+            target_seconds=target_seconds,
+            n_scenes=n_scenes,
+            target_words=target_words,
+            tol_words=tol_words,
+            wpm_estimate=wpm_estimate,
+            api_key=openai_api_key,
+        )
+
+        script = bundle["script"]
+        scenes = bundle.get("scenes") or []
+        word_count = bundle.get("word_count") or len(script.split())
+
+        article.raw_text = raw
+        article.tts_script = script
+        article.script_language = os.getenv("TTS_OUTPUT_LANGUAGE", "es-MX")
+        article.summary_model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+        article.storyboard_json = {
+            "scenes": scenes,
+            "total_duration_estimate": bundle.get("total_duration_estimate", 0),
+        }
+        db.commit()
+
+        try:
+            from app.analysis import analyze_article as _analyze
+            self.update_state(state="PROGRESS", meta={"stage": "analyzing", "msg": "Analyzing content…"})
+            article.analysis_json = _analyze(script, api_key=openai_api_key)
+            db.commit()
+        except Exception as exc:
+            logger.warning("Analysis failed (non-fatal): %s", exc)
+
+        estimated_duration = int(round(word_count / (wpm_estimate / 60.0)))
+        logger.info("Prepared article id=%s words=%d est=%ds", article.id, word_count, estimated_duration)
+        return {
+            "article_id": article.id,
+            "word_count": word_count,
+            "estimated_duration_seconds": estimated_duration,
+        }
+
+
 @celery_app.task(name="generate_latest_for_source", bind=True)
 def generate_latest_for_source(
     self,
@@ -134,6 +233,7 @@ def generate_latest_for_source(
     article_title: str | None = None,
     article_summary: str | None = None,
     article_published_at: str | None = None,
+    article_id: str | None = None,
 ) -> dict:
     audio_dir = os.getenv("AUDIO_DIR", "/data/audio")
     os.makedirs(audio_dir, exist_ok=True)
@@ -143,62 +243,7 @@ def generate_latest_for_source(
         if not src:
             raise ValueError(f"Unknown source_id: {source_id}")
 
-        if article_url:
-            # User pre-selected this article from the RSS picker — skip feed fetch entirely
-            title = (article_title or "").strip() or "Untitled"
-            url = article_url.strip()
-            fallback = (article_summary or "").strip()
-            published_at = None
-            if article_published_at:
-                try:
-                    published_at = datetime.fromisoformat(article_published_at)
-                except Exception:
-                    pass
-            logger.info("Using pre-selected article: title=%r url=%s", title, url)
-        else:
-            # Auto-pick best entry from the RSS feed (scheduled / legacy path)
-            self.update_state(state="PROGRESS", meta={"stage": "fetching", "msg": "Fetching latest RSS entry…"})
-
-            feed = feedparser.parse(src.rss_url)
-            if not feed.entries:
-                raise RuntimeError("No RSS entries found")
-
-            lookback_days = int(os.getenv("RSS_LOOKBACK_DAYS", "7"))
-            cutoff = datetime.utcnow() - timedelta(days=lookback_days)
-
-            candidates = [e for e in feed.entries if _parse_dt(e) and _parse_dt(e) >= cutoff]
-            now = datetime.utcnow()
-            entry = max(candidates, key=lambda e: _score_entry(e, now)) if candidates else feed.entries[0]
-            title = (entry.get("title") or "").strip() or "Untitled"
-            url = (entry.get("link") or "").strip()
-            if not url:
-                raise RuntimeError("RSS entry has no link/url")
-            fallback = (entry.get("summary") or entry.get("description") or "").strip()
-            published_at = _parse_dt(entry)
-
-            logger.info("Selected RSS entry: title=%r published_at=%s url=%s", title, published_at, url)
-
-        # Upsert article
-        article = Article(source_id=src.id, title=title, url=url, published_at=published_at, user_id=user_id)
-        db.add(article)
-        try:
-            db.commit()
-        except IntegrityError:
-            db.rollback()
-            article = db.execute(
-                select(Article).where(Article.source_id == src.id, Article.url == url)
-            ).scalar_one()
-            # Claim ownership if not yet assigned
-            if user_id and not article.user_id:
-                article.user_id = user_id
-                db.commit()
-
-        self.update_state(state="PROGRESS", meta={"stage": "extracting", "msg": "Extracting article content…"})
-
-        raw = extract_article_text(url, fallback_text=fallback)
-        if not raw:
-            raw = fallback or title
-
+        # TTS config resolved up-front — needed by both the script+TTS path and the TTS-only path
         used_voice_id = voice_id or os.getenv("ELEVENLABS_VOICE_ID")
         if not used_voice_id:
             raise RuntimeError("Missing ELEVENLABS_VOICE_ID")
@@ -206,42 +251,100 @@ def generate_latest_for_source(
         output_format = os.getenv("ELEVENLABS_OUTPUT_FORMAT", "mp3_44100_128")
         speed = _speed_key(float(os.getenv("ELEVENLABS_SPEED", "1.0")))
 
-        cal = db.get(VoiceCalibration, (used_voice_id, model_id, speed))
-        wpm = cal.wpm_estimate if cal else 140.0
+        if article_id:
+            # ── Shortcut: article already prepared — jump straight to TTS ────
+            article = db.get(Article, article_id)
+            if not article:
+                raise ValueError(f"Article {article_id} not found")
+            if not article.tts_script:
+                raise RuntimeError("Article has no script — call /articles/prepare first")
+            script = article.tts_script
+            scenes = (article.storyboard_json or {}).get("scenes") or []
+            word_count = len(script.split())
+            logger.info("TTS-only run for pre-prepared article id=%s words=%d", article.id, word_count)
+        else:
+            # ── Full path: obtain article + extract content + generate script ─
+            if article_url:
+                title = (article_title or "").strip() or "Untitled"
+                url = article_url.strip()
+                fallback = (article_summary or "").strip()
+                published_at = None
+                if article_published_at:
+                    try:
+                        published_at = datetime.fromisoformat(article_published_at)
+                    except Exception:
+                        pass
+                logger.info("Using pre-selected article: title=%r url=%s", title, url)
+            else:
+                self.update_state(state="PROGRESS", meta={"stage": "fetching", "msg": "Fetching latest RSS entry…"})
+                feed = feedparser.parse(src.rss_url)
+                if not feed.entries:
+                    raise RuntimeError("No RSS entries found")
+                lookback_days = int(os.getenv("RSS_LOOKBACK_DAYS", "7"))
+                cutoff = datetime.utcnow() - timedelta(days=lookback_days)
+                candidates = [e for e in feed.entries if _parse_dt(e) and _parse_dt(e) >= cutoff]
+                now = datetime.utcnow()
+                entry = max(candidates, key=lambda e: _score_entry(e, now)) if candidates else feed.entries[0]
+                title = (entry.get("title") or "").strip() or "Untitled"
+                url = (entry.get("link") or "").strip()
+                if not url:
+                    raise RuntimeError("RSS entry has no link/url")
+                fallback = (entry.get("summary") or entry.get("description") or "").strip()
+                published_at = _parse_dt(entry)
+                logger.info("Selected RSS entry: title=%r published_at=%s url=%s", title, published_at, url)
 
-        target_words = _words_for_seconds(target_seconds, wpm)
-        tol_words = _words_for_seconds(TOLERANCE_SECONDS, wpm)
+            article = Article(source_id=src.id, title=title, url=url, published_at=published_at, user_id=user_id)
+            db.add(article)
+            try:
+                db.commit()
+            except IntegrityError:
+                db.rollback()
+                article = db.execute(
+                    select(Article).where(Article.source_id == src.id, Article.url == url)
+                ).scalar_one()
+                if user_id and not article.user_id:
+                    article.user_id = user_id
+                    db.commit()
 
-        self.update_state(state="PROGRESS", meta={"stage": "scripting", "msg": "Generating script & storyboard…"})
+            self.update_state(state="PROGRESS", meta={"stage": "extracting", "msg": "Extracting article content…"})
+            raw = extract_article_text(url, fallback_text=fallback)
+            if not raw:
+                raw = fallback or title
 
-        bundle = make_tts_bundle(
-            title=title,
-            body=raw,
-            language_hint=src.language_hint,
-            target_seconds=target_seconds,
-            n_scenes=n_scenes,
-            target_words=target_words,
-            tol_words=tol_words,
-            wpm_estimate=wpm,
-            api_key=openai_api_key,
-        )
+            cal = db.get(VoiceCalibration, (used_voice_id, model_id, speed))
+            wpm = cal.wpm_estimate if cal else 140.0
+            target_words = _words_for_seconds(target_seconds, wpm)
+            tol_words = _words_for_seconds(TOLERANCE_SECONDS, wpm)
 
-        script = bundle["script"]
-        scenes = bundle.get("scenes") or []
-        word_count = bundle.get("word_count")
+            self.update_state(state="PROGRESS", meta={"stage": "scripting", "msg": "Generating script & storyboard…"})
+            bundle = make_tts_bundle(
+                title=title,
+                body=raw,
+                language_hint=src.language_hint,
+                target_seconds=target_seconds,
+                n_scenes=n_scenes,
+                target_words=target_words,
+                tol_words=tol_words,
+                wpm_estimate=wpm,
+                api_key=openai_api_key,
+            )
 
-        logger.info("Final script words=%s preview=%r", word_count, script[:400])
+            script = bundle["script"]
+            scenes = bundle.get("scenes") or []
+            word_count = bundle.get("word_count")
+            logger.info("Script generated words=%s preview=%r", word_count, script[:400])
 
-        article.raw_text = raw
-        article.tts_script = script
-        article.script_language = os.getenv("TTS_OUTPUT_LANGUAGE", "es-MX")
-        article.summary_model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-        article.storyboard_json = {
-            "scenes": scenes,
-            "total_duration_estimate": bundle.get("total_duration_estimate", 0),
-        }
-        db.commit()
+            article.raw_text = raw
+            article.tts_script = script
+            article.script_language = os.getenv("TTS_OUTPUT_LANGUAGE", "es-MX")
+            article.summary_model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+            article.storyboard_json = {
+                "scenes": scenes,
+                "total_duration_estimate": bundle.get("total_duration_estimate", 0),
+            }
+            db.commit()
 
+        # ── TTS synthesis (common to all paths) ──────────────────────────────
         final_path = os.path.join(audio_dir, f"{article.id}_{used_voice_id}.mp3")
         duration = None
         last_error = None
