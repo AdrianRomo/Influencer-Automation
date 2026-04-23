@@ -21,24 +21,97 @@ from typing import Literal, Optional
 
 logger = logging.getLogger(__name__)
 
-# ── Auth rate limiting (in-memory, single-instance) ────────────────────────
-# For multi-worker deployments, replace with Redis-backed rate limiting.
-_auth_attempts: dict[str, list[float]] = defaultdict(list)
+# ── Redis client (shared for rate limiting + task ownership) ────────────────
+
+_rl_redis: Optional[RedisClient] = None
+
+
+def _get_rl_redis() -> RedisClient:
+    global _rl_redis
+    if _rl_redis is None:
+        _rl_redis = RedisClient.from_url(
+            os.getenv("CELERY_BROKER_URL", "redis://redis:6379/0"),
+            decode_responses=True, socket_connect_timeout=1, socket_timeout=1,
+        )
+    return _rl_redis
+
+
+def _rate_limit(key: str, limit: int, window: int = 60) -> None:
+    """Sliding-window counter in Redis. Fails open if Redis is unavailable."""
+    try:
+        r = _get_rl_redis()
+        pipe = r.pipeline()
+        pipe.incr(key)
+        pipe.expire(key, window)
+        count, _ = pipe.execute()
+        if int(count) > limit:
+            raise HTTPException(
+                status_code=429,
+                detail="Too many requests — please wait before retrying",
+                headers={"Retry-After": str(window)},
+            )
+    except HTTPException:
+        raise
+    except Exception:
+        pass  # Redis failure should not block legitimate requests
+
+
+def _assert_article_owner(article: Article, current_user: Optional[User]) -> None:
+    """Raise 403 if a JWT user tries to access another user's article.
+
+    API-key callers (current_user=None) always pass — the API key is a
+    server-level credential with full access.
+    """
+    if current_user and article.user_id and article.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+
+def _store_task_owner(task_id: str, user_id: Optional[str]) -> None:
+    """Record task→owner in Redis so we can verify on status/cancel."""
+    try:
+        owner = user_id or "__anon__"
+        _get_rl_redis().set(f"task:{task_id}:owner", owner, ex=86400)
+    except Exception:
+        pass
+
+
+def _assert_task_owner(task_id: str, current_user: Optional[User]) -> None:
+    """Raise 403 if a JWT user tries to inspect/cancel another user's task."""
+    if not current_user:
+        return  # API-key callers skip the check
+    try:
+        owner = _get_rl_redis().get(f"task:{task_id}:owner")
+        if owner and owner != "__anon__" and owner != current_user.id:
+            raise HTTPException(status_code=403, detail="Forbidden")
+    except HTTPException:
+        raise
+    except Exception:
+        pass  # Redis failure → allow (fail open)
+
+
+# ── Auth rate limiting (Redis-backed, works across workers) ────────────────
 _AUTH_WINDOW = 60   # seconds
 _AUTH_MAX = 10      # max attempts per window per IP
 
 
 def _check_auth_rate(request: Request) -> None:
     ip = (request.client.host if request.client else None) or "unknown"
-    now = _time()
-    recent = [t for t in _auth_attempts[ip] if now - t < _AUTH_WINDOW]
-    if len(recent) >= _AUTH_MAX:
-        raise HTTPException(
-            status_code=429,
-            detail=f"Too many authentication attempts — please wait {_AUTH_WINDOW}s",
-        )
-    recent.append(now)
-    _auth_attempts[ip] = recent
+    key = f"auth_attempts:{ip}"
+    try:
+        r = _get_rl_redis()
+        pipe = r.pipeline()
+        pipe.incr(key)
+        pipe.expire(key, _AUTH_WINDOW)
+        count, _ = pipe.execute()
+        if int(count) > _AUTH_MAX:
+            raise HTTPException(
+                status_code=429,
+                detail=f"Too many authentication attempts — please wait {_AUTH_WINDOW}s",
+            )
+    except HTTPException:
+        raise
+    except Exception:
+        pass  # Redis failure → allow
 
 from app.auth import (
     create_access_token, decode_access_token,
@@ -138,9 +211,18 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=_cors_origins,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization", "X-API-Key"],
 )
+
+
+@app.middleware("http")
+async def _security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+    return response
 
 
 class RssCandidateOut(BaseModel):
@@ -156,14 +238,14 @@ class RssCandidateOut(BaseModel):
 class PrepareArticleReq(BaseModel):
     source_id: str
     article_url: str
-    article_title: str = ""
-    article_summary: str | None = None
+    article_title: str = Field(default="", max_length=500)
+    article_summary: str | None = Field(default=None, max_length=5000)
     article_published_at: str | None = None
     n_scenes: int = Field(default=DEFAULT_SCENES, ge=0, le=20)
     target_seconds: int = Field(default=DEFAULT_TARGET_SECONDS, ge=30, le=600)
     language: str = DEFAULT_LANGUAGE
     selected_platforms: list[str] = Field(default_factory=lambda: [DEFAULT_PLATFORM])
-    animation_prompt: str | None = None
+    animation_prompt: str | None = Field(default=None, max_length=500)
 
 
 class GenerateReq(BaseModel):
@@ -171,12 +253,10 @@ class GenerateReq(BaseModel):
     voice_id: str | None = None
     target_seconds: int = Field(default=DEFAULT_TARGET_SECONDS, ge=30, le=600)
     n_scenes: int = Field(default=DEFAULT_SCENES, ge=0, le=20)
-    # Pre-selected article from the RSS picker — when set, the task skips RSS auto-pick
     article_url: str | None = None
-    article_title: str | None = None
-    article_summary: str | None = None
+    article_title: str | None = Field(default=None, max_length=500)
+    article_summary: str | None = Field(default=None, max_length=5000)
     article_published_at: str | None = None
-    # Pre-prepared article with script — when set, the task skips straight to TTS
     article_id: str | None = None
 
 
@@ -517,10 +597,11 @@ def list_articles(
 
 
 @app.get("/articles/{article_id}", response_model=ArticleResponse, dependencies=[Depends(check_api_key)])
-def get_article(article_id: str, db=Depends(get_db)):
+def get_article(article_id: str, db=Depends(get_db), current_user: Optional[User] = Depends(get_optional_user)):
     article = db.get(Article, article_id)
     if not article:
         raise HTTPException(status_code=404, detail="Article not found")
+    _assert_article_owner(article, current_user)
     storyboard = _load_storyboard(article)
     return ArticleResponse(
         id=article.id,
@@ -537,10 +618,11 @@ def get_article(article_id: str, db=Depends(get_db)):
 
 
 @app.get("/articles/{article_id}/captions.srt", dependencies=[Depends(check_api_key)])
-def get_captions_srt(article_id: str, db=Depends(get_db)):
+def get_captions_srt(article_id: str, db=Depends(get_db), current_user: Optional[User] = Depends(get_optional_user)):
     article = db.get(Article, article_id)
     if not article:
         raise HTTPException(status_code=404, detail="Article not found")
+    _assert_article_owner(article, current_user)
     storyboard = _load_storyboard(article)
     if not storyboard:
         raise HTTPException(status_code=404, detail="No compatible storyboard — regenerate the article")
@@ -553,10 +635,11 @@ def get_captions_srt(article_id: str, db=Depends(get_db)):
 
 
 @app.get("/articles/{article_id}/captions.vtt", dependencies=[Depends(check_api_key)])
-def get_captions_vtt(article_id: str, db=Depends(get_db)):
+def get_captions_vtt(article_id: str, db=Depends(get_db), current_user: Optional[User] = Depends(get_optional_user)):
     article = db.get(Article, article_id)
     if not article:
         raise HTTPException(status_code=404, detail="Article not found")
+    _assert_article_owner(article, current_user)
     storyboard = _load_storyboard(article)
     if not storyboard:
         raise HTTPException(status_code=404, detail="No compatible storyboard — regenerate the article")
@@ -569,10 +652,11 @@ def get_captions_vtt(article_id: str, db=Depends(get_db)):
 
 
 @app.get("/articles/{article_id}/package", response_model=ContentPackage, dependencies=[Depends(check_api_key)])
-def get_article_package(article_id: str, db=Depends(get_db)):
+def get_article_package(article_id: str, db=Depends(get_db), current_user: Optional[User] = Depends(get_optional_user)):
     article = db.get(Article, article_id)
     if not article:
         raise HTTPException(status_code=404, detail="Article not found")
+    _assert_article_owner(article, current_user)
 
     audio_ref: AudioAssetRef | None = None
     audio_row = _latest_audio(article_id, db)
@@ -737,10 +821,12 @@ def get_article_package(article_id: str, db=Depends(get_db)):
 
 
 @app.get("/articles/{article_id}/costs", response_model=CostSummary, dependencies=[Depends(check_api_key)])
-def get_article_costs(article_id: str, db=Depends(get_db)):
+def get_article_costs(article_id: str, db=Depends(get_db), current_user: Optional[User] = Depends(get_optional_user)):
     """Return the full cost and usage breakdown for an article."""
-    if not db.get(Article, article_id):
+    article = db.get(Article, article_id)
+    if not article:
         raise HTTPException(status_code=404, detail="Article not found")
+    _assert_article_owner(article, current_user)
     from app.usage import get_article_cost_summary
     raw = get_article_cost_summary(db, article_id)
     return CostSummary(
@@ -757,9 +843,11 @@ def get_article_costs(article_id: str, db=Depends(get_db)):
 
 
 @app.get("/articles/{article_id}/images", dependencies=[Depends(check_api_key)])
-def list_article_images(article_id: str, db=Depends(get_db)):
-    if not db.get(Article, article_id):
+def list_article_images(article_id: str, db=Depends(get_db), current_user: Optional[User] = Depends(get_optional_user)):
+    article = db.get(Article, article_id)
+    if not article:
         raise HTTPException(status_code=404, detail="Article not found")
+    _assert_article_owner(article, current_user)
     rows = db.execute(
         select(ImageAsset)
         .where(ImageAsset.article_id == article_id)
@@ -773,11 +861,12 @@ def list_article_images(article_id: str, db=Depends(get_db)):
 
 
 @app.get("/thumbnail/{article_id}", dependencies=[Depends(check_api_key)])
-def get_thumbnail(article_id: str, db: Session = Depends(get_db)):
+def get_thumbnail(article_id: str, db: Session = Depends(get_db), current_user: Optional[User] = Depends(get_optional_user)):
     """Serve the generated cover/thumbnail PNG for an article."""
     article = db.get(Article, article_id)
     if not article or not article.thumbnail_path:
         raise HTTPException(status_code=404, detail="Thumbnail not found")
+    _assert_article_owner(article, current_user)
     if not os.path.exists(article.thumbnail_path):
         raise HTTPException(status_code=404, detail="Thumbnail file missing from disk")
     return FileResponse(article.thumbnail_path, media_type="image/png")
@@ -788,11 +877,12 @@ class PinReq(BaseModel):
 
 
 @app.patch("/articles/{article_id}/pin", dependencies=[Depends(check_api_key)])
-def toggle_pin(article_id: str, req: PinReq, db: Session = Depends(get_db)):
+def toggle_pin(article_id: str, req: PinReq, db: Session = Depends(get_db), current_user: Optional[User] = Depends(get_optional_user)):
     """Pin or unpin an article for quick access."""
     article = db.get(Article, article_id)
     if not article:
         raise HTTPException(status_code=404, detail="Article not found")
+    _assert_article_owner(article, current_user)
     article.is_pinned = 1 if req.pinned else 0
     db.commit()
     return {"article_id": article_id, "is_pinned": bool(article.is_pinned)}
@@ -807,11 +897,13 @@ def reorder_storyboard(
     article_id: str,
     req: StoryboardReorderReq,
     db: Session = Depends(get_db),
+    current_user: Optional[User] = Depends(get_optional_user),
 ):
     """Reorder storyboard scenes. scene_order is the list of original scene_numbers in new sequence."""
     article = db.get(Article, article_id)
     if not article:
         raise HTTPException(status_code=404, detail="Article not found")
+    _assert_article_owner(article, current_user)
     storyboard = _load_storyboard(article)
     if not storyboard:
         raise HTTPException(status_code=400, detail="Article has no storyboard")
@@ -848,11 +940,18 @@ async def upload_scene_image(
     scene_number: int,
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
+    current_user: Optional[User] = Depends(get_optional_user),
 ):
     """Replace a scene's image with a user-uploaded file (PNG/JPEG/WEBP, max 20 MB)."""
     article = db.get(Article, article_id)
     if not article:
         raise HTTPException(status_code=404, detail="Article not found")
+    _assert_article_owner(article, current_user)
+
+    # Validate scene_number is in the actual storyboard
+    storyboard = _load_storyboard(article)
+    if storyboard and scene_number not in {s.scene_number for s in storyboard.scenes}:
+        raise HTTPException(status_code=422, detail="scene_number not in article storyboard")
 
     content_type = (file.content_type or "").lower()
     if content_type not in _ALLOWED_IMAGE_TYPES:
@@ -862,13 +961,28 @@ async def upload_scene_image(
     if len(contents) > 20 * 1024 * 1024:
         raise HTTPException(status_code=413, detail="File too large — maximum 20 MB")
 
+    # Magic-byte validation (first 8 bytes)
+    _MAGIC: dict[bytes, str] = {
+        b"\x89PNG\r\n\x1a\n": "image/png",
+        b"\xff\xd8\xff": "image/jpeg",
+        b"RIFF": "image/webp",
+        b"GIF8": "image/gif",
+    }
+    magic_ok = any(contents[:len(sig)] == sig for sig in _MAGIC)
+    if not magic_ok:
+        raise HTTPException(status_code=422, detail="File content does not match a supported image format")
+
     image_dir = os.getenv("IMAGE_DIR", "/data/images")
     os.makedirs(image_dir, exist_ok=True)
     ext = _IMAGE_EXT_MAP.get(content_type, "png")
     save_path = os.path.join(image_dir, f"{article_id}_scene_{scene_number}_upload.{ext}")
 
-    with open(save_path, "wb") as fh:
-        fh.write(contents)
+    # Atomic write: temp file → rename to prevent partial reads
+    import tempfile as _tmpmod
+    with _tmpmod.NamedTemporaryFile(delete=False, dir=image_dir, suffix=f".{ext}") as tmp:
+        tmp.write(contents)
+        tmp_path = tmp.name
+    os.replace(tmp_path, save_path)
 
     existing = db.execute(
         select(ImageAsset).where(
@@ -914,11 +1028,13 @@ def update_article_script(
     article_id: str,
     req: ScriptEditReq,
     db: Session = Depends(get_db),
+    current_user: Optional[User] = Depends(get_optional_user),
 ):
     """Replace the article's TTS script. Existing audio/video assets are preserved."""
     article = db.get(Article, article_id)
     if not article:
         raise HTTPException(status_code=404, detail="Article not found")
+    _assert_article_owner(article, current_user)
     text = req.text.strip()
     if not text:
         raise HTTPException(status_code=422, detail="Script text cannot be empty")
@@ -935,6 +1051,7 @@ class RegenerateScriptReq(BaseModel):
 def trigger_regenerate_script(
     article_id: str,
     req: RegenerateScriptReq,
+    request: Request,
     db: Session = Depends(get_db),
     current_user: Optional[User] = Depends(get_optional_user),
 ):
@@ -942,8 +1059,13 @@ def trigger_regenerate_script(
     article = db.get(Article, article_id)
     if not article:
         raise HTTPException(status_code=404, detail="Article not found")
+    _assert_article_owner(article, current_user)
     if not article.raw_text:
         raise HTTPException(status_code=400, detail="Article has no raw text — cannot regenerate script")
+
+    uid = current_user.id if current_user else f"ip:{(request.client.host if request.client else 'x')}"
+    _rate_limit(f"rl:regen-script:{uid}", limit=10, window=60)
+
     openai_key, _, _ = _resolve_user_keys(current_user, db)
     task = celery_app.send_task(
         "regenerate_script_for_article",
@@ -953,15 +1075,17 @@ def trigger_regenerate_script(
             "openai_api_key": openai_key,
         },
     )
+    _store_task_owner(task.id, current_user.id if current_user else None)
     return {"task_id": task.id, "status": "queued"}
 
 
 @app.get("/articles/{article_id}/export.zip", dependencies=[Depends(check_api_key)])
-def export_article_zip(article_id: str, db: Session = Depends(get_db)):
+def export_article_zip(article_id: str, db: Session = Depends(get_db), current_user: Optional[User] = Depends(get_optional_user)):
     """Download a ZIP bundle: script, audio, video, captions, and scene images."""
     article = db.get(Article, article_id)
     if not article:
         raise HTTPException(status_code=404, detail="Article not found")
+    _assert_article_owner(article, current_user)
 
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -1013,18 +1137,25 @@ def export_article_zip(article_id: str, db: Session = Depends(get_db)):
 @app.post("/articles/prepare", dependencies=[Depends(check_api_key)])
 def prepare_article_endpoint(
     req: PrepareArticleReq,
+    request: Request,
     db: Session = Depends(get_db),
     current_user: Optional[User] = Depends(get_optional_user),
 ):
-    """Queue script + storyboard generation without TTS. Returns a task_id to poll.
+    """Queue script + storyboard generation without TTS. Returns a task_id to poll."""
+    # SSRF guard
+    from app.extract import _validate_article_url
+    try:
+        _validate_article_url(req.article_url)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
 
-    The resulting article_id can then be passed to POST /generate to run TTS
-    on the user-reviewed (and optionally edited) script.
-    """
+    uid = current_user.id if current_user else f"ip:{(request.client.host if request.client else 'x')}"
+    _rate_limit(f"rl:prepare:{uid}", limit=10, window=60)
+
     if not db.get(Source, req.source_id):
         raise HTTPException(status_code=404, detail="Unknown source_id")
     openai_key, _, _ = _resolve_user_keys(current_user, db)
-    task = celery_app.send_task(
+    task = celery_app.send_task(  # type: ignore[assignment]
         "prepare_article",
         kwargs={
             "source_id": req.source_id,
@@ -1041,18 +1172,31 @@ def prepare_article_endpoint(
             "animation_prompt": req.animation_prompt,
         },
     )
+    _store_task_owner(task.id, current_user.id if current_user else None)
     return {"task_id": task.id, "status": "queued"}
 
 
 @app.post("/generate", dependencies=[Depends(check_api_key)])
 def generate(
     req: GenerateReq,
+    request: Request,
     db: Session = Depends(get_db),
     current_user: Optional[User] = Depends(get_optional_user),
 ):
     src = db.get(Source, req.source_id)
     if not src:
         raise HTTPException(status_code=404, detail="Unknown source_id")
+
+    uid = current_user.id if current_user else f"ip:{(request.client.host if request.client else 'x')}"
+    _rate_limit(f"rl:generate:{uid}", limit=5, window=60)
+
+    # SSRF guard on optional pre-selected URL
+    if req.article_url:
+        from app.extract import _validate_article_url
+        try:
+            _validate_article_url(req.article_url)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
 
     # Return existing in-flight task rather than spawning a duplicate
     task_key = f"{req.source_id}:{current_user.id if current_user else 'anon'}"
@@ -1082,11 +1226,13 @@ def generate(
         },
     )
     _audio_tasks[task_key] = task.id
+    _store_task_owner(task.id, current_user.id if current_user else None)
     return {"task_id": task.id, "status": "queued"}
 
 
 @app.get("/jobs/{task_id}", dependencies=[Depends(check_api_key)])
-def job_status(task_id: str):
+def job_status(task_id: str, current_user: Optional[User] = Depends(get_optional_user)):
+    _assert_task_owner(task_id, current_user)
     res = AsyncResult(task_id, app=celery_app)
     payload: dict = {"task_id": task_id, "state": res.state}
 
@@ -1104,8 +1250,9 @@ def job_status(task_id: str):
 
 
 @app.delete("/jobs/{task_id}", dependencies=[Depends(check_api_key)])
-def cancel_job(task_id: str):
+def cancel_job(task_id: str, current_user: Optional[User] = Depends(get_optional_user)):
     """Revoke a queued or running task. Sends SIGTERM to the worker process."""
+    _assert_task_owner(task_id, current_user)
     celery_app.control.revoke(task_id, terminate=True, signal="SIGTERM")
     return {"cancelled": task_id}
 
@@ -1113,14 +1260,19 @@ def cancel_job(task_id: str):
 @app.post("/generate-video", dependencies=[Depends(check_api_key)])
 def generate_video(
     req: GenerateVideoReq,
+    request: Request,
     db: Session = Depends(get_db),
     current_user: Optional[User] = Depends(get_optional_user),
 ):
     article = db.get(Article, req.article_id)
     if not article:
         raise HTTPException(status_code=404, detail="Unknown article_id")
+    _assert_article_owner(article, current_user)
     if not article.storyboard_json:
         raise HTTPException(status_code=400, detail="Article has no storyboard — generate audio first")
+
+    uid = current_user.id if current_user else f"ip:{(request.client.host if request.client else 'x')}"
+    _rate_limit(f"rl:video:{uid}", limit=5, window=60)
 
     existing = _video_tasks.get(req.article_id)
     if existing:
@@ -1146,26 +1298,33 @@ def generate_video(
         },
     )
     _video_tasks[req.article_id] = task.id
+    _store_task_owner(task.id, current_user.id if current_user else None)
     return {"task_id": task.id, "status": "queued", "render_mode": req.render_mode}
 
 
 # ── Static assets ──────────────────────────────────────────────────────────
 
 @app.get("/audio/{audio_id}", dependencies=[Depends(check_api_key)])
-def get_audio(audio_id: str, db=Depends(get_db)):
+def get_audio(audio_id: str, db=Depends(get_db), current_user: Optional[User] = Depends(get_optional_user)):
     audio = db.get(AudioAsset, audio_id)
     if not audio:
         raise HTTPException(status_code=404, detail="Audio not found")
+    article = db.get(Article, audio.article_id)
+    if article:
+        _assert_article_owner(article, current_user)
     if not os.path.exists(audio.file_path):
         raise HTTPException(status_code=404, detail="File missing on disk")
     return FileResponse(audio.file_path, media_type="audio/mpeg", filename=os.path.basename(audio.file_path))
 
 
 @app.get("/image/{image_id}", dependencies=[Depends(check_api_key)])
-def get_image(image_id: str, db=Depends(get_db)):
+def get_image(image_id: str, db=Depends(get_db), current_user: Optional[User] = Depends(get_optional_user)):
     img = db.get(ImageAsset, image_id)
     if not img:
         raise HTTPException(status_code=404, detail="Image not found")
+    article = db.get(Article, img.article_id)
+    if article:
+        _assert_article_owner(article, current_user)
     if img.status != "ready":
         raise HTTPException(status_code=409, detail=f"Image not ready: {img.status}")
     if not os.path.exists(img.file_path):
@@ -1182,6 +1341,7 @@ class RegenerateReq(BaseModel):
 def regenerate_stage(
     article_id: str,
     req: RegenerateReq,
+    request: Request,
     db: Session = Depends(get_db),
     current_user: Optional[User] = Depends(get_optional_user),
 ):
@@ -1194,8 +1354,12 @@ def regenerate_stage(
     article = db.get(Article, article_id)
     if not article:
         raise HTTPException(status_code=404, detail="Article not found")
+    _assert_article_owner(article, current_user)
     if not article.storyboard_json:
         raise HTTPException(status_code=400, detail="Article has no storyboard — generate audio first")
+
+    uid = current_user.id if current_user else f"ip:{(request.client.host if request.client else 'x')}"
+    _rate_limit(f"rl:regen:{uid}", limit=5, window=60)
 
     if req.stage == "images":
         db.execute(delete(ImageAsset).where(ImageAsset.article_id == article_id))
@@ -1217,14 +1381,18 @@ def regenerate_stage(
         },
     )
     _video_tasks[article_id] = task.id
+    _store_task_owner(task.id, current_user.id if current_user else None)
     return {"task_id": task.id, "status": "queued", "stage": req.stage}
 
 
 @app.get("/video/{video_id}", dependencies=[Depends(check_api_key)])
-def get_video(video_id: str, db=Depends(get_db)):
+def get_video(video_id: str, db=Depends(get_db), current_user: Optional[User] = Depends(get_optional_user)):
     video = db.get(VideoAsset, video_id)
     if not video:
         raise HTTPException(status_code=404, detail="Video not found")
+    article = db.get(Article, video.article_id)
+    if article:
+        _assert_article_owner(article, current_user)
     if video.status != "ready":
         raise HTTPException(status_code=409, detail=f"Video not ready: status={video.status}")
     if not os.path.exists(video.file_path):
@@ -1237,11 +1405,14 @@ def get_video(video_id: str, db=Depends(get_db)):
 
 
 @app.get("/scene-videos/{scene_video_id}", dependencies=[Depends(check_api_key)])
-def get_scene_video_clip(scene_video_id: str, db=Depends(get_db)):
+def get_scene_video_clip(scene_video_id: str, db=Depends(get_db), current_user: Optional[User] = Depends(get_optional_user)):
     """Download an individual animated scene clip."""
     sv = db.get(SceneVideoAsset, scene_video_id)
     if not sv:
         raise HTTPException(status_code=404, detail="Scene video not found")
+    article = db.get(Article, sv.article_id)
+    if article:
+        _assert_article_owner(article, current_user)
     if sv.status not in ("ready", "fallback"):
         raise HTTPException(status_code=409, detail=f"Scene clip not ready: status={sv.status}")
     if not sv.file_path or not os.path.exists(sv.file_path):

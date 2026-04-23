@@ -55,7 +55,10 @@ def assemble_video(
             if srt_path and "subtitles" in result.stderr:
                 logger.warning("Subtitle filter failed, retrying without subtitles")
                 return assemble_video(scenes, audio_path, output_path, srt_path=None, width=width, height=height)
-            raise RuntimeError(f"FFmpeg failed (exit {result.returncode}):\n{result.stderr[-3000:]}")
+            # Log full stderr server-side; surface only a safe summary to callers
+            last_line = result.stderr.strip().split("\n")[-1][:200] if result.stderr else ""
+            logger.error("FFmpeg failed (exit %d):\n%s", result.returncode, result.stderr[-2000:])
+            raise RuntimeError(f"Video assembly failed (exit {result.returncode}): {last_line}")
     finally:
         try:
             os.unlink(concat_file)
@@ -132,9 +135,9 @@ def normalize_clip(
     logger.info("Normalizing clip → %.2fs: %s", target_duration, output_path)
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
     if result.returncode != 0:
-        raise RuntimeError(
-            f"FFmpeg normalize_clip failed (exit {result.returncode}):\n{result.stderr[-1000:]}"
-        )
+        last_line = result.stderr.strip().split("\n")[-1][:200] if result.stderr else ""
+        logger.error("FFmpeg normalize_clip failed (exit %d):\n%s", result.returncode, result.stderr[-1000:])
+        raise RuntimeError(f"Clip normalization failed (exit {result.returncode}): {last_line}")
 
 
 def assemble_video_from_clips(
@@ -177,9 +180,9 @@ def assemble_video_from_clips(
                     scene_clips, audio_path, output_path,
                     srt_path=None, width=width, height=height,
                 )
-            raise RuntimeError(
-                f"FFmpeg animated assembly failed (exit {result.returncode}):\n{result.stderr[-3000:]}"
-            )
+            last_line = result.stderr.strip().split("\n")[-1][:200] if result.stderr else ""
+            logger.error("FFmpeg animated assembly failed (exit %d):\n%s", result.returncode, result.stderr[-2000:])
+            raise RuntimeError(f"Animated video assembly failed (exit {result.returncode}): {last_line}")
     finally:
         try:
             os.unlink(concat_file)
