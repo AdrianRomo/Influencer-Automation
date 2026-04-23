@@ -78,6 +78,52 @@ def generate_scene_image(
     return img_bytes
 
 
+def generate_thumbnail(
+    title: str,
+    scene_prompt: str | None = None,
+    api_key: str | None = None,
+    collector: "UsageCollector | None" = None,
+) -> bytes:
+    """Generate a DALL-E 3 cover/thumbnail image for the article."""
+    topic = title[:200]
+    visual_hint = f" Visual reference: {scene_prompt[:150]}." if scene_prompt else ""
+    prompt = (
+        f"Eye-catching social media cover image for a medical health video about: {topic}.{visual_hint} "
+        "Professional photorealistic healthcare aesthetic. Cinematic lighting. "
+        "No text, no watermarks, no logos. Clean composition."
+    )[:900]
+
+    c = OpenAI(api_key=api_key) if api_key else _client
+    resp = c.images.generate(
+        model=IMAGE_MODEL,
+        prompt=prompt,
+        size=IMAGE_SIZE,
+        quality=IMAGE_QUALITY,
+        n=1,
+        response_format="b64_json",
+    )
+    img_bytes = base64.b64decode(resp.data[0].b64_json)
+
+    if collector is not None:
+        try:
+            from app.pricing import estimate_openai_image_cost, get_image_pricing_snapshot
+            cost = estimate_openai_image_cost(model=IMAGE_MODEL, size=IMAGE_SIZE, quality=IMAGE_QUALITY, count=1)
+            collector.record(
+                provider="openai",
+                operation="thumbnail",
+                model=IMAGE_MODEL,
+                image_count=1,
+                image_size=IMAGE_SIZE,
+                image_quality=IMAGE_QUALITY,
+                estimated_cost_usd=cost,
+                pricing_snapshot=get_image_pricing_snapshot(IMAGE_MODEL, IMAGE_SIZE, IMAGE_QUALITY),
+            )
+        except Exception:
+            pass
+
+    return img_bytes
+
+
 def create_placeholder_image(output_path: str, width: int = 1024, height: int = 1792) -> None:
     """Write a solid black PNG using FFmpeg — used when image generation fails."""
     subprocess.run(

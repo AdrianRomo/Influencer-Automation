@@ -1432,3 +1432,50 @@ hr {
   font-size: 11px;
   font-weight: 500;
 }
+
+/* ── Article thumbnail ────────────────────────────────────────────────── */
+
+.result-meta-top {
+  display: flex;
+  gap: 14px;
+  align-items: flex-start;
+}
+
+.result-meta-info {
+  flex: 1;
+  min-width: 0;
+}
+
+.result-article-meta {
+  display: flex;
+  gap: 10px;
+  color: #6b7280;
+  margin-top: 4px;
+  flex-wrap: wrap;
+}
+
+.thumbnail-wrap {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  flex-shrink: 0;
+}
+
+.article-thumbnail {
+  width: 80px;
+  border-radius: 6px;
+  object-fit: cover;
+  aspect-ratio: 9 / 16;
+  box-shadow: 0 1px 4px rgba(0,0,0,0.12);
+  cursor: pointer;
+  transition: transform 0.15s;
+}
+
+.article-thumbnail:hover {
+  transform: scale(1.04);
+}
+
+.dl-btn-sm {
+  font-size: 10px;
+  padding: 2px 8px;
+}

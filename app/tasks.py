@@ -156,10 +156,18 @@ def prepare_article(
                 pass
 
         eff_language = language or os.getenv("TTS_OUTPUT_LANGUAGE", "es-MX")
+
+        # Cap target duration to the shortest selected platform's max_duration
+        eff_platforms = selected_platforms or ["tiktok"]
+        from app.platforms import PROFILES as _PROFILES
+        _max_durs = [_PROFILES[p].max_duration for p in eff_platforms if p in _PROFILES]
+        if _max_durs:
+            target_seconds = min(target_seconds, min(_max_durs))
+
         article = Article(
             source_id=src.id, title=title, url=url, published_at=published_at,
             user_id=user_id, language=eff_language,
-            selected_platforms=selected_platforms or ["tiktok"],
+            selected_platforms=eff_platforms,
             animation_prompt=animation_prompt,
         )
         db.add(article)
@@ -173,7 +181,7 @@ def prepare_article(
             if user_id and not article.user_id:
                 article.user_id = user_id
             article.language = eff_language
-            article.selected_platforms = selected_platforms or article.selected_platforms or ["tiktok"]
+            article.selected_platforms = eff_platforms or article.selected_platforms or ["tiktok"]
             if animation_prompt:
                 article.animation_prompt = animation_prompt
             db.commit()
@@ -236,6 +244,21 @@ def prepare_article(
             db.commit()
         except Exception as exc:
             logger.warning("Social caption generation failed (non-fatal): %s", exc)
+
+        try:
+            from app.image_gen import generate_thumbnail as _gen_thumb
+            self.update_state(state="PROGRESS", meta={"stage": "thumbnail", "msg": "Generating thumbnail…"})
+            image_dir = os.getenv("IMAGE_DIR", "/data/images")
+            os.makedirs(image_dir, exist_ok=True)
+            first_scene_prompt = scenes[0].get("visual_prompt") if scenes else None
+            thumb_bytes = _gen_thumb(title, scene_prompt=first_scene_prompt, api_key=openai_api_key, collector=collector)
+            thumb_path = os.path.join(image_dir, f"{article.id}_thumbnail.png")
+            with open(thumb_path, "wb") as fh:
+                fh.write(thumb_bytes)
+            article.thumbnail_path = thumb_path
+            db.commit()
+        except Exception as exc:
+            logger.warning("Thumbnail generation failed (non-fatal): %s", exc)
 
         collector.flush(db)
 

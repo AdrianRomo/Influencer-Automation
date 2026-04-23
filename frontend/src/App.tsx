@@ -8,8 +8,8 @@ import {
   cancelJob, editScript, fetchRssCandidates, getArticlePackage, getExportZipUrl,
   getPlatforms, jobStatus, listArticles, listSources, pinArticle, prepareArticle,
   regenerateStage, reorderStoryboard, resolveAudioUrl, resolveCaptionUrl, resolveImageUrl,
-  resolveVideoUrl, setApiKey, startGenerate, startGenerateVideo, startRegenerateScript,
-  uploadSceneImage, register, login, getMe, getUserKeys, saveUserKeys,
+  resolveThumbnailUrl, resolveVideoUrl, setApiKey, startGenerate, startGenerateVideo,
+  startRegenerateScript, uploadSceneImage, register, login, getMe, getUserKeys, saveUserKeys,
   setAuthToken, clearAuthToken,
 } from './api'
 
@@ -1653,9 +1653,38 @@ export default function App() {
 
           {/* Article title + audio metadata + player */}
           <div className="result-meta card">
-            <a href={pkg.url} target="_blank" rel="noreferrer" className="article-title link">
-              {pkg.title}
-            </a>
+            <div className="result-meta-top">
+              <div className="result-meta-info">
+                <a href={pkg.url} target="_blank" rel="noreferrer" className="article-title link">
+                  {pkg.title}
+                </a>
+                {(pkg.source_name || pkg.published_at) && (
+                  <div className="small result-article-meta">
+                    {pkg.source_name && <span>{pkg.source_name}</span>}
+                    {pkg.published_at && <span>{relativeDate(pkg.published_at)}</span>}
+                  </div>
+                )}
+              </div>
+              {pkg.thumbnail_url && (
+                <div className="thumbnail-wrap">
+                  <a href={resolveThumbnailUrl(pkg.article_id)} target="_blank" rel="noreferrer">
+                    <img
+                      src={resolveThumbnailUrl(pkg.article_id)}
+                      alt="Thumbnail"
+                      className="article-thumbnail"
+                    />
+                  </a>
+                  <a
+                    href={resolveThumbnailUrl(pkg.article_id)}
+                    className="dl-btn dl-btn-sm"
+                    download="thumbnail.png"
+                    style={{ marginTop: 4 }}
+                  >
+                    Download
+                  </a>
+                </div>
+              )}
+            </div>
             {pkg.audio && (
               <div className="small" style={{ marginTop: 4 }}>
                 {fmtSeconds(pkg.audio.duration_seconds)}

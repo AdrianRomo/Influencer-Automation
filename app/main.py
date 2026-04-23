@@ -707,15 +707,20 @@ def get_article_package(article_id: str, db=Depends(get_db)):
     except Exception:
         pass
 
+    source_obj = db.get(Source, article.source_id)
+
     return ContentPackage(
         article_id=article.id,
         title=article.title,
         url=article.url,
         source_id=article.source_id,
+        source_name=source_obj.name if source_obj else None,
+        published_at=article.published_at,
         generated_at=article.created_at,
         language=article.language or "es-MX",
         selected_platforms=article.selected_platforms,
         animation_prompt=article.animation_prompt,
+        thumbnail_url=f"/thumbnail/{article.id}" if article.thumbnail_path else None,
         script=script_asset,
         audio=audio_ref,
         storyboard=storyboard,
@@ -765,6 +770,17 @@ def list_article_images(article_id: str, db=Depends(get_db)):
          "status": r.status, "created_at": r.created_at}
         for r in rows
     ]
+
+
+@app.get("/thumbnail/{article_id}", dependencies=[Depends(check_api_key)])
+def get_thumbnail(article_id: str, db: Session = Depends(get_db)):
+    """Serve the generated cover/thumbnail PNG for an article."""
+    article = db.get(Article, article_id)
+    if not article or not article.thumbnail_path:
+        raise HTTPException(status_code=404, detail="Thumbnail not found")
+    if not os.path.exists(article.thumbnail_path):
+        raise HTTPException(status_code=404, detail="Thumbnail file missing from disk")
+    return FileResponse(article.thumbnail_path, media_type="image/png")
 
 
 class PinReq(BaseModel):

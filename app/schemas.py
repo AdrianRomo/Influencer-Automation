@@ -184,10 +184,13 @@ class ContentPackage(BaseModel):
     title: str
     url: str
     source_id: str
+    source_name: Optional[str] = None
+    published_at: Optional[datetime] = None
     generated_at: datetime
     language: str = "es-MX"
     selected_platforms: Optional[List[str]] = None
     animation_prompt: Optional[str] = None
+    thumbnail_url: Optional[str] = None
     script: Optional[ScriptAsset] = None
     audio: Optional[AudioAssetRef] = None
     storyboard: Optional[Storyboard] = None

@@ -269,10 +269,13 @@ export type ContentPackage = {
   title: string
   url: string
   source_id: string
+  source_name?: string | null
+  published_at?: string | null
   generated_at: string
   language?: string
   selected_platforms?: string[] | null
   animation_prompt?: string | null
+  thumbnail_url?: string | null
   script?: ScriptAsset | null
   audio?: AudioAssetRef | null
   storyboard?: Storyboard | null

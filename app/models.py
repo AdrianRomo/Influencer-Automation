@@ -76,6 +76,9 @@ class Article(Base):
     selected_platforms: Mapped[list | None] = mapped_column(JSON, nullable=True)  # ["tiktok", "reels"]
     animation_prompt: Mapped[str | None] = mapped_column(Text, nullable=True)
 
+    # Cover/thumbnail image for social posts
+    thumbnail_path: Mapped[str | None] = mapped_column(String, nullable=True)
+
     # User content management
     is_pinned: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
 

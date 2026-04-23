@@ -136,6 +136,10 @@ export function resolveVideoUrl(videoId: string): string {
   return `${API_BASE}/video/${videoId}`
 }
 
+export function resolveThumbnailUrl(articleId: string): string {
+  return `${API_BASE}/thumbnail/${articleId}`
+}
+
 export function resolveCaptionUrl(articleId: string, format: 'srt' | 'vtt'): string {
   return `${API_BASE}/articles/${articleId}/captions.${format}`
 }
