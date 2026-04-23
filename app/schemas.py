@@ -138,6 +138,17 @@ class VideoAssetRef(BaseModel):
     has_subtitles: bool
     status: str
     error: Optional[str] = None
+    render_mode: str = "static"   # "static" | "animated"
+
+
+class SceneVideoRef(BaseModel):
+    """Status of one AI-generated scene clip in an animated render."""
+    id: str
+    scene_number: int
+    provider: str           # "seedance" | "static" | …
+    status: str             # pending | processing | ready | failed | fallback
+    duration_seconds: Optional[float] = None
+    error: Optional[str] = None
 
 
 class AnalysisResult(BaseModel):
@@ -161,4 +172,5 @@ class ContentPackage(BaseModel):
     visual_prompts: Optional[List[VisualPromptEntry]] = None
     images: Optional[List[ImageAssetRef]] = None
     video: Optional[VideoAssetRef] = None
+    scene_videos: Optional[List[SceneVideoRef]] = None
     analysis: Optional[AnalysisResult] = None

@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type {
   AnalysisResult, ArticleSummary, ContentPackage, GenerateReq, ImageAssetRef,
-  JobStatus, RssCandidate, Source, StoryboardScene, UserResp, UserKeysOut,
+  JobStatus, RenderMode, RssCandidate, SceneVideoRef, Source, StoryboardScene,
+  UserResp, UserKeysOut,
 } from './types'
 import {
   cancelJob, editScript, fetchRssCandidates, getArticlePackage, getExportZipUrl,
@@ -535,6 +536,7 @@ export default function App() {
   const [videoJob, setVideoJob] = useState<JobStatus | null>(null)
   const [videoError, setVideoError] = useState('')
   const [videoStage, setVideoStage] = useState('')
+  const [renderMode, setRenderMode] = useState<RenderMode>('static')
 
   // ── Script prepare (preview-before-audio) ──────────────────────────────
   const [prepareLoading, setPrepareLoading] = useState(false)
@@ -792,7 +794,7 @@ export default function App() {
     if (!articleId) return
     setVideoError(''); setVideoLoading(true); setVideoJob(null); setVideoStage('Queueing…')
     try {
-      const resp = await startGenerateVideo(articleId, true)
+      const resp = await startGenerateVideo(articleId, true, renderMode)
       activeVideoTaskId.current = resp.task_id
       pollVideo(resp.task_id)
     } catch (e: unknown) {
@@ -1602,6 +1604,7 @@ export default function App() {
                 <span className="small">
                   {fmtSeconds(pkg.video.duration_seconds)} · {pkg.video.width}×{pkg.video.height}
                   {pkg.video.has_subtitles ? ' · subtitles' : ''}
+                  {pkg.video.render_mode === 'animated' ? ' · animated' : ''}
                 </span>
               )}
             </div>
@@ -1643,18 +1646,74 @@ export default function App() {
                 </div>
               </div>
             ) : (
-              <div className="actions">
-                <button onClick={startVideo} disabled={videoLoading || !articleId}>
-                  {videoLoading ? 'Generating…' : 'Generate Video'}
-                </button>
-                {videoLoading
-                  ? <button className="secondary" onClick={cancelVideo}>Cancel</button>
-                  : <span className="small">DALL-E scene images + FFmpeg assembly · ~2–5 min</span>
-                }
+              <div>
+                {/* Render mode toggle */}
+                {!videoLoading && (
+                  <div className="render-mode-toggle">
+                    <button
+                      className={`render-mode-btn ${renderMode === 'static' ? 'render-mode-active' : ''}`}
+                      onClick={() => setRenderMode('static')}
+                    >
+                      Standard
+                      <span className="render-mode-desc">DALL-E images · FFmpeg slideshow</span>
+                    </button>
+                    <button
+                      className={`render-mode-btn ${renderMode === 'animated' ? 'render-mode-active' : ''}`}
+                      onClick={() => setRenderMode('animated')}
+                    >
+                      Animated <span className="pro-badge">PRO</span>
+                      <span className="render-mode-desc">AI-animated scene clips</span>
+                    </button>
+                  </div>
+                )}
+                {renderMode === 'animated' && !videoLoading && (
+                  <div className="animated-info small">
+                    Each scene image is animated by the configured provider ({'{SCENE_VIDEO_PROVIDER}'}),
+                    then assembled into one video matched to the narration audio.
+                    Falls back to static for any scene that fails.
+                  </div>
+                )}
+                <div className="actions" style={{ marginTop: 12 }}>
+                  <button onClick={startVideo} disabled={videoLoading || !articleId}>
+                    {videoLoading
+                      ? 'Generating…'
+                      : renderMode === 'animated'
+                        ? 'Generate Animated Video'
+                        : 'Generate Video'}
+                  </button>
+                  {videoLoading
+                    ? <button className="secondary" onClick={cancelVideo}>Cancel</button>
+                    : <span className="small">
+                        {renderMode === 'animated'
+                          ? 'Animates each scene · ~5–15 min'
+                          : 'DALL-E images + FFmpeg · ~2–5 min'}
+                      </span>
+                  }
+                </div>
               </div>
             )}
 
             {videoError && <div className="error-text">{videoError}</div>}
+
+            {/* Scene animation status grid (animated renders) */}
+            {pkg.scene_videos && pkg.scene_videos.length > 0 && (
+              <div style={{ marginTop: 12 }}>
+                <div className="small" style={{ marginBottom: 6, color: '#6b7280', fontWeight: 600 }}>
+                  Scene clips · {pkg.scene_videos.filter((sv: SceneVideoRef) => sv.status === 'ready').length}/{pkg.scene_videos.length} animated
+                </div>
+                <div className="scene-clip-grid">
+                  {pkg.scene_videos.map((sv: SceneVideoRef) => (
+                    <span
+                      key={sv.id}
+                      className={`scene-clip-dot scene-clip-${sv.status}`}
+                      title={`Scene ${sv.scene_number} · ${sv.provider} · ${sv.status}${sv.error ? ': ' + sv.error : ''}${sv.duration_seconds ? ' · ' + fmtSeconds(sv.duration_seconds) : ''}`}
+                    >
+                      {sv.scene_number}
+                    </span>
+                  ))}
+                </div>
+              </div>
+            )}
 
             {pkg.images && pkg.images.length > 0 && (
               <div className="image-status-row small" style={{ marginTop: 10 }}>

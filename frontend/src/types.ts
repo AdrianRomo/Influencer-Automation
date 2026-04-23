@@ -174,7 +174,19 @@ export type VideoAssetRef = {
   has_subtitles: boolean
   status: string
   error?: string | null
+  render_mode: 'static' | 'animated'
 }
+
+export type SceneVideoRef = {
+  id: string
+  scene_number: number
+  provider: string
+  status: 'pending' | 'processing' | 'ready' | 'failed' | 'fallback' | string
+  duration_seconds?: number | null
+  error?: string | null
+}
+
+export type RenderMode = 'static' | 'animated'
 
 export type AnalysisResult = {
   sentiment: 'positive' | 'neutral' | 'cautionary' | 'urgent'
@@ -197,5 +209,6 @@ export type ContentPackage = {
   visual_prompts?: VisualPromptEntry[] | null
   images?: ImageAssetRef[] | null
   video?: VideoAssetRef | null
+  scene_videos?: SceneVideoRef[] | null
   analysis?: AnalysisResult | null
 }

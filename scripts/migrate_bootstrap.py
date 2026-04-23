@@ -25,6 +25,11 @@ def _detect_current_rev(inspector) -> str | None:
 
     articles_cols = {c["name"] for c in inspector.get_columns("articles")}
 
+    video_cols = (
+        {c["name"] for c in inspector.get_columns("video_assets")}
+        if "video_assets" in all_tables else set()
+    )
+
     checks = [
         ("001", lambda: "sources" in all_tables),
         ("002", lambda: "users" in all_tables
@@ -32,6 +37,8 @@ def _detect_current_rev(inspector) -> str | None:
                         and "user_id" in articles_cols),
         ("003", lambda: "analysis_json" in articles_cols),
         ("004", lambda: "is_pinned" in articles_cols),
+        ("005", lambda: "scene_video_assets" in all_tables
+                        and "render_mode" in video_cols),
     ]
 
     stamp = None

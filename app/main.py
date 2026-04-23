@@ -46,12 +46,12 @@ from app.auth import (
     encrypt_api_key, decrypt_api_key,
 )
 from app.db import get_db, engine
-from app.models import Base, Source, AudioAsset, Article, ImageAsset, VideoAsset, User, UserApiKeys
+from app.models import Base, Source, AudioAsset, Article, ImageAsset, VideoAsset, SceneVideoAsset, User, UserApiKeys
 from app.rss_sources import SOURCES
 from app.schemas import (
     ArticleResponse, Storyboard,
     AudioAssetRef, ScriptAsset, VisualPromptEntry, ContentPackage,
-    ImageAssetRef, VideoAssetRef, AnalysisResult,
+    ImageAssetRef, VideoAssetRef, SceneVideoRef, AnalysisResult,
     RegisterReq, LoginReq, TokenResp, UserResp, UserKeysIn, UserKeysOut,
 )
 from app.captions import storyboard_to_captions, captions_to_srt, captions_to_vtt
@@ -179,6 +179,7 @@ class GenerateVideoReq(BaseModel):
     article_id: str
     audio_asset_id: str | None = None
     burn_subtitles: bool = True
+    render_mode: Literal["static", "animated"] = "static"
 
 
 # ── Health ─────────────────────────────────────────────────────────────────
@@ -619,7 +620,29 @@ def get_article_package(article_id: str, db=Depends(get_db)):
             has_subtitles=bool(video_row.has_subtitles),
             status=video_row.status,
             error=video_row.error,
+            render_mode=video_row.render_mode or "static",
         )
+
+    # Per-scene animated clip status (only populated for animated renders)
+    scene_video_rows = db.execute(
+        select(SceneVideoAsset)
+        .where(SceneVideoAsset.article_id == article_id)
+        .order_by(SceneVideoAsset.scene_number)
+    ).scalars().all()
+    scene_videos: list[SceneVideoRef] | None = (
+        [
+            SceneVideoRef(
+                id=r.id,
+                scene_number=r.scene_number,
+                provider=r.provider,
+                status=r.status,
+                duration_seconds=r.duration_seconds,
+                error=r.error,
+            )
+            for r in scene_video_rows
+        ]
+        if scene_video_rows else None
+    )
 
     analysis: AnalysisResult | None = None
     if article.analysis_json:
@@ -641,6 +664,7 @@ def get_article_package(article_id: str, db=Depends(get_db)):
         visual_prompts=visual_prompts,
         images=images,
         video=video_ref,
+        scene_videos=scene_videos,
         analysis=analysis,
     )
 
@@ -1004,17 +1028,22 @@ def generate_video(
             return {"task_id": existing, "status": "already_running"}
 
     openai_key, _, _ = _resolve_user_keys(current_user, db)
+    task_name = (
+        "generate_animated_video_for_article"
+        if req.render_mode == "animated"
+        else "generate_video_for_article"
+    )
     task = celery_app.send_task(
-        "generate_video_for_article",
+        task_name,
         kwargs={
-            "article_id": req.article_id,
+            "article_id":    req.article_id,
             "audio_asset_id": req.audio_asset_id,
             "burn_subtitles": req.burn_subtitles,
             "openai_api_key": openai_key,
         },
     )
     _video_tasks[req.article_id] = task.id
-    return {"task_id": task.id, "status": "queued"}
+    return {"task_id": task.id, "status": "queued", "render_mode": req.render_mode}
 
 
 # ── Static assets ──────────────────────────────────────────────────────────
@@ -1101,6 +1130,23 @@ def get_video(video_id: str, db=Depends(get_db)):
         video.file_path,
         media_type="video/mp4",
         filename=os.path.basename(video.file_path),
+    )
+
+
+@app.get("/scene-videos/{scene_video_id}", dependencies=[Depends(check_api_key)])
+def get_scene_video_clip(scene_video_id: str, db=Depends(get_db)):
+    """Download an individual animated scene clip."""
+    sv = db.get(SceneVideoAsset, scene_video_id)
+    if not sv:
+        raise HTTPException(status_code=404, detail="Scene video not found")
+    if sv.status not in ("ready", "fallback"):
+        raise HTTPException(status_code=409, detail=f"Scene clip not ready: status={sv.status}")
+    if not sv.file_path or not os.path.exists(sv.file_path):
+        raise HTTPException(status_code=404, detail="Clip file missing on disk")
+    return FileResponse(
+        sv.file_path,
+        media_type="video/mp4",
+        filename=os.path.basename(sv.file_path),
     )
 
 

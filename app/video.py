@@ -101,6 +101,104 @@ def _write_concat_file(scenes: list[dict]) -> str:
     return f.name
 
 
+def normalize_clip(
+    input_path: str,
+    output_path: str,
+    target_duration: float,
+    width: int  = DEFAULT_WIDTH,
+    height: int = DEFAULT_HEIGHT,
+) -> None:
+    """Trim or pad a video clip to exactly target_duration seconds.
+
+    - If the clip is longer: trim with -t.
+    - If the clip is shorter: freeze the last frame to fill the gap via tpad.
+    The output is a silent H.264 clip ready for concat.
+    """
+    vf = (
+        f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
+        f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black,"
+        f"setsar=1,fps=24,"
+        f"tpad=stop_mode=clone:stop_duration={target_duration:.3f}"
+    )
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", input_path,
+        "-vf", vf,
+        "-c:v", "libx264", "-preset", "fast", "-crf", "23", "-pix_fmt", "yuv420p",
+        "-t", f"{target_duration:.3f}",
+        "-an",
+        output_path,
+    ]
+    logger.info("Normalizing clip → %.2fs: %s", target_duration, output_path)
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"FFmpeg normalize_clip failed (exit {result.returncode}):\n{result.stderr[-1000:]}"
+        )
+
+
+def assemble_video_from_clips(
+    scene_clips: list[dict],   # [{"clip_path": str, "duration": float}, ...]
+    audio_path: str,
+    output_path: str,
+    srt_path: str | None = None,
+    width: int  = DEFAULT_WIDTH,
+    height: int = DEFAULT_HEIGHT,
+) -> float:
+    """Concatenate pre-normalised video clips, attach audio, burn optional subtitles.
+
+    Each clip in scene_clips must already be normalised to its target duration
+    (silent H.264). The audio track drives the final length via -shortest.
+    Returns actual video duration in seconds.
+    """
+    if not scene_clips:
+        raise ValueError("No clips provided for animated video assembly")
+
+    concat_file = _write_clips_concat_file(scene_clips)
+    try:
+        vf  = _build_vf(width, height, srt_path)
+        cmd = [
+            "ffmpeg", "-y",
+            "-f", "concat", "-safe", "0", "-i", concat_file,
+            "-i", audio_path,
+            "-vf", vf,
+            "-c:v", "libx264", "-preset", "fast", "-crf", "23", "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "128k",
+            "-movflags", "+faststart",
+            "-shortest",
+            output_path,
+        ]
+        logger.info("Assembling animated video: %s", " ".join(cmd))
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        if result.returncode != 0:
+            if srt_path and "subtitles" in result.stderr:
+                logger.warning("Subtitle filter failed in animated assembly, retrying without")
+                return assemble_video_from_clips(
+                    scene_clips, audio_path, output_path,
+                    srt_path=None, width=width, height=height,
+                )
+            raise RuntimeError(
+                f"FFmpeg animated assembly failed (exit {result.returncode}):\n{result.stderr[-3000:]}"
+            )
+    finally:
+        try:
+            os.unlink(concat_file)
+        except OSError:
+            pass
+
+    return probe_duration(output_path)
+
+
+def _write_clips_concat_file(clips: list[dict]) -> str:
+    """Write an FFmpeg concat demuxer file for a list of video clip paths."""
+    f = tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False, encoding="utf-8")
+    for clip in clips:
+        path = clip["clip_path"].replace("'", r"'\''")
+        f.write(f"file '{path}'\n")
+    f.close()
+    return f.name
+
+
 def _build_vf(width: int, height: int, srt_path: str | None) -> str:
     """Build the FFmpeg -vf filtergraph string."""
     # Scale the image to fit within target dimensions preserving aspect ratio,

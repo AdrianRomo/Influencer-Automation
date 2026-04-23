@@ -1,6 +1,6 @@
 import type {
   ArticleSummary, PaginatedArticles, PrepareArticleReq, RssCandidate, Source,
-  GenerateReq, GenerateResp, JobStatus, ContentPackage,
+  GenerateReq, GenerateResp, JobStatus, ContentPackage, RenderMode,
   TokenResp, UserResp, UserKeysIn, UserKeysOut,
 } from './types'
 
@@ -100,11 +100,20 @@ export function getArticlePackage(articleId: string): Promise<ContentPackage> {
 export function startGenerateVideo(
   articleId: string,
   burnSubtitles: boolean = true,
+  renderMode: RenderMode = 'static',
 ): Promise<GenerateResp> {
   return http<GenerateResp>('/generate-video', {
     method: 'POST',
-    body: JSON.stringify({ article_id: articleId, burn_subtitles: burnSubtitles }),
+    body: JSON.stringify({
+      article_id: articleId,
+      burn_subtitles: burnSubtitles,
+      render_mode: renderMode,
+    }),
   })
+}
+
+export function resolveSceneVideoUrl(sceneVideoId: string): string {
+  return `${API_BASE}/scene-videos/${sceneVideoId}`
 }
 
 export function resolveAudioUrl(audioId: string): string {

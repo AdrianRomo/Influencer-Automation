@@ -11,7 +11,7 @@ from sqlalchemy.exc import IntegrityError
 from mutagen.mp3 import MP3
 
 from app.db import SessionLocal
-from app.models import Source, Article, AudioAsset, VoiceCalibration, ImageAsset, VideoAsset
+from app.models import Source, Article, AudioAsset, VoiceCalibration, ImageAsset, VideoAsset, SceneVideoAsset
 from app.extract import extract_article_text
 from app.summarize import make_tts_bundle, rewrite_to_target_words
 from app.tts import synthesize
@@ -662,3 +662,350 @@ def regenerate_script_for_article(
             "word_count": bundle.get("word_count"),
             "scene_count": len(bundle.get("scenes") or []),
         }
+
+
+# ── Animated video task ────────────────────────────────────────────────────────
+
+@celery_app.task(
+    name="generate_animated_video_for_article",
+    bind=True,
+    time_limit=3600,
+    soft_time_limit=3540,
+)
+def generate_animated_video_for_article(
+    self,
+    article_id: str,
+    audio_asset_id: str | None = None,
+    burn_subtitles: bool = True,
+    openai_api_key: str | None = None,
+    scene_video_provider: str | None = None,
+) -> dict:
+    """Generate AI-animated scene clips then assemble a final MP4.
+
+    Flow
+    ────
+    1. Generate (or reuse) DALL-E images for each scene.
+    2. Submit each scene image to the configured image-to-video provider.
+    3. Poll until all scene jobs finish (or per-scene timeout).
+    4. Download and normalise each clip to its storyboard duration.
+    5. Fall back to static FFmpeg clip for any scene that failed.
+    6. Assemble: concat clips + attach audio + burn subtitles.
+
+    Falls back gracefully: any single scene failure only affects that scene.
+    """
+    import time as _time
+
+    from app.image_gen import generate_and_save
+    from app.scene_video import get_scene_video_provider, JobState, StaticImageProvider
+    from app.video import normalize_clip, assemble_video_from_clips
+    from app.captions import storyboard_to_captions, captions_to_srt
+    from app.schemas import Storyboard
+
+    image_dir = os.getenv("IMAGE_DIR", "/data/images")
+    video_dir = os.getenv("VIDEO_DIR", "/data/video")
+    os.makedirs(image_dir, exist_ok=True)
+    os.makedirs(video_dir, exist_ok=True)
+
+    # Per-scene timeout for the provider (seconds)
+    scene_timeout    = float(os.getenv("SCENE_VIDEO_TIMEOUT_SECONDS", "300"))
+    # How long to sleep between poll sweeps
+    poll_interval    = float(os.getenv("SCENE_VIDEO_POLL_INTERVAL_SECONDS", "6"))
+
+    provider = get_scene_video_provider(scene_video_provider)
+    logger.info("Animated video task starting: article=%s provider=%s", article_id, provider.name)
+
+    with SessionLocal() as db:
+        article = db.get(Article, article_id)
+        if not article:
+            raise ValueError(f"Unknown article_id: {article_id}")
+        if not article.storyboard_json:
+            raise RuntimeError("Article has no storyboard — run audio generation first")
+
+        try:
+            storyboard = Storyboard(**article.storyboard_json)
+        except Exception as exc:
+            raise RuntimeError(f"Storyboard incompatible — regenerate the article: {exc}") from exc
+
+        if audio_asset_id:
+            audio = db.get(AudioAsset, audio_asset_id)
+            if not audio:
+                raise ValueError(f"Unknown audio_asset_id: {audio_asset_id}")
+        else:
+            audio = db.execute(
+                select(AudioAsset)
+                .where(AudioAsset.article_id == article_id, AudioAsset.status == "ready")
+                .order_by(AudioAsset.created_at.desc())
+                .limit(1)
+            ).scalar_one_or_none()
+        if not audio:
+            raise RuntimeError("No ready audio asset — run audio generation first")
+        if not os.path.exists(audio.file_path):
+            raise RuntimeError(f"Audio file missing: {audio.file_path}")
+
+        video_record = VideoAsset(
+            article_id=article_id,
+            audio_asset_id=audio.id,
+            file_path="",
+            status="created",
+            render_mode="animated",
+        )
+        db.add(video_record)
+        db.commit()
+
+        total_scenes = len(storyboard.scenes)
+        srt_path: str | None = None
+
+        try:
+            # ── Step 1: ensure scene images exist ────────────────────────────
+            image_map: dict[int, str] = {}  # scene_number → image file path
+            for i, scene in enumerate(storyboard.scenes):
+                self.update_state(
+                    state="PROGRESS",
+                    meta={
+                        "stage": "imaging",
+                        "msg": f"Preparing scene images… {i + 1}/{total_scenes}",
+                        "progress": (i / max(total_scenes, 1)) * 0.2,
+                    },
+                )
+                img_path = os.path.join(image_dir, f"{article_id}_scene_{scene.scene_number}.png")
+                existing = db.execute(
+                    select(ImageAsset).where(
+                        ImageAsset.article_id == article_id,
+                        ImageAsset.scene_number == scene.scene_number,
+                        ImageAsset.status == "ready",
+                    )
+                ).scalar_one_or_none()
+
+                if existing and os.path.exists(existing.file_path):
+                    img_path = existing.file_path
+                    logger.info("Reusing image for scene %d", scene.scene_number)
+                else:
+                    success = generate_and_save(scene.visual_prompt, img_path, api_key=openai_api_key)
+                    img_rec = ImageAsset(
+                        article_id=article_id,
+                        scene_number=scene.scene_number,
+                        visual_prompt=scene.visual_prompt,
+                        file_path=img_path,
+                        status="ready" if success else "failed",
+                        error=None if success else "generation failed, placeholder used",
+                    )
+                    db.add(img_rec)
+                    db.commit()
+                image_map[scene.scene_number] = img_path
+
+            # ── Step 2: submit all scenes to the provider ─────────────────────
+            self.update_state(
+                state="PROGRESS",
+                meta={
+                    "stage": "submitting",
+                    "msg": f"Submitting {total_scenes} scenes to {provider.name}…",
+                    "progress": 0.2,
+                },
+            )
+
+            # Clean up stale scene video records for this article/provider
+            db.execute(
+                __import__("sqlalchemy").delete(SceneVideoAsset).where(
+                    SceneVideoAsset.article_id == article_id,
+                )
+            )
+            db.commit()
+
+            scene_records: dict[int, SceneVideoAsset] = {}
+            for scene in storyboard.scenes:
+                img_path   = image_map[scene.scene_number]
+                clip_raw   = os.path.join(video_dir, f"{article_id}_scene_{scene.scene_number}_raw.mp4")
+                duration_t = max(scene.duration_estimate, 1.0)
+
+                sv = SceneVideoAsset(
+                    article_id=article_id,
+                    scene_number=scene.scene_number,
+                    provider=provider.name,
+                    status="pending",
+                )
+                db.add(sv)
+                db.commit()
+                scene_records[scene.scene_number] = sv
+
+                try:
+                    job_id = provider.submit(
+                        image_path=img_path,
+                        prompt=scene.visual_prompt,
+                        duration_hint=duration_t,
+                    )
+                    sv.provider_job_id = job_id
+                    sv.status = "processing"
+                    db.commit()
+                    logger.info(
+                        "Submitted scene %d → provider job %s", scene.scene_number, job_id
+                    )
+                except Exception as exc:
+                    logger.error("Submit failed for scene %d: %s", scene.scene_number, exc)
+                    sv.status = "failed"
+                    sv.error  = str(exc)[:500]
+                    db.commit()
+
+            # ── Step 3: poll until all scenes are done ─────────────────────────
+            pending = {
+                sn: rec for sn, rec in scene_records.items()
+                if rec.status == "processing" and rec.provider_job_id
+            }
+            deadlines = {sn: _time.monotonic() + scene_timeout for sn in pending}
+
+            while pending:
+                self.update_state(
+                    state="PROGRESS",
+                    meta={
+                        "stage": "animating",
+                        "msg": f"Animating scenes… {total_scenes - len(pending)}/{total_scenes} done",
+                        "progress": 0.2 + 0.6 * (1.0 - len(pending) / max(total_scenes, 1)),
+                        "scene_statuses": {
+                            sn: scene_records[sn].status
+                            for sn in range(1, total_scenes + 1)
+                            if sn in scene_records
+                        },
+                    },
+                )
+                still_pending: dict[int, SceneVideoAsset] = {}
+                for sn, rec in list(pending.items()):
+                    if _time.monotonic() > deadlines[sn]:
+                        logger.warning("Scene %d timed out, falling back to static", sn)
+                        rec.status = "failed"
+                        rec.error  = f"Provider timeout after {scene_timeout:.0f}s"
+                        db.commit()
+                        continue
+                    try:
+                        job = provider.poll(rec.provider_job_id)
+                        if job.state == JobState.READY:
+                            # Download raw clip
+                            clip_raw = os.path.join(
+                                video_dir, f"{article_id}_scene_{sn}_raw.mp4"
+                            )
+                            provider.download(job, clip_raw)
+                            rec.status = "ready"
+                            rec.file_path = clip_raw
+                            db.commit()
+                            logger.info("Scene %d clip ready: %s", sn, clip_raw)
+                        elif job.state == JobState.FAILED:
+                            rec.status = "failed"
+                            rec.error  = job.error or "Provider reported failure"
+                            db.commit()
+                        else:
+                            still_pending[sn] = rec
+                    except Exception as exc:
+                        logger.error("Poll error for scene %d: %s", sn, exc)
+                        still_pending[sn] = rec
+
+                pending = still_pending
+                if pending:
+                    _time.sleep(poll_interval)
+
+            # ── Step 4: normalise clips (trim/pad) and apply static fallback ──
+            self.update_state(
+                state="PROGRESS",
+                meta={"stage": "normalizing", "msg": "Normalising scene clips…", "progress": 0.82},
+            )
+            final_clips: list[dict] = []
+            static_fallback = StaticImageProvider()
+
+            for scene in storyboard.scenes:
+                sn = scene.scene_number
+                rec = scene_records.get(sn)
+                dur = max(scene.duration_estimate, 1.0)
+                clip_norm = os.path.join(video_dir, f"{article_id}_scene_{sn}_norm.mp4")
+
+                if rec and rec.status == "ready" and rec.file_path and os.path.exists(rec.file_path):
+                    try:
+                        normalize_clip(rec.file_path, clip_norm, dur)
+                        rec.duration_seconds = dur
+                        db.commit()
+                        final_clips.append({"clip_path": clip_norm, "duration": dur})
+                        continue
+                    except Exception as exc:
+                        logger.warning("Normalize failed for scene %d: %s — using static fallback", sn, exc)
+
+                # Static fallback for this scene
+                img_path = image_map[sn]
+                try:
+                    static_fallback.generate_sync(
+                        image_path=img_path,
+                        prompt=scene.visual_prompt,
+                        output_path=clip_norm,
+                        duration_hint=dur,
+                    )
+                    if rec:
+                        rec.status    = "fallback"
+                        rec.file_path = clip_norm
+                        rec.duration_seconds = dur
+                        db.commit()
+                    final_clips.append({"clip_path": clip_norm, "duration": dur})
+                except Exception as exc:
+                    logger.error("Static fallback also failed for scene %d: %s", sn, exc)
+                    raise RuntimeError(f"Cannot produce clip for scene {sn}: {exc}") from exc
+
+            # ── Step 5: SRT captions ───────────────────────────────────────────
+            if burn_subtitles:
+                from app.captions import storyboard_to_captions, captions_to_srt
+                captions    = storyboard_to_captions(storyboard)
+                srt_content = captions_to_srt(captions)
+                srt_path    = os.path.join(video_dir, f"{article_id}.srt")
+                with open(srt_path, "w", encoding="utf-8") as fh:
+                    fh.write(srt_content)
+
+            # ── Step 6: assemble final video ──────────────────────────────────
+            self.update_state(
+                state="PROGRESS",
+                meta={"stage": "rendering", "msg": "Assembling final animated video…", "progress": 0.9},
+            )
+            output_path   = os.path.join(video_dir, f"{article_id}_{video_record.id}.mp4")
+            actual_dur    = assemble_video_from_clips(
+                scene_clips=final_clips,
+                audio_path=audio.file_path,
+                output_path=output_path,
+                srt_path=srt_path,
+            )
+
+            fallback_count = sum(
+                1 for r in scene_records.values() if r.status in ("fallback", "failed")
+            )
+
+            video_record.file_path        = output_path
+            video_record.duration_seconds = actual_dur
+            video_record.has_subtitles    = 1 if burn_subtitles and srt_path else 0
+            video_record.status           = "ready"
+            db.commit()
+
+            # Update scene video asset durations for fully animated clips
+            for rec in scene_records.values():
+                if rec.status == "ready":
+                    db.refresh(rec)
+
+            logger.info(
+                "Animated video ready: %s (%.1fs, %d/%d animated, %d fallback)",
+                output_path, actual_dur,
+                total_scenes - fallback_count, total_scenes,
+                fallback_count,
+            )
+
+            return {
+                "article_id":      article_id,
+                "video_id":        video_record.id,
+                "video_path":      output_path,
+                "duration_seconds": actual_dur,
+                "scene_count":     total_scenes,
+                "animated_scenes": total_scenes - fallback_count,
+                "fallback_scenes": fallback_count,
+                "has_subtitles":   bool(video_record.has_subtitles),
+                "render_mode":     "animated",
+            }
+
+        except Exception as exc:
+            video_record.status = "failed"
+            video_record.error  = str(exc)[:500]
+            db.commit()
+            if srt_path and os.path.exists(srt_path):
+                try:
+                    os.remove(srt_path)
+                except OSError:
+                    pass
+            raise
