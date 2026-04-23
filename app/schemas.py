@@ -174,3 +174,36 @@ class ContentPackage(BaseModel):
     video: Optional[VideoAssetRef] = None
     scene_videos: Optional[List[SceneVideoRef]] = None
     analysis: Optional[AnalysisResult] = None
+    cost_summary: Optional["CostSummary"] = None
+
+
+# ── Usage / cost tracking ──────────────────────────────────────────────────
+
+class UsageEventOut(BaseModel):
+    id: str
+    provider: str
+    operation: str
+    model: Optional[str] = None
+    input_tokens: Optional[int] = None
+    output_tokens: Optional[int] = None
+    total_tokens: Optional[int] = None
+    cached_input_tokens: Optional[int] = None
+    character_count: Optional[int] = None
+    image_count: Optional[int] = None
+    image_size: Optional[str] = None
+    image_quality: Optional[str] = None
+    estimated_cost_usd: Optional[float] = None
+    external_request_id: Optional[str] = None
+    created_at: Optional[datetime] = None
+
+
+class CostSummary(BaseModel):
+    article_id: str
+    total_estimated_usd: float
+    by_provider: dict
+    by_stage: dict
+    total_tokens: int
+    total_characters: int
+    event_count: int
+    events: List[UsageEventOut] = []
+    pricing_note: str = ""

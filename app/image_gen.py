@@ -10,8 +10,12 @@ import base64
 import logging
 import os
 import subprocess
+from typing import TYPE_CHECKING
 
 from openai import OpenAI
+
+if TYPE_CHECKING:
+    from app.usage import UsageCollector
 
 logger = logging.getLogger(__name__)
 
@@ -35,7 +39,12 @@ def _safe_prompt(visual_prompt: str) -> str:
     return raw[:_MAX_PROMPT_CHARS + len(_PROMPT_PREFIX)]
 
 
-def generate_scene_image(visual_prompt: str, api_key: str | None = None) -> bytes:
+def generate_scene_image(
+    visual_prompt: str,
+    api_key: str | None = None,
+    collector: "UsageCollector | None" = None,
+    scene_number: int | None = None,
+) -> bytes:
     """Call DALL-E and return raw PNG bytes."""
     c = OpenAI(api_key=api_key) if api_key else _client
     resp = c.images.generate(
@@ -46,7 +55,27 @@ def generate_scene_image(visual_prompt: str, api_key: str | None = None) -> byte
         n=1,
         response_format="b64_json",
     )
-    return base64.b64decode(resp.data[0].b64_json)
+    img_bytes = base64.b64decode(resp.data[0].b64_json)
+
+    if collector is not None:
+        try:
+            from app.pricing import estimate_openai_image_cost, get_image_pricing_snapshot
+            cost = estimate_openai_image_cost(model=IMAGE_MODEL, size=IMAGE_SIZE, quality=IMAGE_QUALITY, count=1)
+            collector.record(
+                provider="openai",
+                operation="image",
+                model=IMAGE_MODEL,
+                image_count=1,
+                image_size=IMAGE_SIZE,
+                image_quality=IMAGE_QUALITY,
+                estimated_cost_usd=cost,
+                pricing_snapshot=get_image_pricing_snapshot(IMAGE_MODEL, IMAGE_SIZE, IMAGE_QUALITY),
+                metadata={"scene_number": scene_number} if scene_number is not None else None,
+            )
+        except Exception:
+            pass
+
+    return img_bytes
 
 
 def create_placeholder_image(output_path: str, width: int = 1024, height: int = 1792) -> None:
@@ -63,13 +92,20 @@ def create_placeholder_image(output_path: str, width: int = 1024, height: int = 
     )
 
 
-def generate_and_save(visual_prompt: str, output_path: str, api_key: str | None = None) -> bool:
+def generate_and_save(
+    visual_prompt: str,
+    output_path: str,
+    api_key: str | None = None,
+    collector: "UsageCollector | None" = None,
+    scene_number: int | None = None,
+) -> bool:
     """Generate an image and save to disk. Returns True on success, False on failure.
 
     On failure, writes a black placeholder so callers don't need to handle missing files.
     """
     try:
-        img_bytes = generate_scene_image(visual_prompt, api_key=api_key)
+        img_bytes = generate_scene_image(visual_prompt, api_key=api_key,
+                                         collector=collector, scene_number=scene_number)
         with open(output_path, "wb") as fh:
             fh.write(img_bytes)
         return True

@@ -196,6 +196,36 @@ export type AnalysisResult = {
   audience_relevance?: string | null
 }
 
+export type UsageEvent = {
+  id: string
+  provider: string
+  operation: string
+  model?: string | null
+  input_tokens?: number | null
+  output_tokens?: number | null
+  total_tokens?: number | null
+  cached_input_tokens?: number | null
+  character_count?: number | null
+  image_count?: number | null
+  image_size?: string | null
+  image_quality?: string | null
+  estimated_cost_usd?: number | null
+  external_request_id?: string | null
+  created_at?: string | null
+}
+
+export type CostSummary = {
+  article_id: string
+  total_estimated_usd: number
+  by_provider: Record<string, number>
+  by_stage: Record<string, number>
+  total_tokens: number
+  total_characters: number
+  event_count: number
+  events: UsageEvent[]
+  pricing_note: string
+}
+
 export type ContentPackage = {
   article_id: string
   title: string
@@ -211,4 +241,5 @@ export type ContentPackage = {
   video?: VideoAssetRef | null
   scene_videos?: SceneVideoRef[] | null
   analysis?: AnalysisResult | null
+  cost_summary?: CostSummary | null
 }

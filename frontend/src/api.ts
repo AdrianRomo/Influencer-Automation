@@ -1,7 +1,7 @@
 import type {
   ArticleSummary, PaginatedArticles, PrepareArticleReq, RssCandidate, Source,
   GenerateReq, GenerateResp, JobStatus, ContentPackage, RenderMode,
-  TokenResp, UserResp, UserKeysIn, UserKeysOut,
+  TokenResp, UserResp, UserKeysIn, UserKeysOut, CostSummary,
 } from './types'
 
 const rawBase = import.meta.env.VITE_API_BASE_URL as string | undefined
@@ -214,6 +214,10 @@ export function startRegenerateScript(
 
 export function getExportZipUrl(articleId: string): string {
   return `${API_BASE}/articles/${encodeURIComponent(articleId)}/export.zip`
+}
+
+export function getArticleCosts(articleId: string): Promise<CostSummary> {
+  return http<CostSummary>(`/articles/${encodeURIComponent(articleId)}/costs`)
 }
 
 export function resolveDownloadUrl(status: JobStatus): string | undefined {

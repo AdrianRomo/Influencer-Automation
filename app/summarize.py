@@ -1,8 +1,11 @@
 import os
 import json
 import re
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 from openai import OpenAI
+
+if TYPE_CHECKING:
+    from app.usage import UsageCollector
 
 client = OpenAI()
 
@@ -116,7 +119,16 @@ def _tolerance_words(tolerance_seconds=TOLERANCE_SECONDS, output_language=None) 
     return int(round(tolerance_seconds * (wpm / 60.0)))
 
 
-def _call_llm(system: str, user: str, model: str, temperature: float = 0.3, *, api_key: str | None = None) -> str:
+def _call_llm(
+    system: str,
+    user: str,
+    model: str,
+    temperature: float = 0.3,
+    *,
+    api_key: str | None = None,
+    collector: "UsageCollector | None" = None,
+    operation: str = "llm",
+) -> str:
     c = OpenAI(api_key=api_key) if api_key else client
     resp = c.responses.create(
         model=model,
@@ -127,7 +139,39 @@ def _call_llm(system: str, user: str, model: str, temperature: float = 0.3, *, a
         temperature=temperature,
         store=False,
     )
-    return (resp.output_text or "").strip()
+    text = (resp.output_text or "").strip()
+
+    if collector is not None:
+        try:
+            from app.pricing import estimate_openai_llm_cost, get_llm_pricing_snapshot
+            usage = getattr(resp, "usage", None)
+            in_tok = getattr(usage, "input_tokens", None) if usage else None
+            out_tok = getattr(usage, "output_tokens", None) if usage else None
+            tot_tok = getattr(usage, "total_tokens", None) if usage else None
+            details = getattr(usage, "input_tokens_details", None) if usage else None
+            cached = getattr(details, "cached_tokens", None) if details else None
+            cost = estimate_openai_llm_cost(
+                model=model,
+                input_tokens=in_tok or 0,
+                output_tokens=out_tok or 0,
+                cached_input_tokens=cached or 0,
+            )
+            collector.record(
+                provider="openai",
+                operation=operation,
+                model=model,
+                external_request_id=getattr(resp, "id", None),
+                input_tokens=in_tok,
+                output_tokens=out_tok,
+                total_tokens=tot_tok,
+                cached_input_tokens=cached,
+                estimated_cost_usd=cost,
+                pricing_snapshot=get_llm_pricing_snapshot(model),
+            )
+        except Exception:
+            pass  # never block generation on tracking failures
+
+    return text
 
 
 def make_tts_script(
@@ -139,6 +183,7 @@ def make_tts_script(
         target_words: int | None = None,
         tol_words: int | None = None,
         api_key: str | None = None,
+        collector: "UsageCollector | None" = None,
 ) -> str:
     """
     Returns a narration-ready script aimed at ~target_seconds, always in Spanish by default.
@@ -163,7 +208,8 @@ Length requirement:
 - Target word count: {target} words (acceptable range {target - tol} to {target + tol} words).
 """
 
-    script = _call_llm(SYSTEM_SCRIPT, prompt, model=model, temperature=0.3, api_key=api_key)
+    script = _call_llm(SYSTEM_SCRIPT, prompt, model=model, temperature=0.3, api_key=api_key,
+                       collector=collector, operation="script")
     wc = _count_words(script)
 
     for _ in range(2):
@@ -180,7 +226,8 @@ Keep it natural spoken narration. End with the brief medical disclaimer in Spani
 SCRIPT:
 {script}
 """
-        script = _call_llm(SYSTEM_REWRITE, rewrite_prompt, model=model, temperature=0.2, api_key=api_key)
+        script = _call_llm(SYSTEM_REWRITE, rewrite_prompt, model=model, temperature=0.2, api_key=api_key,
+                           collector=collector, operation="rewrite")
         wc = _count_words(script)
 
     return script.strip()
@@ -194,6 +241,7 @@ def make_storyboard(
         image_prompt_language: str = IMAGE_PROMPT_LANGUAGE,
         wpm_estimate: float | None = None,
         api_key: str | None = None,
+        collector: "UsageCollector | None" = None,
 ) -> List[Dict[str, Any]]:
     """Return timing-enriched scene list aligned to the narration script.
 
@@ -223,7 +271,8 @@ SCRIPT:
 {script}
 """.strip()
 
-    raw = _call_llm(SYSTEM_STORYBOARD, user, model=model, temperature=0.2, api_key=api_key)
+    raw = _call_llm(SYSTEM_STORYBOARD, user, model=model, temperature=0.2, api_key=api_key,
+                    collector=collector, operation="storyboard")
     try:
         data = json.loads(raw)
         if isinstance(data, list):
@@ -248,6 +297,7 @@ def make_tts_bundle(
         tol_words: int | None = None,
         wpm_estimate: float | None = None,
         api_key: str | None = None,
+        collector: "UsageCollector | None" = None,
 ) -> Dict[str, Any]:
     """Convenience: script + metadata + timing-enriched storyboard in one call."""
     script = make_tts_script(
@@ -258,6 +308,7 @@ def make_tts_bundle(
         target_words=target_words,
         tol_words=tol_words,
         api_key=api_key,
+        collector=collector,
     )
     wc = _count_words(script)
     est = _estimate_seconds(wc, output_language)
@@ -267,6 +318,7 @@ def make_tts_bundle(
         n_scenes=n_scenes,
         wpm_estimate=wpm_estimate,
         api_key=api_key,
+        collector=collector,
     )
     total_duration = sum(s.get("duration_estimate", 0.0) for s in scenes)
 
@@ -285,7 +337,13 @@ def _words_for_seconds(seconds: int, wpm: float) -> int:
     return int(round(seconds * (wpm / 60.0)))
 
 
-def rewrite_to_target_words(script: str, target_words: int, tol_words: int = 10, api_key: str | None = None) -> str:
+def rewrite_to_target_words(
+    script: str,
+    target_words: int,
+    tol_words: int = 10,
+    api_key: str | None = None,
+    collector: "UsageCollector | None" = None,
+) -> str:
     model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
     prompt = f"""Rewrite this Spanish TTS script to fit the word count range.
 
@@ -296,4 +354,5 @@ Keep it natural spoken narration. End with the brief medical disclaimer in Spani
 SCRIPT:
 {script}
 """
-    return _call_llm(SYSTEM_REWRITE, prompt, model=model, temperature=0.2, api_key=api_key)
+    return _call_llm(SYSTEM_REWRITE, prompt, model=model, temperature=0.2, api_key=api_key,
+                     collector=collector, operation="rewrite")

@@ -1,9 +1,12 @@
 import os
 import time
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from elevenlabs import VoiceSettings
 from elevenlabs.client import ElevenLabs
+
+if TYPE_CHECKING:
+    from app.usage import UsageCollector
 
 # Module-level client — used when no per-user key is supplied
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", "")
@@ -39,6 +42,8 @@ def synthesize(
     retries: int = 3,
     model_id: str = MODEL_ID,
     output_format: str = OUTPUT_FORMAT,
+    collector: "UsageCollector | None" = None,
+    operation: str = "tts",
 ) -> bytes:
     if not text or not text.strip():
         raise ValueError("Empty text")
@@ -73,7 +78,26 @@ def synthesize(
             for chunk in audio_stream:
                 if isinstance(chunk, (bytes, bytearray)) and chunk:
                     chunks.append(bytes(chunk))
-            return b"".join(chunks)
+            audio_bytes = b"".join(chunks)
+
+            if collector is not None:
+                try:
+                    from app.pricing import estimate_elevenlabs_cost, get_elevenlabs_pricing_snapshot
+                    char_count = len(text)
+                    cost = estimate_elevenlabs_cost(model_id=model_id, character_count=char_count)
+                    collector.record(
+                        provider="elevenlabs",
+                        operation=operation,
+                        model=model_id,
+                        character_count=char_count,
+                        estimated_cost_usd=cost,
+                        pricing_snapshot=get_elevenlabs_pricing_snapshot(model_id),
+                        metadata={"voice_id": vid, "output_format": output_format},
+                    )
+                except Exception:
+                    pass  # never block generation on tracking failures
+
+            return audio_bytes
 
         except Exception as e:
             last_err = e

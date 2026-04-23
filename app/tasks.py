@@ -15,6 +15,7 @@ from app.models import Source, Article, AudioAsset, VoiceCalibration, ImageAsset
 from app.extract import extract_article_text
 from app.summarize import make_tts_bundle, rewrite_to_target_words
 from app.tts import synthesize
+from app.usage import UsageCollector
 
 logger = logging.getLogger(__name__)
 
@@ -164,6 +165,8 @@ def prepare_article(
                 article.user_id = user_id
                 db.commit()
 
+        collector = UsageCollector(article_id=article.id, user_id=user_id)
+
         self.update_state(state="PROGRESS", meta={"stage": "extracting", "msg": "Extracting article content…"})
         raw = extract_article_text(url, fallback_text=fallback)
         if not raw:
@@ -184,6 +187,7 @@ def prepare_article(
             tol_words=tol_words,
             wpm_estimate=wpm_estimate,
             api_key=openai_api_key,
+            collector=collector,
         )
 
         script = bundle["script"]
@@ -203,10 +207,12 @@ def prepare_article(
         try:
             from app.analysis import analyze_article as _analyze
             self.update_state(state="PROGRESS", meta={"stage": "analyzing", "msg": "Analyzing content…"})
-            article.analysis_json = _analyze(script, api_key=openai_api_key)
+            article.analysis_json = _analyze(script, api_key=openai_api_key, collector=collector)
             db.commit()
         except Exception as exc:
             logger.warning("Analysis failed (non-fatal): %s", exc)
+
+        collector.flush(db)
 
         estimated_duration = int(round(word_count / (wpm_estimate / 60.0)))
         logger.info("Prepared article id=%s words=%d est=%ds", article.id, word_count, estimated_duration)
@@ -259,6 +265,7 @@ def generate_latest_for_source(
             script = article.tts_script
             scenes = (article.storyboard_json or {}).get("scenes") or []
             word_count = len(script.split())
+            collector = UsageCollector(article_id=article.id, user_id=user_id)
             logger.info("TTS-only run for pre-prepared article id=%s words=%d", article.id, word_count)
         else:
             # ── Full path: obtain article + extract content + generate script ─
@@ -315,6 +322,7 @@ def generate_latest_for_source(
             tol_words = _words_for_seconds(TOLERANCE_SECONDS, wpm)
 
             self.update_state(state="PROGRESS", meta={"stage": "scripting", "msg": "Generating script & storyboard…"})
+            collector = UsageCollector(article_id=article.id, user_id=user_id)
             bundle = make_tts_bundle(
                 title=title,
                 body=raw,
@@ -325,6 +333,7 @@ def generate_latest_for_source(
                 tol_words=tol_words,
                 wpm_estimate=wpm,
                 api_key=openai_api_key,
+                collector=collector,
             )
 
             script = bundle["script"]
@@ -358,6 +367,7 @@ def generate_latest_for_source(
                 audio_bytes = synthesize(
                     script, voice_id=used_voice_id, model_id=model_id,
                     output_format=output_format, api_key=elevenlabs_api_key,
+                    collector=collector,
                 )
                 with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3", dir=audio_dir) as tmp:
                     tmp.write(audio_bytes)
@@ -379,7 +389,10 @@ def generate_latest_for_source(
                 wc = word_count or len(script.split())
                 desired = MIN_SECONDS if duration < MIN_SECONDS else MAX_SECONDS
                 target_wc = int(round(wc * (desired / max(duration, 1))))
-                script = rewrite_to_target_words(script, target_words=target_wc, tol_words=20, api_key=openai_api_key)
+                script = rewrite_to_target_words(
+                    script, target_words=target_wc, tol_words=20,
+                    api_key=openai_api_key, collector=collector,
+                )
                 word_count = len(script.split())
 
                 try:
@@ -399,7 +412,7 @@ def generate_latest_for_source(
         try:
             from app.analysis import analyze_article as _analyze
             self.update_state(state="PROGRESS", meta={"stage": "analyzing", "msg": "Analyzing content…"})
-            article.analysis_json = _analyze(script, api_key=openai_api_key)
+            article.analysis_json = _analyze(script, api_key=openai_api_key, collector=collector)
         except Exception as exc:
             logger.warning("Analysis failed (non-fatal): %s", exc)
 
@@ -436,6 +449,7 @@ def generate_latest_for_source(
         db.add(audio)
         db.commit()
 
+        collector.flush(db)
         logger.info("Saved audio duration=%ss path=%s", duration, final_path)
 
         return {
@@ -510,6 +524,7 @@ def generate_video_for_article(
         db.add(video_record)
         db.commit()
 
+        collector = UsageCollector(article_id=article_id, user_id=getattr(article, "user_id", None))
         total_scenes = len(storyboard.scenes)
         srt_path: str | None = None  # declared here so except block can clean it up
 
@@ -540,7 +555,10 @@ def generate_video_for_article(
                     img_path = existing.file_path
                 else:
                     logger.info("Generating image for scene %d: %r", scene.scene_number, scene.visual_prompt[:80])
-                    success = generate_and_save(scene.visual_prompt, img_path, api_key=openai_api_key)
+                    success = generate_and_save(
+                        scene.visual_prompt, img_path, api_key=openai_api_key,
+                        collector=collector, scene_number=scene.scene_number,
+                    )
                     img_record = ImageAsset(
                         article_id=article_id,
                         scene_number=scene.scene_number,
@@ -578,6 +596,7 @@ def generate_video_for_article(
             video_record.status = "ready"
             db.commit()
 
+            collector.flush(db, video_asset_id=video_record.id)
             logger.info("Video ready: %s (%.1fs)", output_path, actual_duration)
             return {
                 "article_id": article_id,
@@ -592,6 +611,7 @@ def generate_video_for_article(
             video_record.status = "failed"
             video_record.error = str(exc)[:500]
             db.commit()
+            collector.flush(db, video_asset_id=video_record.id)
             # Clean up orphaned SRT
             if srt_path and os.path.exists(srt_path):
                 try:
@@ -630,6 +650,7 @@ def regenerate_script_for_article(
         target_words = _words_for_seconds(target_seconds, wpm)
         tol_words = _words_for_seconds(tol_seconds, wpm)
 
+        collector = UsageCollector(article_id=article_id, user_id=getattr(article, "user_id", None))
         bundle = make_tts_bundle(
             title=article.title,
             body=article.raw_text,
@@ -640,6 +661,7 @@ def regenerate_script_for_article(
             tol_words=tol_words,
             wpm_estimate=wpm,
             api_key=openai_api_key,
+            collector=collector,
         )
 
         article.tts_script = bundle["script"]
@@ -651,11 +673,12 @@ def regenerate_script_for_article(
         try:
             from app.analysis import analyze_article as _analyze
             self.update_state(state="PROGRESS", meta={"stage": "analyzing", "msg": "Analyzing content…"})
-            article.analysis_json = _analyze(bundle["script"], api_key=openai_api_key)
+            article.analysis_json = _analyze(bundle["script"], api_key=openai_api_key, collector=collector)
         except Exception as exc:
             logger.warning("Analysis failed (non-fatal): %s", exc)
 
         db.commit()
+        collector.flush(db)
 
         return {
             "article_id": article_id,
@@ -752,6 +775,7 @@ def generate_animated_video_for_article(
         db.add(video_record)
         db.commit()
 
+        anim_collector = UsageCollector(article_id=article_id, user_id=getattr(article, "user_id", None))
         total_scenes = len(storyboard.scenes)
         srt_path: str | None = None
 
@@ -780,7 +804,10 @@ def generate_animated_video_for_article(
                     img_path = existing.file_path
                     logger.info("Reusing image for scene %d", scene.scene_number)
                 else:
-                    success = generate_and_save(scene.visual_prompt, img_path, api_key=openai_api_key)
+                    success = generate_and_save(
+                        scene.visual_prompt, img_path, api_key=openai_api_key,
+                        collector=anim_collector, scene_number=scene.scene_number,
+                    )
                     img_rec = ImageAsset(
                         article_id=article_id,
                         scene_number=scene.scene_number,
@@ -980,6 +1007,7 @@ def generate_animated_video_for_article(
                 if rec.status == "ready":
                     db.refresh(rec)
 
+            anim_collector.flush(db, video_asset_id=video_record.id)
             logger.info(
                 "Animated video ready: %s (%.1fs, %d/%d animated, %d fallback)",
                 output_path, actual_dur,
@@ -1003,6 +1031,7 @@ def generate_animated_video_for_article(
             video_record.status = "failed"
             video_record.error  = str(exc)[:500]
             db.commit()
+            anim_collector.flush(db, video_asset_id=video_record.id)
             if srt_path and os.path.exists(srt_path):
                 try:
                     os.remove(srt_path)

@@ -53,6 +53,7 @@ from app.schemas import (
     AudioAssetRef, ScriptAsset, VisualPromptEntry, ContentPackage,
     ImageAssetRef, VideoAssetRef, SceneVideoRef, AnalysisResult,
     RegisterReq, LoginReq, TokenResp, UserResp, UserKeysIn, UserKeysOut,
+    CostSummary, UsageEventOut,
 )
 from app.captions import storyboard_to_captions, captions_to_srt, captions_to_vtt
 from app.summarize import _count_words, _estimate_seconds
@@ -651,6 +652,26 @@ def get_article_package(article_id: str, db=Depends(get_db)):
         except Exception:
             pass
 
+    # Inline cost summary so the frontend gets everything in one request
+    cost_summary: CostSummary | None = None
+    try:
+        from app.usage import get_article_cost_summary
+        raw = get_article_cost_summary(db, article_id)
+        if raw["event_count"] > 0:
+            cost_summary = CostSummary(
+                article_id=raw["article_id"],
+                total_estimated_usd=raw["total_estimated_usd"],
+                by_provider=raw["by_provider"],
+                by_stage=raw["by_stage"],
+                total_tokens=raw["total_tokens"],
+                total_characters=raw["total_characters"],
+                event_count=raw["event_count"],
+                events=[UsageEventOut(**e) for e in raw["events"]],
+                pricing_note=raw["pricing_note"],
+            )
+    except Exception:
+        pass
+
     return ContentPackage(
         article_id=article.id,
         title=article.title,
@@ -666,6 +687,27 @@ def get_article_package(article_id: str, db=Depends(get_db)):
         video=video_ref,
         scene_videos=scene_videos,
         analysis=analysis,
+        cost_summary=cost_summary,
+    )
+
+
+@app.get("/articles/{article_id}/costs", response_model=CostSummary, dependencies=[Depends(check_api_key)])
+def get_article_costs(article_id: str, db=Depends(get_db)):
+    """Return the full cost and usage breakdown for an article."""
+    if not db.get(Article, article_id):
+        raise HTTPException(status_code=404, detail="Article not found")
+    from app.usage import get_article_cost_summary
+    raw = get_article_cost_summary(db, article_id)
+    return CostSummary(
+        article_id=raw["article_id"],
+        total_estimated_usd=raw["total_estimated_usd"],
+        by_provider=raw["by_provider"],
+        by_stage=raw["by_stage"],
+        total_tokens=raw["total_tokens"],
+        total_characters=raw["total_characters"],
+        event_count=raw["event_count"],
+        events=[UsageEventOut(**e) for e in raw["events"]],
+        pricing_note=raw["pricing_note"],
     )
 
 

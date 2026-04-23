@@ -3,9 +3,12 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from openai import OpenAI
+
+if TYPE_CHECKING:
+    from app.usage import UsageCollector
 
 _SYSTEM = """You are a medical-content analyst. Given a narration script about a health or medical topic, analyze it and return a JSON object with exactly these fields:
 
@@ -36,7 +39,11 @@ def _llm() -> OpenAI:
     return _client
 
 
-def analyze_article(script: str, api_key: Optional[str] = None) -> dict:
+def analyze_article(
+    script: str,
+    api_key: Optional[str] = None,
+    collector: "UsageCollector | None" = None,
+) -> dict:
     """Return sentiment/impact analysis for a TTS script.
 
     Never raises — returns a safe neutral stub on any failure so callers are never blocked.
@@ -55,6 +62,32 @@ def analyze_article(script: str, api_key: Optional[str] = None) -> dict:
             store=False,
         )
         raw = (resp.output_text or "").strip()
+
+        if collector is not None:
+            try:
+                from app.pricing import estimate_openai_llm_cost, get_llm_pricing_snapshot
+                usage = getattr(resp, "usage", None)
+                in_tok = getattr(usage, "input_tokens", None) if usage else None
+                out_tok = getattr(usage, "output_tokens", None) if usage else None
+                tot_tok = getattr(usage, "total_tokens", None) if usage else None
+                details = getattr(usage, "input_tokens_details", None) if usage else None
+                cached = getattr(details, "cached_tokens", None) if details else None
+                cost = estimate_openai_llm_cost(
+                    model=model, input_tokens=in_tok or 0,
+                    output_tokens=out_tok or 0, cached_input_tokens=cached or 0,
+                )
+                collector.record(
+                    provider="openai",
+                    operation="analysis",
+                    model=model,
+                    external_request_id=getattr(resp, "id", None),
+                    input_tokens=in_tok, output_tokens=out_tok,
+                    total_tokens=tot_tok, cached_input_tokens=cached,
+                    estimated_cost_usd=cost,
+                    pricing_snapshot=get_llm_pricing_snapshot(model),
+                )
+            except Exception:
+                pass
 
         # Strip markdown code fences if the model ignores instructions
         if raw.startswith("```"):
