@@ -671,7 +671,7 @@ def toggle_pin(article_id: str, req: PinReq, db: Session = Depends(get_db)):
     article = db.get(Article, article_id)
     if not article:
         raise HTTPException(status_code=404, detail="Article not found")
-    article.is_pinned = req.pinned
+    article.is_pinned = 1 if req.pinned else 0
     db.commit()
     return {"article_id": article_id, "is_pinned": bool(article.is_pinned)}
 

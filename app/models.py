@@ -69,7 +69,7 @@ class Article(Base):
     analysis_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
     # User content management
-    is_pinned: Mapped[bool] = mapped_column(Integer, default=False, nullable=False)
+    is_pinned: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
 
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
 
