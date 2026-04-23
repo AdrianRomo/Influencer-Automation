@@ -1,19 +1,18 @@
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 
-// If you prefer not to set VITE_API_BASE_URL, you can proxy requests to your backend.
-// Uncomment and set the target to match your docker-compose service name / port.
+// Proxy all API paths to the FastAPI backend so cookies work in dev.
+// Set VITE_API_BASE_URL to override with an absolute URL (bypasses proxy).
 export default defineConfig({
   plugins: [react()],
   server: {
     port: 5173,
     strictPort: true,
-    // proxy: {
-    //   '/': {
-    //     target: 'http://api:8000',
-    //     changeOrigin: true,
-    //     secure: false,
-    //   },
-    // },
+    proxy: {
+      '^/(auth|users|sources|platforms|articles|generate-video|generate|jobs|audio|image|video|thumbnail|scene-videos|rss|health|admin|beat)': {
+        target: 'http://localhost:8085',
+        changeOrigin: true,
+      },
+    },
   },
 })

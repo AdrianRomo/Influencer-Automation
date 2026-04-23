@@ -20,6 +20,7 @@ class LoginReq(BaseModel):
 
 class TokenResp(BaseModel):
     access_token: str
+    refresh_token: Optional[str] = None
     token_type: str = "bearer"
     user_id: str
     email: str

@@ -9,8 +9,8 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from time import time as _time
 import feedparser as _fp
-from fastapi import FastAPI, Depends, File, HTTPException, Header, Query, Request, UploadFile
-from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi import Cookie, FastAPI, Depends, File, HTTPException, Header, Query, Request, Response, UploadFile
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from celery.result import AsyncResult
@@ -89,6 +89,83 @@ def _assert_task_owner(task_id: str, current_user: Optional[User]) -> None:
         pass  # Redis failure → allow (fail open)
 
 
+# ── Refresh token storage (Redis-backed, 30-day TTL) ──────────────────────
+
+def _store_refresh_token(token: str, user_id: str) -> None:
+    try:
+        _get_rl_redis().set(f"rt:{token}", user_id, ex=REFRESH_TOKEN_EXPIRE_SECONDS)
+    except Exception:
+        pass
+
+
+def _consume_refresh_token(token: str) -> Optional[str]:
+    """Return user_id and atomically revoke the token (single-use rotation)."""
+    try:
+        r = _get_rl_redis()
+        key = f"rt:{token}"
+        user_id = r.get(key)
+        if user_id:
+            r.delete(key)
+        return user_id
+    except Exception:
+        return None
+
+
+def _revoke_refresh_token(token: str) -> None:
+    try:
+        _get_rl_redis().delete(f"rt:{token}")
+    except Exception:
+        pass
+
+
+def _set_auth_cookies(response: Response, access_token: str, refresh_token: str) -> None:
+    is_prod = bool(os.getenv("DOMAIN", "").strip())
+    response.set_cookie(
+        key="access_token", value=access_token,
+        httponly=True, secure=is_prod, samesite="lax",
+        max_age=ACCESS_TOKEN_EXPIRE_MINUTES * 60, path="/",
+    )
+    response.set_cookie(
+        key="refresh_token", value=refresh_token,
+        httponly=True, secure=is_prod, samesite="lax",
+        max_age=REFRESH_TOKEN_EXPIRE_SECONDS, path="/auth/refresh",
+    )
+
+
+def _clear_auth_cookies(response: Response) -> None:
+    response.delete_cookie(key="access_token", path="/")
+    response.delete_cookie(key="refresh_token", path="/auth/refresh")
+
+
+# ── Per-user task backpressure (Redis counter) ─────────────────────────────
+
+_MAX_CONCURRENT_TASKS = int(os.getenv("MAX_CONCURRENT_TASKS_PER_USER", "10"))
+
+
+def _check_user_task_capacity(user_id: str) -> None:
+    """Raise 429 if the user already has too many active tasks queued."""
+    try:
+        count = _get_rl_redis().get(f"user_tasks:{user_id}")
+        if count and int(count) >= _MAX_CONCURRENT_TASKS:
+            raise HTTPException(
+                status_code=429,
+                detail="Too many concurrent tasks — wait for existing jobs to complete",
+            )
+    except HTTPException:
+        raise
+    except Exception:
+        pass  # fail open
+
+
+def _increment_user_task_count(user_id: str) -> None:
+    try:
+        r = _get_rl_redis()
+        r.incr(f"user_tasks:{user_id}")
+        r.expire(f"user_tasks:{user_id}", 7200)  # 2h safety TTL
+    except Exception:
+        pass
+
+
 # ── Auth rate limiting (Redis-backed, works across workers) ────────────────
 _AUTH_WINDOW = 60   # seconds
 _AUTH_MAX = 10      # max attempts per window per IP
@@ -117,6 +194,8 @@ from app.auth import (
     create_access_token, decode_access_token,
     hash_password, verify_password,
     encrypt_api_key, decrypt_api_key,
+    get_or_create_dek, encrypt_with_dek, decrypt_with_dek,
+    generate_refresh_token, REFRESH_TOKEN_EXPIRE_SECONDS, ACCESS_TOKEN_EXPIRE_MINUTES,
 )
 from app.db import get_db, engine
 from app.models import Base, Source, AudioAsset, Article, ImageAsset, VideoAsset, SceneVideoAsset, User, UserApiKeys
@@ -155,27 +234,36 @@ def _user_from_bearer(token: str, db: Session) -> Optional[User]:
 
 def get_optional_user(
     authorization: str = Header(default=""),
+    access_token: str = Cookie(default=""),
     db: Session = Depends(get_db),
 ) -> Optional[User]:
-    """Return the authenticated User or None — never raises."""
+    """Return the authenticated User or None — never raises.
+
+    Checks the Authorization header first, then the httpOnly access_token cookie
+    (set on login/register for same-domain production deployments).
+    """
+    token: str | None = None
     if authorization.startswith("Bearer "):
-        return _user_from_bearer(authorization[7:], db)
+        token = authorization[7:]
+    elif access_token:
+        token = access_token
+    if token:
+        return _user_from_bearer(token, db)
     return None
 
 
 def check_api_key(
     x_api_key: str = Header(default=""),
     authorization: str = Header(default=""),
+    access_token: str = Cookie(default=""),
 ):
-    """Accept either a valid Bearer JWT (signature only) or the server-level X-API-Key.
-
-    Avoids a DB lookup here — the user record is fetched only when needed via
-    get_optional_user(), which runs as a separate dependency on endpoints that
-    require user context.
-    """
+    """Accept a valid Bearer JWT (header or cookie) or the server-level X-API-Key."""
     if authorization.startswith("Bearer "):
         if decode_access_token(authorization[7:]) is not None:
-            return  # valid JWT signature
+            return
+    if access_token:
+        if decode_access_token(access_token) is not None:
+            return
     if API_KEY and x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid or missing auth")
 
@@ -412,7 +500,7 @@ async def _unhandled_exception(request: Request, exc: Exception):
 # ── Auth ───────────────────────────────────────────────────────────────────
 
 @app.post("/auth/register", response_model=TokenResp)
-def register(req: RegisterReq, request: Request, db: Session = Depends(get_db)):
+def register(req: RegisterReq, request: Request, response: Response, db: Session = Depends(get_db)):
     _check_auth_rate(request)
     email = req.email.lower().strip()
     if db.execute(select(User).where(User.email == email)).scalar_one_or_none():
@@ -422,25 +510,88 @@ def register(req: RegisterReq, request: Request, db: Session = Depends(get_db)):
     user = User(email=email, hashed_password=hash_password(req.password))
     db.add(user)
     db.commit()
+    access_token = create_access_token(user.id)
+    refresh_token = generate_refresh_token()
+    _store_refresh_token(refresh_token, user.id)
+    _set_auth_cookies(response, access_token, refresh_token)
     return TokenResp(
-        access_token=create_access_token(user.id),
+        access_token=access_token,
+        refresh_token=refresh_token,
         user_id=user.id,
         email=user.email,
     )
 
 
 @app.post("/auth/login", response_model=TokenResp)
-def login(req: LoginReq, request: Request, db: Session = Depends(get_db)):
+def login(req: LoginReq, request: Request, response: Response, db: Session = Depends(get_db)):
     _check_auth_rate(request)
     email = req.email.lower().strip()
     user = db.execute(select(User).where(User.email == email)).scalar_one_or_none()
     if not user or not verify_password(req.password, user.hashed_password):
         raise HTTPException(status_code=401, detail="Invalid email or password")
+    access_token = create_access_token(user.id)
+    refresh_token = generate_refresh_token()
+    _store_refresh_token(refresh_token, user.id)
+    _set_auth_cookies(response, access_token, refresh_token)
     return TokenResp(
-        access_token=create_access_token(user.id),
+        access_token=access_token,
+        refresh_token=refresh_token,
         user_id=user.id,
         email=user.email,
     )
+
+
+class _RefreshReq(BaseModel):
+    refresh_token: Optional[str] = None
+
+
+@app.post("/auth/refresh", response_model=TokenResp)
+def refresh_access_token(
+    req: _RefreshReq,
+    response: Response,
+    refresh_token_cookie: str = Cookie(default="", alias="refresh_token"),
+    db: Session = Depends(get_db),
+):
+    """Rotate a refresh token and issue a new short-lived access token.
+
+    Reads the refresh token from the httpOnly cookie (production via Vite proxy)
+    or from the request body (dev clients that store it in localStorage).
+    """
+    token = refresh_token_cookie or req.refresh_token or ""
+    if not token:
+        raise HTTPException(status_code=401, detail="No refresh token provided")
+    user_id = _consume_refresh_token(token)
+    if not user_id:
+        _clear_auth_cookies(response)
+        raise HTTPException(status_code=401, detail="Invalid or expired refresh token")
+    user = db.get(User, user_id)
+    if not user:
+        _clear_auth_cookies(response)
+        raise HTTPException(status_code=401, detail="User not found")
+    new_access = create_access_token(user.id)
+    new_refresh = generate_refresh_token()
+    _store_refresh_token(new_refresh, user.id)
+    _set_auth_cookies(response, new_access, new_refresh)
+    return TokenResp(
+        access_token=new_access,
+        refresh_token=new_refresh,
+        user_id=user.id,
+        email=user.email,
+    )
+
+
+@app.post("/auth/logout")
+def logout(
+    req: _RefreshReq,
+    response: Response,
+    refresh_token_cookie: str = Cookie(default="", alias="refresh_token"),
+):
+    """Revoke the refresh token and clear auth cookies."""
+    token = refresh_token_cookie or req.refresh_token or ""
+    if token:
+        _revoke_refresh_token(token)
+    _clear_auth_cookies(response)
+    return {"logged_out": True}
 
 
 @app.get("/users/me", response_model=UserResp, dependencies=[Depends(check_api_key)])
@@ -467,10 +618,11 @@ def upsert_user_keys(
     if not keys:
         keys = UserApiKeys(user_id=current_user.id, updated_at=datetime.utcnow())
         db.add(keys)
+    dek = get_or_create_dek(keys)
     if req.openai_key is not None:
-        keys.openai_key_enc = encrypt_api_key(req.openai_key) if req.openai_key else None
+        keys.openai_key_enc = encrypt_with_dek(req.openai_key, dek) if req.openai_key else None
     if req.elevenlabs_key is not None:
-        keys.elevenlabs_key_enc = encrypt_api_key(req.elevenlabs_key) if req.elevenlabs_key else None
+        keys.elevenlabs_key_enc = encrypt_with_dek(req.elevenlabs_key, dek) if req.elevenlabs_key else None
     if req.elevenlabs_voice_id is not None:
         keys.elevenlabs_voice_id = req.elevenlabs_voice_id or None
     if req.elevenlabs_model_id is not None:
@@ -556,6 +708,7 @@ def list_articles(
         select(Article, audio_sq.c.cnt.label("audio_count"), video_sq.c.cnt.label("video_count"))
         .outerjoin(audio_sq, Article.id == audio_sq.c.article_id)
         .outerjoin(video_sq, Article.id == video_sq.c.article_id)
+        .where(Article.deleted_at.is_(None))
         .order_by(Article.is_pinned.desc(), Article.created_at.desc())
         .limit(limit)
         .offset(offset)
@@ -568,7 +721,7 @@ def list_articles(
         q = q.where(Article.is_pinned == pinned)
 
     # Count total matching rows (ignoring limit/offset)
-    count_q = select(func.count(Article.id))
+    count_q = select(func.count(Article.id)).where(Article.deleted_at.is_(None))
     if source_id:
         count_q = count_q.where(Article.source_id == source_id)
     if current_user:
@@ -599,7 +752,7 @@ def list_articles(
 @app.get("/articles/{article_id}", response_model=ArticleResponse, dependencies=[Depends(check_api_key)])
 def get_article(article_id: str, db=Depends(get_db), current_user: Optional[User] = Depends(get_optional_user)):
     article = db.get(Article, article_id)
-    if not article:
+    if not article or article.deleted_at:
         raise HTTPException(status_code=404, detail="Article not found")
     _assert_article_owner(article, current_user)
     storyboard = _load_storyboard(article)
@@ -700,7 +853,7 @@ def get_article_package(article_id: str, db=Depends(get_db), current_user: Optio
 
     image_rows = db.execute(
         select(ImageAsset)
-        .where(ImageAsset.article_id == article_id)
+        .where(ImageAsset.article_id == article_id, ImageAsset.deleted_at.is_(None))
         .order_by(ImageAsset.scene_number)
     ).scalars().all()
     images = [
@@ -724,7 +877,7 @@ def get_article_package(article_id: str, db=Depends(get_db), current_user: Optio
 
     all_video_rows = db.execute(
         select(VideoAsset)
-        .where(VideoAsset.article_id == article_id)
+        .where(VideoAsset.article_id == article_id, VideoAsset.deleted_at.is_(None))
         .order_by(VideoAsset.created_at.desc())
     ).scalars().all()
     video_ref: VideoAssetRef | None = _video_to_ref(all_video_rows[0]) if all_video_rows else None
@@ -850,7 +1003,7 @@ def list_article_images(article_id: str, db=Depends(get_db), current_user: Optio
     _assert_article_owner(article, current_user)
     rows = db.execute(
         select(ImageAsset)
-        .where(ImageAsset.article_id == article_id)
+        .where(ImageAsset.article_id == article_id, ImageAsset.deleted_at.is_(None))
         .order_by(ImageAsset.scene_number)
     ).scalars().all()
     return [
@@ -1065,8 +1218,12 @@ def trigger_regenerate_script(
 
     uid = current_user.id if current_user else f"ip:{(request.client.host if request.client else 'x')}"
     _rate_limit(f"rl:regen-script:{uid}", limit=10, window=60)
+    if current_user:
+        _check_user_task_capacity(current_user.id)
 
     openai_key, _, _ = _resolve_user_keys(current_user, db)
+    if current_user:
+        _increment_user_task_count(current_user.id)
     task = celery_app.send_task(
         "regenerate_script_for_article",
         kwargs={
@@ -1151,10 +1308,14 @@ def prepare_article_endpoint(
 
     uid = current_user.id if current_user else f"ip:{(request.client.host if request.client else 'x')}"
     _rate_limit(f"rl:prepare:{uid}", limit=10, window=60)
+    if current_user:
+        _check_user_task_capacity(current_user.id)
 
     if not db.get(Source, req.source_id):
         raise HTTPException(status_code=404, detail="Unknown source_id")
     openai_key, _, _ = _resolve_user_keys(current_user, db)
+    if current_user:
+        _increment_user_task_count(current_user.id)
     task = celery_app.send_task(  # type: ignore[assignment]
         "prepare_article",
         kwargs={
@@ -1189,6 +1350,8 @@ def generate(
 
     uid = current_user.id if current_user else f"ip:{(request.client.host if request.client else 'x')}"
     _rate_limit(f"rl:generate:{uid}", limit=5, window=60)
+    if current_user:
+        _check_user_task_capacity(current_user.id)
 
     # SSRF guard on optional pre-selected URL
     if req.article_url:
@@ -1227,6 +1390,8 @@ def generate(
     )
     _audio_tasks[task_key] = task.id
     _store_task_owner(task.id, current_user.id if current_user else None)
+    if current_user:
+        _increment_user_task_count(current_user.id)
     return {"task_id": task.id, "status": "queued"}
 
 
@@ -1273,6 +1438,8 @@ def generate_video(
 
     uid = current_user.id if current_user else f"ip:{(request.client.host if request.client else 'x')}"
     _rate_limit(f"rl:video:{uid}", limit=5, window=60)
+    if current_user:
+        _check_user_task_capacity(current_user.id)
 
     existing = _video_tasks.get(req.article_id)
     if existing:
@@ -1299,6 +1466,8 @@ def generate_video(
     )
     _video_tasks[req.article_id] = task.id
     _store_task_owner(task.id, current_user.id if current_user else None)
+    if current_user:
+        _increment_user_task_count(current_user.id)
     return {"task_id": task.id, "status": "queued", "render_mode": req.render_mode}
 
 
@@ -1360,6 +1529,8 @@ def regenerate_stage(
 
     uid = current_user.id if current_user else f"ip:{(request.client.host if request.client else 'x')}"
     _rate_limit(f"rl:regen:{uid}", limit=5, window=60)
+    if current_user:
+        _check_user_task_capacity(current_user.id)
 
     if req.stage == "images":
         db.execute(delete(ImageAsset).where(ImageAsset.article_id == article_id))
@@ -1382,6 +1553,8 @@ def regenerate_stage(
     )
     _video_tasks[article_id] = task.id
     _store_task_owner(task.id, current_user.id if current_user else None)
+    if current_user:
+        _increment_user_task_count(current_user.id)
     return {"task_id": task.id, "status": "queued", "stage": req.stage}
 
 
@@ -1424,6 +1597,42 @@ def get_scene_video_clip(scene_video_id: str, db=Depends(get_db), current_user: 
     )
 
 
+# ── Article soft-delete ────────────────────────────────────────────────────
+
+@app.delete("/articles/{article_id}", dependencies=[Depends(check_api_key)])
+def delete_article(
+    article_id: str,
+    db: Session = Depends(get_db),
+    current_user: Optional[User] = Depends(get_optional_user),
+):
+    """Soft-delete an article. Assets remain on disk; the row is hidden from all list/get queries."""
+    article = db.get(Article, article_id)
+    if not article or article.deleted_at:
+        raise HTTPException(status_code=404, detail="Article not found")
+    _assert_article_owner(article, current_user)
+    article.deleted_at = datetime.utcnow()
+    db.commit()
+    return {"deleted": article_id}
+
+
+# ── Admin / ops ────────────────────────────────────────────────────────────
+
+@app.get("/admin/beat-info", dependencies=[Depends(check_api_key)])
+def beat_info():
+    """Return the current scheduled generation configuration."""
+    enabled = os.getenv("ENABLE_SCHEDULED_GENERATION", "false").lower() == "true"
+    interval_h = int(os.getenv("BEAT_GENERATION_INTERVAL_HOURS", "0"))
+    return {
+        "enabled": enabled,
+        "schedule": (
+            f"every {interval_h}h" if interval_h > 0
+            else f"daily at {os.getenv('BEAT_GENERATION_HOUR', '6')}:00 UTC"
+        ),
+        "skip_recent_hours": int(os.getenv("BEAT_SKIP_RECENT_HOURS", "4")),
+        "max_concurrent_tasks_per_user": _MAX_CONCURRENT_TASKS,
+    }
+
+
 # ── Helpers ────────────────────────────────────────────────────────────────
 
 def _resolve_user_keys(
@@ -1432,14 +1641,23 @@ def _resolve_user_keys(
 ) -> tuple[Optional[str], Optional[str], Optional[str]]:
     """Return (openai_key, elevenlabs_key, elevenlabs_voice_id) for the user.
 
-    Returns (None, None, None) when no user is authenticated or user has no stored keys,
-    in which case tasks fall back to server-level env var keys.
+    Uses per-user DEK (envelope encryption) when available; falls back to
+    master-key decryption for rows created before the DEK migration.
     """
     if not user:
         return None, None, None
     keys = db.get(UserApiKeys, user.id)
     if not keys:
         return None, None, None
+    if keys.dek_enc:
+        try:
+            dek = get_or_create_dek(keys)
+            openai_key = decrypt_with_dek(keys.openai_key_enc, dek) if keys.openai_key_enc else None
+            el_key = decrypt_with_dek(keys.elevenlabs_key_enc, dek) if keys.elevenlabs_key_enc else None
+            return openai_key, el_key, keys.elevenlabs_voice_id
+        except Exception:
+            pass
+    # Legacy: master-key encryption (rows created before DEK migration)
     openai_key = decrypt_api_key(keys.openai_key_enc) if keys.openai_key_enc else None
     el_key = decrypt_api_key(keys.elevenlabs_key_enc) if keys.elevenlabs_key_enc else None
     return openai_key, el_key, keys.elevenlabs_voice_id
@@ -1457,7 +1675,7 @@ def _load_storyboard(article: Article) -> Storyboard | None:
 def _latest_audio(article_id: str, db) -> AudioAsset | None:
     return db.execute(
         select(AudioAsset)
-        .where(AudioAsset.article_id == article_id)
+        .where(AudioAsset.article_id == article_id, AudioAsset.deleted_at.is_(None))
         .order_by(AudioAsset.created_at.desc())
         .limit(1)
     ).scalar_one_or_none()

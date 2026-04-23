@@ -46,8 +46,10 @@ def generate_scene_image(
     scene_number: int | None = None,
 ) -> bytes:
     """Call DALL-E and return raw PNG bytes."""
+    from app.circuit_breakers import openai_breaker  # lazy import — no circular deps
     c = OpenAI(api_key=api_key) if api_key else _client
-    resp = c.images.generate(
+    resp = openai_breaker.call(
+        c.images.generate,
         model=IMAGE_MODEL,
         prompt=_safe_prompt(visual_prompt),
         size=IMAGE_SIZE,
@@ -93,8 +95,10 @@ def generate_thumbnail(
         "No text, no watermarks, no logos. Clean composition."
     )[:900]
 
+    from app.circuit_breakers import openai_breaker  # lazy import — no circular deps
     c = OpenAI(api_key=api_key) if api_key else _client
-    resp = c.images.generate(
+    resp = openai_breaker.call(
+        c.images.generate,
         model=IMAGE_MODEL,
         prompt=prompt,
         size=IMAGE_SIZE,

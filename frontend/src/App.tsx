@@ -5,12 +5,12 @@ import type {
   Source, StoryboardScene, UserResp, UserKeysOut,
 } from './types'
 import {
-  cancelJob, editScript, fetchRssCandidates, getArticlePackage, getExportZipUrl,
-  getPlatforms, jobStatus, listArticles, listSources, pinArticle, prepareArticle,
-  regenerateStage, reorderStoryboard, resolveAudioUrl, resolveCaptionUrl, resolveImageUrl,
-  resolveThumbnailUrl, resolveVideoUrl, setApiKey, startGenerate, startGenerateVideo,
-  startRegenerateScript, uploadSceneImage, register, login, getMe, getUserKeys, saveUserKeys,
-  setAuthToken, clearAuthToken,
+  cancelJob, deleteArticle, editScript, fetchRssCandidates, getArticlePackage, getExportZipUrl,
+  getPlatforms, jobStatus, listArticles, listSources, logout, pinArticle, prepareArticle,
+  refreshAccessToken, regenerateStage, reorderStoryboard, resolveAudioUrl, resolveCaptionUrl,
+  resolveImageUrl, resolveThumbnailUrl, resolveVideoUrl, setApiKey, startGenerate,
+  startGenerateVideo, startRegenerateScript, uploadSceneImage, register, login, getMe,
+  getUserKeys, saveUserKeys, setAuthToken, clearAuthToken, setRefreshToken,
 } from './api'
 
 // ── Helpers ────────────────────────────────────────────────────────────────
@@ -74,7 +74,7 @@ function ToastContainer({ toasts, onDismiss }: { toasts: Toast[]; onDismiss: (id
 
 // ── Auth Modal ─────────────────────────────────────────────────────────────
 
-function AuthModal({ onSuccess }: { onSuccess: (token: string, user: UserResp) => void }) {
+function AuthModal({ onSuccess }: { onSuccess: (token: string, user: UserResp, refreshToken?: string) => void }) {
   const [tab, setTab] = useState<'login' | 'register'>('login')
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
@@ -91,8 +91,9 @@ function AuthModal({ onSuccess }: { onSuccess: (token: string, user: UserResp) =
         : await register(email.trim(), password)
       setAuthToken(resp.access_token)
       localStorage.setItem('jwt_token', resp.access_token)
+      if (resp.refresh_token) localStorage.setItem('refresh_token', resp.refresh_token)
       const user: UserResp = { id: resp.user_id, email: resp.email, created_at: '', has_keys: false }
-      onSuccess(resp.access_token, user)
+      onSuccess(resp.access_token, user, resp.refresh_token)
     } catch (e: unknown) {
       setError(String((e as Error)?.message ?? e))
     } finally {
@@ -720,7 +721,7 @@ export default function App() {
     setToasts(prev => prev.filter(t => t.id !== id))
   }, [])
 
-  // ── Bootstrap: validate stored JWT, then load user + keys ──────────────
+  // ── Bootstrap: validate stored JWT, try refresh on failure ───────────────
   useEffect(() => {
     const stored = localStorage.getItem('jwt_token')
     const legacyKey = localStorage.getItem('api_key') ?? ''
@@ -742,13 +743,27 @@ export default function App() {
         setUserKeys(keys)
         setAuthLoading(false)
       })
-      .catch(() => {
-        // Token expired or invalid
-        localStorage.removeItem('jwt_token')
-        clearAuthToken()
-        setAuthTokenState(null)
-        setAuthLoading(false)
-        setShowAuthModal(true)
+      .catch(async () => {
+        // Access token expired — attempt silent refresh before showing login
+        try {
+          const tokens = await refreshAccessToken()
+          setAuthToken(tokens.access_token)
+          localStorage.setItem('jwt_token', tokens.access_token)
+          if (tokens.refresh_token) setRefreshToken(tokens.refresh_token)
+          setAuthTokenState(tokens.access_token)
+          const user = await getMe()
+          setCurrentUser(user)
+          const keys = await getUserKeys()
+          setUserKeys(keys)
+          setAuthLoading(false)
+        } catch {
+          localStorage.removeItem('jwt_token')
+          localStorage.removeItem('refresh_token')
+          clearAuthToken()
+          setAuthTokenState(null)
+          setAuthLoading(false)
+          setShowAuthModal(true)
+        }
       })
   }, [])
 
@@ -804,10 +819,11 @@ export default function App() {
 
   // ── Auth handlers ───────────────────────────────────────────────────────
 
-  function handleAuthSuccess(token: string, user: UserResp) {
+  function handleAuthSuccess(token: string, user: UserResp, refreshToken?: string) {
     setAuthTokenState(token)
     setCurrentUser(user)
     setShowAuthModal(false)
+    if (refreshToken) setRefreshToken(refreshToken)
     // Fetch keys for this user
     getUserKeys()
       .then(keys => {
@@ -819,8 +835,10 @@ export default function App() {
       .catch(() => setShowKeysModal(true))
   }
 
-  function handleLogout() {
+  async function handleLogout() {
+    await logout().catch(() => {})
     localStorage.removeItem('jwt_token')
+    localStorage.removeItem('refresh_token')
     clearAuthToken()
     setAuthTokenState(null)
     setCurrentUser(null)

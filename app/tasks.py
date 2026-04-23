@@ -29,23 +29,89 @@ celery_app.conf.result_expires = 86400  # purge task results after 24 h
 # Scheduled generation — disabled unless ENABLE_SCHEDULED_GENERATION=true
 if os.getenv("ENABLE_SCHEDULED_GENERATION", "false").lower() == "true":
     from celery.schedules import crontab
+    from datetime import timedelta as _td
+    _beat_interval_hours = int(os.getenv("BEAT_GENERATION_INTERVAL_HOURS", "0"))
+    _beat_hour = int(os.getenv("BEAT_GENERATION_HOUR", "6"))
     celery_app.conf.beat_schedule = {
-        "daily-content-generation": {
+        "scheduled-content-generation": {
             "task": "generate_all_sources_daily",
-            "schedule": crontab(
-                hour=int(os.getenv("BEAT_GENERATION_HOUR", "6")),
-                minute=0,
+            "schedule": (
+                _td(hours=_beat_interval_hours)
+                if _beat_interval_hours > 0
+                else crontab(hour=_beat_hour, minute=0)
             ),
         }
     }
 
 TARGET_SECONDS = int(os.getenv("TTS_TARGET_SECONDS", "180"))
+BEAT_SKIP_RECENT_HOURS = int(os.getenv("BEAT_SKIP_RECENT_HOURS", "4"))
 TOLERANCE_SECONDS = int(os.getenv("TTS_TOLERANCE_SECONDS", "30"))
 WAY_OFF_SECONDS = int(os.getenv("TTS_WAY_OFF_SECONDS", "15"))
 CAL_ALPHA = float(os.getenv("TTS_CAL_ALPHA", "0.3"))
 MAX_TTS_ATTEMPTS = int(os.getenv("TTS_MAX_ATTEMPTS", "2"))
 MIN_SECONDS = int(os.getenv("TTS_DURATION_MIN_SECONDS", "150"))
 MAX_SECONDS = int(os.getenv("TTS_DURATION_MAX_SECONDS", "210"))
+
+
+import hashlib
+from contextlib import contextmanager
+from redis import Redis as _RedisClient
+
+
+@contextmanager
+def _article_lock(source_id: str, url: str, ttl: int = 120):
+    """Redis NX lock preventing two workers from running expensive work on
+    the same (source_id, url) concurrently.  Fails open if Redis is down.
+    """
+    url_hash = hashlib.sha256(url.encode()).hexdigest()[:20]
+    key = f"lock:article:{source_id}:{url_hash}"
+    acquired = False
+    r = None
+    try:
+        r = _RedisClient.from_url(
+            os.environ["CELERY_BROKER_URL"],
+            decode_responses=True,
+            socket_connect_timeout=1,
+            socket_timeout=1,
+        )
+        acquired = bool(r.set(key, "1", nx=True, ex=ttl))
+    except Exception:
+        acquired = True  # fail open — allow the task to proceed
+    try:
+        yield acquired
+    finally:
+        if acquired and r:
+            try:
+                r.delete(key)
+            except Exception:
+                pass
+
+
+# Task lifecycle signals — decrement the per-user active task counter when
+# a task completes (success, failure, or revocation).
+
+from celery.signals import task_postrun  # noqa: E402
+
+
+@task_postrun.connect
+def _on_task_postrun(sender=None, task_id=None, kwargs=None, **_extra):
+    """Decrement the per-user active task counter on task completion."""
+    user_id = (kwargs or {}).get("user_id")
+    if not user_id:
+        return
+    try:
+        r = _RedisClient.from_url(
+            os.environ["CELERY_BROKER_URL"],
+            decode_responses=True,
+            socket_connect_timeout=1,
+            socket_timeout=1,
+        )
+        key = f"user_tasks:{user_id}"
+        count = r.decr(key)
+        if int(count) < 0:
+            r.set(key, "0")
+    except Exception:
+        pass
 
 
 def _parse_dt(entry) -> datetime | None:
@@ -97,15 +163,32 @@ def _score_entry(entry, now: datetime) -> float:
 
 @celery_app.task(name="generate_all_sources_daily")
 def generate_all_sources_daily() -> dict:
-    """Dispatch audio generation for every source. Triggered by Celery Beat."""
+    """Dispatch audio generation for every source. Triggered by Celery Beat.
+
+    Skips sources that already have an article created within the last
+    BEAT_SKIP_RECENT_HOURS hours to avoid redundant generation runs.
+    """
     target_seconds = int(os.getenv("TTS_TARGET_SECONDS", "180"))
     n_scenes = int(os.getenv("STORYBOARD_SCENES", "8"))
+    cutoff = datetime.utcnow() - timedelta(hours=BEAT_SKIP_RECENT_HOURS)
 
     with SessionLocal() as db:
         sources = db.execute(select(Source)).scalars().all()
+        recently_processed: set[str] = set(
+            db.execute(
+                select(Article.source_id)
+                .where(Article.created_at >= cutoff)
+                .distinct()
+            ).scalars().all()
+        )
 
     dispatched = 0
+    skipped = 0
     for src in sources:
+        if src.id in recently_processed:
+            logger.info("Beat: skipping source %s — processed within last %dh", src.id, BEAT_SKIP_RECENT_HOURS)
+            skipped += 1
+            continue
         try:
             celery_app.send_task(
                 "generate_latest_for_source",
@@ -113,10 +196,10 @@ def generate_all_sources_daily() -> dict:
             )
             dispatched += 1
         except Exception as exc:
-            logger.error("Failed to queue source %s: %s", src.id, exc)
+            logger.error("Beat: failed to queue source %s: %s", src.id, exc)
 
-    logger.info("Beat: dispatched %d generation tasks", dispatched)
-    return {"dispatched": dispatched, "total_sources": len(sources)}
+    logger.info("Beat: dispatched=%d skipped=%d total=%d", dispatched, skipped, len(sources))
+    return {"dispatched": dispatched, "skipped": skipped, "total_sources": len(sources)}
 
 
 @celery_app.task(name="prepare_article", bind=True)
@@ -186,89 +269,99 @@ def prepare_article(
                 article.animation_prompt = animation_prompt
             db.commit()
 
-        collector = UsageCollector(article_id=article.id, user_id=user_id)
+        with _article_lock(source_id, url) as lock_acquired:
+            if not lock_acquired:
+                logger.info("Article lock not acquired for url=%s — skipping duplicate work", url)
+                return {
+                    "article_id": article.id,
+                    "word_count": len((article.tts_script or "").split()),
+                    "estimated_duration_seconds": 0,
+                    "skipped": True,
+                }
 
-        self.update_state(state="PROGRESS", meta={"stage": "extracting", "msg": "Extracting article content…"})
-        raw = extract_article_text(url, fallback_text=fallback)
-        if not raw:
-            raw = fallback or title
+            collector = UsageCollector(article_id=article.id, user_id=user_id)
 
-        wpm_estimate = float(_pick_wpm(eff_language))
-        target_words = _words_for_seconds(target_seconds, wpm_estimate)
-        tol_words = _words_for_seconds(TOLERANCE_SECONDS, wpm_estimate)
+            self.update_state(state="PROGRESS", meta={"stage": "extracting", "msg": "Extracting article content…"})
+            raw = extract_article_text(url, fallback_text=fallback)
+            if not raw:
+                raw = fallback or title
 
-        self.update_state(state="PROGRESS", meta={"stage": "scripting", "msg": "Generating script & storyboard…"})
-        bundle = make_tts_bundle(
-            title=title,
-            body=raw,
-            language_hint=src.language_hint,
-            target_seconds=target_seconds,
-            n_scenes=n_scenes,
-            target_words=target_words,
-            tol_words=tol_words,
-            wpm_estimate=wpm_estimate,
-            api_key=openai_api_key,
-            collector=collector,
-            output_language=eff_language,
-        )
+            wpm_estimate = float(_pick_wpm(eff_language))
+            target_words = _words_for_seconds(target_seconds, wpm_estimate)
+            tol_words = _words_for_seconds(TOLERANCE_SECONDS, wpm_estimate)
 
-        script = bundle["script"]
-        scenes = bundle.get("scenes") or []
-        word_count = bundle.get("word_count") or len(script.split())
-
-        article.raw_text = raw
-        article.tts_script = script
-        article.script_language = eff_language
-        article.summary_model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-        article.storyboard_json = {
-            "scenes": scenes,
-            "total_duration_estimate": bundle.get("total_duration_estimate", 0),
-        }
-        db.commit()
-
-        try:
-            from app.analysis import analyze_article as _analyze
-            self.update_state(state="PROGRESS", meta={"stage": "analyzing", "msg": "Analyzing content…"})
-            article.analysis_json = _analyze(script, api_key=openai_api_key, collector=collector)
-            db.commit()
-        except Exception as exc:
-            logger.warning("Analysis failed (non-fatal): %s", exc)
-
-        try:
-            platforms = article.selected_platforms or ["tiktok"]
-            self.update_state(state="PROGRESS", meta={"stage": "captions", "msg": "Generating social captions…"})
-            article.social_captions_json = generate_social_captions(
-                title=title, script=script, platforms=platforms,
-                output_language=eff_language, api_key=openai_api_key, collector=collector,
+            self.update_state(state="PROGRESS", meta={"stage": "scripting", "msg": "Generating script & storyboard…"})
+            bundle = make_tts_bundle(
+                title=title,
+                body=raw,
+                language_hint=src.language_hint,
+                target_seconds=target_seconds,
+                n_scenes=n_scenes,
+                target_words=target_words,
+                tol_words=tol_words,
+                wpm_estimate=wpm_estimate,
+                api_key=openai_api_key,
+                collector=collector,
+                output_language=eff_language,
             )
+
+            script = bundle["script"]
+            scenes = bundle.get("scenes") or []
+            word_count = bundle.get("word_count") or len(script.split())
+
+            article.raw_text = raw
+            article.tts_script = script
+            article.script_language = eff_language
+            article.summary_model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+            article.storyboard_json = {
+                "scenes": scenes,
+                "total_duration_estimate": bundle.get("total_duration_estimate", 0),
+            }
             db.commit()
-        except Exception as exc:
-            logger.warning("Social caption generation failed (non-fatal): %s", exc)
 
-        try:
-            from app.image_gen import generate_thumbnail as _gen_thumb
-            self.update_state(state="PROGRESS", meta={"stage": "thumbnail", "msg": "Generating thumbnail…"})
-            image_dir = os.getenv("IMAGE_DIR", "/data/images")
-            os.makedirs(image_dir, exist_ok=True)
-            first_scene_prompt = scenes[0].get("visual_prompt") if scenes else None
-            thumb_bytes = _gen_thumb(title, scene_prompt=first_scene_prompt, api_key=openai_api_key, collector=collector)
-            thumb_path = os.path.join(image_dir, f"{article.id}_thumbnail.png")
-            with open(thumb_path, "wb") as fh:
-                fh.write(thumb_bytes)
-            article.thumbnail_path = thumb_path
-            db.commit()
-        except Exception as exc:
-            logger.warning("Thumbnail generation failed (non-fatal): %s", exc)
+            try:
+                from app.analysis import analyze_article as _analyze
+                self.update_state(state="PROGRESS", meta={"stage": "analyzing", "msg": "Analyzing content…"})
+                article.analysis_json = _analyze(script, api_key=openai_api_key, collector=collector)
+                db.commit()
+            except Exception as exc:
+                logger.warning("Analysis failed (non-fatal): %s", exc)
 
-        collector.flush(db)
+            try:
+                platforms = article.selected_platforms or ["tiktok"]
+                self.update_state(state="PROGRESS", meta={"stage": "captions", "msg": "Generating social captions…"})
+                article.social_captions_json = generate_social_captions(
+                    title=title, script=script, platforms=platforms,
+                    output_language=eff_language, api_key=openai_api_key, collector=collector,
+                )
+                db.commit()
+            except Exception as exc:
+                logger.warning("Social caption generation failed (non-fatal): %s", exc)
 
-        estimated_duration = int(round(word_count / (wpm_estimate / 60.0)))
-        logger.info("Prepared article id=%s words=%d est=%ds", article.id, word_count, estimated_duration)
-        return {
-            "article_id": article.id,
-            "word_count": word_count,
-            "estimated_duration_seconds": estimated_duration,
-        }
+            try:
+                from app.image_gen import generate_thumbnail as _gen_thumb
+                self.update_state(state="PROGRESS", meta={"stage": "thumbnail", "msg": "Generating thumbnail…"})
+                image_dir = os.getenv("IMAGE_DIR", "/data/images")
+                os.makedirs(image_dir, exist_ok=True)
+                first_scene_prompt = scenes[0].get("visual_prompt") if scenes else None
+                thumb_bytes = _gen_thumb(title, scene_prompt=first_scene_prompt, api_key=openai_api_key, collector=collector)
+                thumb_path = os.path.join(image_dir, f"{article.id}_thumbnail.png")
+                with open(thumb_path, "wb") as fh:
+                    fh.write(thumb_bytes)
+                article.thumbnail_path = thumb_path
+                db.commit()
+            except Exception as exc:
+                logger.warning("Thumbnail generation failed (non-fatal): %s", exc)
+
+            collector.flush(db)
+
+            estimated_duration = int(round(word_count / (wpm_estimate / 60.0)))
+            logger.info("Prepared article id=%s words=%d est=%ds", article.id, word_count, estimated_duration)
+            return {
+                "article_id": article.id,
+                "word_count": word_count,
+                "estimated_duration_seconds": estimated_duration,
+            }
 
 
 @celery_app.task(name="generate_latest_for_source", bind=True)

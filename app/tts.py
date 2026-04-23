@@ -64,14 +64,16 @@ def synthesize(
     last_err: Exception | None = None
     for attempt in range(retries):
         try:
+            from app.circuit_breakers import elevenlabs_breaker  # lazy import — no circular deps
             # convert returns an iterator of bytes in the SDK examples.
-            audio_stream = active_client.text_to_speech.convert(
+            audio_stream = elevenlabs_breaker.call(
+                active_client.text_to_speech.convert,
                 voice_id=vid,
                 model_id=model_id,
                 output_format=output_format,
                 text=text,
                 voice_settings=vs,
-                language_code=language_code,  # optional, but helpful for Spanish normalization
+                language_code=language_code,
             )
 
             chunks = []

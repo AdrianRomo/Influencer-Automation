@@ -45,6 +45,8 @@ def _detect_current_rev(inspector) -> str | None:
                         and "platform" in video_cols),
         ("008", lambda: "social_captions_json" in articles_cols),
         ("009", lambda: "thumbnail_path" in articles_cols),
+        ("010", lambda: "dek_enc" in {c["name"] for c in inspector.get_columns("user_api_keys")}),
+        ("011", lambda: "deleted_at" in articles_cols),
     ]
 
     stamp = None

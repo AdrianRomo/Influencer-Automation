@@ -2,6 +2,7 @@
 
 export type TokenResp = {
   access_token: string
+  refresh_token?: string
   token_type: string
   user_id: string
   email: string

@@ -30,6 +30,7 @@ class UserApiKeys(Base):
     elevenlabs_key_enc: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     elevenlabs_voice_id: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     elevenlabs_model_id: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    dek_enc: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
 
     user: Mapped["User"] = relationship(back_populates="api_keys")
@@ -82,6 +83,7 @@ class Article(Base):
     # User content management
     is_pinned: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
 
+    deleted_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
 
     source: Mapped["Source"] = relationship(back_populates="articles")
@@ -120,6 +122,7 @@ class AudioAsset(Base):
     status: Mapped[str] = mapped_column(String, default="created", nullable=False)  # created|ready|failed
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
 
+    deleted_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
 
     article: Mapped["Article"] = relationship(back_populates="audio_assets")
@@ -150,6 +153,7 @@ class ImageAsset(Base):
     model: Mapped[str] = mapped_column(String, default="dall-e-3", nullable=False)
     status: Mapped[str] = mapped_column(String, default="created", nullable=False)  # created|ready|failed
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    deleted_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
 
     __table_args__ = (
@@ -178,6 +182,7 @@ class VideoAsset(Base):
 
     status: Mapped[str] = mapped_column(String, default="created", nullable=False)  # created|ready|failed
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    deleted_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
 
     __table_args__ = (
@@ -254,6 +259,7 @@ class SceneVideoAsset(Base):
     duration_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
 
+    deleted_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
 

@@ -10,10 +10,54 @@ const API_BASE = (rawBase && rawBase.trim().length > 0) ? rawBase.replace(/\/$/,
 // Module-level auth state — set by the app on init and whenever auth changes
 let _apiKey = ''
 let _jwtToken = ''
+let _refreshToken = ''
 
 export function setApiKey(k: string) { _apiKey = k }
 export function setAuthToken(token: string) { _jwtToken = token }
 export function clearAuthToken() { _jwtToken = '' }
+export function setRefreshToken(t: string) {
+  _refreshToken = t
+  if (t) localStorage.setItem('refresh_token', t)
+  else localStorage.removeItem('refresh_token')
+}
+export function getStoredRefreshToken(): string {
+  if (!_refreshToken) _refreshToken = localStorage.getItem('refresh_token') ?? ''
+  return _refreshToken
+}
+
+// In-flight refresh deduplication: only one refresh request at a time
+let _refreshInFlight: Promise<TokenResp> | null = null
+
+async function _tryRefresh(): Promise<TokenResp | null> {
+  const bodyToken = getStoredRefreshToken() || undefined
+  if (!bodyToken) return null
+
+  if (!_refreshInFlight) {
+    _refreshInFlight = fetch(`${API_BASE}/auth/refresh`, {
+      method: 'POST',
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ refresh_token: bodyToken }),
+    })
+      .then(async r => {
+        if (!r.ok) throw new Error(`Refresh ${r.status}`)
+        return r.json() as Promise<TokenResp>
+      })
+      .finally(() => { _refreshInFlight = null })
+  }
+  try {
+    const tokens = await _refreshInFlight
+    _jwtToken = tokens.access_token
+    localStorage.setItem('jwt_token', tokens.access_token)
+    if (tokens.refresh_token) {
+      _refreshToken = tokens.refresh_token
+      localStorage.setItem('refresh_token', tokens.refresh_token)
+    }
+    return tokens
+  } catch {
+    return null
+  }
+}
 
 async function http<T>(path: string, init?: RequestInit): Promise<T> {
   const headers: Record<string, string> = { 'Content-Type': 'application/json' }
@@ -24,8 +68,29 @@ async function http<T>(path: string, init?: RequestInit): Promise<T> {
   }
   const res = await fetch(`${API_BASE}${path}`, {
     ...init,
+    credentials: 'include',
     headers: { ...headers, ...(init?.headers ?? {}) },
   })
+  // On 401 from non-auth endpoints, attempt transparent token refresh + retry
+  if (res.status === 401 && !path.startsWith('/auth/')) {
+    const tokens = await _tryRefresh()
+    if (tokens) {
+      const retryHeaders: Record<string, string> = {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${_jwtToken}`,
+      }
+      const retry = await fetch(`${API_BASE}${path}`, {
+        ...init,
+        credentials: 'include',
+        headers: { ...retryHeaders, ...(init?.headers ?? {}) },
+      })
+      if (!retry.ok) {
+        const text = await retry.text().catch(() => '')
+        throw new Error(`HTTP ${retry.status} ${retry.statusText}${text ? `: ${text}` : ''}`)
+      }
+      return retry.json() as Promise<T>
+    }
+  }
   if (!res.ok) {
     const text = await res.text().catch(() => '')
     throw new Error(`HTTP ${res.status} ${res.statusText}${text ? `: ${text}` : ''}`)
@@ -35,18 +100,52 @@ async function http<T>(path: string, init?: RequestInit): Promise<T> {
 
 // ── Auth ───────────────────────────────────────────────────────────────────
 
+function _storeTokens(resp: TokenResp): TokenResp {
+  if (resp.refresh_token) {
+    _refreshToken = resp.refresh_token
+    localStorage.setItem('refresh_token', resp.refresh_token)
+  }
+  return resp
+}
+
 export function register(email: string, password: string): Promise<TokenResp> {
   return http<TokenResp>('/auth/register', {
     method: 'POST',
     body: JSON.stringify({ email, password }),
-  })
+  }).then(_storeTokens)
 }
 
 export function login(email: string, password: string): Promise<TokenResp> {
   return http<TokenResp>('/auth/login', {
     method: 'POST',
     body: JSON.stringify({ email, password }),
-  })
+  }).then(_storeTokens)
+}
+
+export function refreshAccessToken(): Promise<TokenResp> {
+  return fetch(`${API_BASE}/auth/refresh`, {
+    method: 'POST',
+    credentials: 'include',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ refresh_token: getStoredRefreshToken() || undefined }),
+  }).then(async r => {
+    if (!r.ok) throw new Error(`Token refresh failed: ${r.status}`)
+    return r.json() as Promise<TokenResp>
+  }).then(_storeTokens)
+}
+
+export async function logout(): Promise<void> {
+  const rt = getStoredRefreshToken()
+  await fetch(`${API_BASE}/auth/logout`, {
+    method: 'POST',
+    credentials: 'include',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ refresh_token: rt || undefined }),
+  }).catch(() => {})
+  _jwtToken = ''
+  _refreshToken = ''
+  localStorage.removeItem('jwt_token')
+  localStorage.removeItem('refresh_token')
 }
 
 export function getMe(): Promise<UserResp> {
@@ -195,7 +294,7 @@ export async function uploadSceneImage(
 
   const res = await fetch(
     `${API_BASE}/articles/${encodeURIComponent(articleId)}/scenes/${sceneNumber}/image`,
-    { method: 'POST', headers, body: form },
+    { method: 'POST', credentials: 'include', headers, body: form },
   )
   if (!res.ok) {
     const text = await res.text().catch(() => '')
@@ -230,6 +329,10 @@ export function getExportZipUrl(articleId: string): string {
 
 export function getArticleCosts(articleId: string): Promise<CostSummary> {
   return http<CostSummary>(`/articles/${encodeURIComponent(articleId)}/costs`)
+}
+
+export function deleteArticle(articleId: string): Promise<{ deleted: string }> {
+  return http(`/articles/${encodeURIComponent(articleId)}`, { method: 'DELETE' })
 }
 
 export function resolveDownloadUrl(status: JobStatus): string | undefined {

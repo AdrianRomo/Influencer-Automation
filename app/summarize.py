@@ -129,8 +129,10 @@ def _call_llm(
     collector: "UsageCollector | None" = None,
     operation: str = "llm",
 ) -> str:
+    from app.circuit_breakers import openai_breaker  # lazy import — no circular deps
     c = OpenAI(api_key=api_key) if api_key else client
-    resp = c.responses.create(
+    resp = openai_breaker.call(
+        c.responses.create,
         model=model,
         input=[
             {"role": "system", "content": system},
