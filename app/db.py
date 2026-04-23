@@ -2,6 +2,7 @@ import os
 from contextlib import contextmanager
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
 
 from app.constants import DbConfig
 
@@ -9,14 +10,24 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL is not set. Example: postgresql+psycopg2://user:pass@host:5432/db")
 
-engine = create_engine(
-    DATABASE_URL,
-    pool_pre_ping=True,
-    pool_size=DbConfig.POOL_SIZE,
-    max_overflow=DbConfig.MAX_OVERFLOW,
-    pool_timeout=DbConfig.POOL_TIMEOUT,
-    pool_recycle=DbConfig.POOL_RECYCLE,
-)
+# SQLite (used in tests + local prototyping) doesn't support connection-pool
+# kwargs meant for server-based databases. Use a single shared connection
+# with StaticPool so in-memory databases survive across Sessions within a test.
+if DATABASE_URL.startswith("sqlite"):
+    engine = create_engine(
+        DATABASE_URL,
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+else:
+    engine = create_engine(
+        DATABASE_URL,
+        pool_pre_ping=True,
+        pool_size=DbConfig.POOL_SIZE,
+        max_overflow=DbConfig.MAX_OVERFLOW,
+        pool_timeout=DbConfig.POOL_TIMEOUT,
+        pool_recycle=DbConfig.POOL_RECYCLE,
+    )
 
 SessionLocal = sessionmaker(
     bind=engine,

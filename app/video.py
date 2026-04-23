@@ -31,6 +31,9 @@ def assemble_video(
     Each image is shown for its scene's duration. The audio track drives the
     final length (-shortest). Returns the actual video duration in seconds.
     """
+    import time as _t
+    from app.metrics import video_assembly_duration_seconds
+    _start = _t.time()
     if not scenes:
         raise ValueError("No scenes provided for video assembly")
 
@@ -63,6 +66,10 @@ def assemble_video(
         try:
             os.unlink(concat_file)
         except OSError:
+            pass
+        try:
+            video_assembly_duration_seconds.labels(render_mode="static").observe(_t.time() - _start)
+        except Exception:
             pass
 
     return probe_duration(output_path)
@@ -154,6 +161,9 @@ def assemble_video_from_clips(
     (silent H.264). The audio track drives the final length via -shortest.
     Returns actual video duration in seconds.
     """
+    import time as _t
+    from app.metrics import video_assembly_duration_seconds
+    _start = _t.time()
     if not scene_clips:
         raise ValueError("No clips provided for animated video assembly")
 
@@ -187,6 +197,10 @@ def assemble_video_from_clips(
         try:
             os.unlink(concat_file)
         except OSError:
+            pass
+        try:
+            video_assembly_duration_seconds.labels(render_mode="animated").observe(_t.time() - _start)
+        except Exception:
             pass
 
     return probe_duration(output_path)

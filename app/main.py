@@ -21,7 +21,16 @@ from sqlalchemy.orm import Session
 from typing import Literal, Optional
 
 from app.redis_client import get_redis as _get_rl_redis
+from app.logging_config import (
+    configure_logging,
+    set_correlation_id,
+    set_log_context,
+    get_correlation_id,
+)
+from app.sentry_init import init_sentry
 
+init_sentry()
+configure_logging()
 logger = logging.getLogger(__name__)
 
 
@@ -302,6 +311,51 @@ async def _security_headers(request: Request, call_next):
     return response
 
 
+@app.middleware("http")
+async def _correlation_id_middleware(request: Request, call_next):
+    """Assign or propagate a correlation ID for every request.
+
+    Clients can supply X-Correlation-ID to tie upstream traces to this request;
+    otherwise a random one is generated. The ID is echoed back in the response
+    so a browser user can report it for support escalation.
+    """
+    incoming = request.headers.get("x-correlation-id", "").strip()
+    cid = set_correlation_id(incoming or None)
+    try:
+        response = await call_next(request)
+    finally:
+        # Reset per-request user/article context so it doesn't bleed into the
+        # next request handled by this worker.
+        set_log_context(user_id="", article_id="", task_id="")
+    response.headers["X-Correlation-ID"] = cid
+    return response
+
+
+@app.middleware("http")
+async def _metrics_middleware(request: Request, call_next):
+    """Record request latency and status-class counts.
+
+    Excludes /metrics itself to avoid scrape-loop noise, and uses the
+    route-template path so cardinality stays bounded (no per-article URL
+    explosions).
+    """
+    from app.metrics import http_request_duration_seconds, http_requests_total
+    if request.url.path == "/metrics":
+        return await call_next(request)
+    start = _time()
+    status = 500
+    try:
+        response = await call_next(request)
+        status = response.status_code
+        return response
+    finally:
+        http_request_duration_seconds.labels(method=request.method).observe(_time() - start)
+        http_requests_total.labels(
+            method=request.method,
+            status_class=f"{status // 100}xx",
+        ).inc()
+
+
 class RssCandidateOut(BaseModel):
     title: str
     url: str
@@ -373,6 +427,25 @@ def health(db: Session = Depends(get_db)):
         status_code=200 if status == "ok" else 503,
         content={"status": status, "db": db_status, "redis": redis_status},
     )
+
+
+@app.get("/metrics")
+def metrics():
+    """Prometheus scrape endpoint.
+
+    Also refreshes the celery_queue_depth gauge on scrape using the default
+    queue length in Redis. Low cost; Prometheus pulls every 15–30s.
+    """
+    from app.metrics import celery_queue_depth, render_metrics
+    try:
+        r = _get_rl_redis()
+        # Celery default queue is 'celery'; LLEN gives pending count.
+        depth = r.llen("celery")
+        celery_queue_depth.labels(queue="celery").set(int(depth or 0))
+    except Exception:
+        pass  # don't block scrapes on redis hiccups
+    body, content_type = render_metrics()
+    return Response(content=body, media_type=content_type)
 
 
 # ── RSS candidate picker ───────────────────────────────────────────────────

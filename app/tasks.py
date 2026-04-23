@@ -5,6 +5,7 @@ import logging
 
 from datetime import datetime, timedelta
 from celery import Celery
+from celery.signals import before_task_publish, task_prerun, task_postrun
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
@@ -16,7 +17,17 @@ from app.extract import extract_article_text
 from app.summarize import make_tts_bundle, rewrite_to_target_words, generate_social_captions, _pick_wpm
 from app.tts import synthesize
 from app.usage import UsageCollector
+from app.logging_config import (
+    configure_logging,
+    get_correlation_id,
+    set_correlation_id,
+    set_log_context,
+    clear_log_context,
+)
+from app.sentry_init import init_sentry
 
+init_sentry()
+configure_logging()
 logger = logging.getLogger(__name__)
 
 celery_app = Celery(
@@ -25,6 +36,37 @@ celery_app = Celery(
     backend=os.environ["CELERY_RESULT_BACKEND"],
 )
 celery_app.conf.result_expires = 86400  # purge task results after 24 h
+
+
+# ── Correlation ID propagation through Celery ──────────────────────────────
+# Clients (API handlers) put the correlation ID into task headers via
+# before_task_publish; workers unpack it in task_prerun and set the
+# contextvar so every log line from the task carries the same trace.
+
+_CORR_HEADER = "x_correlation_id"
+
+
+@before_task_publish.connect
+def _inject_correlation_id(headers=None, **_):
+    if headers is None:
+        return
+    cid = get_correlation_id()
+    if cid and _CORR_HEADER not in headers:
+        headers[_CORR_HEADER] = cid
+
+
+_task_start_times: dict[str, float] = {}
+
+
+@task_prerun.connect
+def _restore_correlation_id(task_id=None, task=None, **_):
+    import time as _t
+    headers = getattr(getattr(task, "request", None), "headers", None) or {}
+    cid = headers.get(_CORR_HEADER) or ""
+    set_correlation_id(cid or None)
+    set_log_context(task_id=task_id or "")
+    if task_id:
+        _task_start_times[task_id] = _t.time()
 
 # Scheduled generation — disabled unless ENABLE_SCHEDULED_GENERATION=true
 if os.getenv("ENABLE_SCHEDULED_GENERATION", "false").lower() == "true":
@@ -84,25 +126,34 @@ def _article_lock(source_id: str, url: str, ttl: int = 120):
 
 
 # Task lifecycle signals — decrement the per-user active task counter when
-# a task completes (success, failure, or revocation).
-
-from celery.signals import task_postrun  # noqa: E402
+# a task completes (success, failure, or revocation), and clear the
+# correlation-ID contextvar so it doesn't leak into the next task.
 
 
 @task_postrun.connect
 def _on_task_postrun(sender=None, task_id=None, kwargs=None, **_extra):
     """Decrement the per-user active task counter on task completion."""
+    import time as _t
     user_id = (kwargs or {}).get("user_id")
-    if not user_id:
-        return
+    if user_id:
+        try:
+            r = _get_redis()
+            key = f"user_tasks:{user_id}"
+            count = r.decr(key)
+            if int(count) < 0:
+                r.set(key, "0")
+        except Exception:
+            pass
+    # Record task duration
     try:
-        r = _get_redis()
-        key = f"user_tasks:{user_id}"
-        count = r.decr(key)
-        if int(count) < 0:
-            r.set(key, "0")
+        if task_id and task_id in _task_start_times:
+            from app.metrics import task_duration_seconds
+            duration = _t.time() - _task_start_times.pop(task_id)
+            task_name = getattr(sender, "name", "unknown") if sender else "unknown"
+            task_duration_seconds.labels(task_name=task_name).observe(duration)
     except Exception:
         pass
+    clear_log_context()
 
 
 def _parse_dt(entry) -> datetime | None:

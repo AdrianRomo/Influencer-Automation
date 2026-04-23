@@ -65,6 +65,7 @@ def synthesize(
     for attempt in range(retries):
         try:
             from app.circuit_breakers import elevenlabs_breaker  # lazy import — no circular deps
+            from app.metrics import tts_calls_total, tts_characters_total
             # convert returns an iterator of bytes in the SDK examples.
             audio_stream = elevenlabs_breaker.call(
                 active_client.text_to_speech.convert,
@@ -81,6 +82,12 @@ def synthesize(
                 if isinstance(chunk, (bytes, bytearray)) and chunk:
                     chunks.append(bytes(chunk))
             audio_bytes = b"".join(chunks)
+
+            try:
+                tts_calls_total.labels(provider="elevenlabs", outcome="success").inc()
+                tts_characters_total.labels(provider="elevenlabs").inc(len(text))
+            except Exception:
+                pass
 
             if collector is not None:
                 try:
@@ -103,6 +110,11 @@ def synthesize(
 
         except Exception as e:
             last_err = e
+            try:
+                from app.metrics import tts_calls_total
+                tts_calls_total.labels(provider="elevenlabs", outcome="error").inc()
+            except Exception:
+                pass
             if attempt == retries - 1:
                 raise
             time.sleep(0.8 * (2 ** attempt))  # simple backoff

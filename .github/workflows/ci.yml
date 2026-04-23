@@ -1,0 +1,76 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main, master]
+
+jobs:
+  backend:
+    name: Backend (pytest + import check)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install dependencies
+        run: uv sync --all-extras
+
+      - name: Compile-check every module
+        run: |
+          uv run python -c "
+          import py_compile, pathlib
+          failed = []
+          for p in pathlib.Path('app').rglob('*.py'):
+              try:
+                  py_compile.compile(str(p), doraise=True)
+              except Exception as e:
+                  failed.append(f'{p}: {e}')
+          if failed:
+              raise SystemExit('\n'.join(failed))
+          print('all modules compile')
+          "
+
+      - name: Run pytest
+        env:
+          DATABASE_URL: sqlite:///:memory:
+          CELERY_BROKER_URL: memory://
+          CELERY_RESULT_BACKEND: cache+memory://
+          SECRET_KEY: ci-test-secret-key-padding-xxxxxxxxxxxx
+          OPENAI_API_KEY: sk-ci-test
+          ELEVENLABS_API_KEY: el-ci-test
+          ELEVENLABS_VOICE_ID: test-voice
+        run: uv run pytest -v
+
+  frontend:
+    name: Frontend (tsc + vitest + build)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run vitest
+        run: npm test
+
+      - name: Build
+        run: npm run build

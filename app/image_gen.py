@@ -47,16 +47,22 @@ def generate_scene_image(
 ) -> bytes:
     """Call DALL-E and return raw PNG bytes."""
     from app.circuit_breakers import openai_breaker  # lazy import — no circular deps
+    from app.metrics import image_gen_calls_total
     c = OpenAI(api_key=api_key) if api_key else _client
-    resp = openai_breaker.call(
-        c.images.generate,
-        model=IMAGE_MODEL,
-        prompt=_safe_prompt(visual_prompt),
-        size=IMAGE_SIZE,
-        quality=IMAGE_QUALITY,
-        n=1,
-        response_format="b64_json",
-    )
+    try:
+        resp = openai_breaker.call(
+            c.images.generate,
+            model=IMAGE_MODEL,
+            prompt=_safe_prompt(visual_prompt),
+            size=IMAGE_SIZE,
+            quality=IMAGE_QUALITY,
+            n=1,
+            response_format="b64_json",
+        )
+    except Exception:
+        image_gen_calls_total.labels(provider="openai", outcome="error").inc()
+        raise
+    image_gen_calls_total.labels(provider="openai", outcome="success").inc()
     img_bytes = base64.b64decode(resp.data[0].b64_json)
 
     if collector is not None:
@@ -96,16 +102,22 @@ def generate_thumbnail(
     )[:900]
 
     from app.circuit_breakers import openai_breaker  # lazy import — no circular deps
+    from app.metrics import image_gen_calls_total
     c = OpenAI(api_key=api_key) if api_key else _client
-    resp = openai_breaker.call(
-        c.images.generate,
-        model=IMAGE_MODEL,
-        prompt=prompt,
-        size=IMAGE_SIZE,
-        quality=IMAGE_QUALITY,
-        n=1,
-        response_format="b64_json",
-    )
+    try:
+        resp = openai_breaker.call(
+            c.images.generate,
+            model=IMAGE_MODEL,
+            prompt=prompt,
+            size=IMAGE_SIZE,
+            quality=IMAGE_QUALITY,
+            n=1,
+            response_format="b64_json",
+        )
+    except Exception:
+        image_gen_calls_total.labels(provider="openai", outcome="error").inc()
+        raise
+    image_gen_calls_total.labels(provider="openai", outcome="success").inc()
     img_bytes = base64.b64decode(resp.data[0].b64_json)
 
     if collector is not None:

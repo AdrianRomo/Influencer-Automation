@@ -1,0 +1,118 @@
+{
+  "uid": "influencer-pipeline",
+  "title": "Influencer Pipeline",
+  "tags": ["influencer", "pipeline"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": {"from": "now-6h", "to": "now"},
+  "panels": [
+    {
+      "type": "stat",
+      "title": "Requests (5m)",
+      "id": 1,
+      "gridPos": {"h": 4, "w": 6, "x": 0, "y": 0},
+      "targets": [
+        {"expr": "sum(rate(http_requests_total[5m]))", "refId": "A"}
+      ],
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}}
+    },
+    {
+      "type": "stat",
+      "title": "5xx rate (5m)",
+      "id": 2,
+      "gridPos": {"h": 4, "w": 6, "x": 6, "y": 0},
+      "targets": [
+        {"expr": "sum(rate(http_requests_total{status_class=\"5xx\"}[5m]))", "refId": "A"}
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "yellow", "value": 0.1},
+              {"color": "red", "value": 1}
+            ]
+          }
+        }
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Celery queue depth",
+      "id": 3,
+      "gridPos": {"h": 4, "w": 6, "x": 12, "y": 0},
+      "targets": [
+        {"expr": "celery_queue_depth", "refId": "A"}
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Stage failures (1h)",
+      "id": 4,
+      "gridPos": {"h": 4, "w": 6, "x": 18, "y": 0},
+      "targets": [
+        {"expr": "sum(increase(task_stage_failures_total[1h]))", "refId": "A"}
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "HTTP latency (p50/p95/p99)",
+      "id": 5,
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 4},
+      "targets": [
+        {"expr": "histogram_quantile(0.50, sum by (le) (rate(http_request_duration_seconds_bucket[5m])))", "legendFormat": "p50", "refId": "A"},
+        {"expr": "histogram_quantile(0.95, sum by (le) (rate(http_request_duration_seconds_bucket[5m])))", "legendFormat": "p95", "refId": "B"},
+        {"expr": "histogram_quantile(0.99, sum by (le) (rate(http_request_duration_seconds_bucket[5m])))", "legendFormat": "p99", "refId": "C"}
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Task duration by task_name (p95)",
+      "id": 6,
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 4},
+      "targets": [
+        {"expr": "histogram_quantile(0.95, sum by (le, task_name) (rate(task_duration_seconds_bucket[15m])))", "legendFormat": "{{task_name}}", "refId": "A"}
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "LLM calls (by operation + outcome)",
+      "id": 7,
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 12},
+      "targets": [
+        {"expr": "sum by (operation, outcome) (rate(llm_calls_total[5m]))", "legendFormat": "{{operation}} / {{outcome}}", "refId": "A"}
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "TTS characters per minute",
+      "id": 8,
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 12},
+      "targets": [
+        {"expr": "sum(rate(tts_characters_total[5m])) * 60", "refId": "A"}
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "LLM tokens (input + output / min)",
+      "id": 9,
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 20},
+      "targets": [
+        {"expr": "sum by (model) (rate(llm_input_tokens_total[5m])) * 60", "legendFormat": "{{model}} in", "refId": "A"},
+        {"expr": "sum by (model) (rate(llm_output_tokens_total[5m])) * 60", "legendFormat": "{{model}} out", "refId": "B"}
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Video assembly duration (p95)",
+      "id": 10,
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 20},
+      "targets": [
+        {"expr": "histogram_quantile(0.95, sum by (le, render_mode) (rate(video_assembly_duration_seconds_bucket[15m])))", "legendFormat": "{{render_mode}}", "refId": "A"}
+      ]
+    }
+  ]
+}

@@ -143,25 +143,36 @@ def _call_llm(
     operation: str = "llm",
 ) -> str:
     from app.circuit_breakers import openai_breaker  # lazy import — no circular deps
+    from app.metrics import llm_calls_total, observe_llm_usage
     c = OpenAI(api_key=api_key) if api_key else client
-    resp = openai_breaker.call(
-        c.responses.create,
-        model=model,
-        input=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-        temperature=temperature,
-        store=False,
-    )
+    try:
+        resp = openai_breaker.call(
+            c.responses.create,
+            model=model,
+            input=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            temperature=temperature,
+            store=False,
+        )
+    except Exception:
+        llm_calls_total.labels(provider="openai", operation=operation, outcome="error").inc()
+        raise
+    llm_calls_total.labels(provider="openai", operation=operation, outcome="success").inc()
     text = (resp.output_text or "").strip()
+
+    usage = getattr(resp, "usage", None)
+    in_tok = getattr(usage, "input_tokens", None) if usage else None
+    out_tok = getattr(usage, "output_tokens", None) if usage else None
+    try:
+        observe_llm_usage("openai", model, in_tok, out_tok)
+    except Exception:
+        pass
 
     if collector is not None:
         try:
             from app.pricing import estimate_openai_llm_cost, get_llm_pricing_snapshot
-            usage = getattr(resp, "usage", None)
-            in_tok = getattr(usage, "input_tokens", None) if usage else None
-            out_tok = getattr(usage, "output_tokens", None) if usage else None
             tot_tok = getattr(usage, "total_tokens", None) if usage else None
             details = getattr(usage, "input_tokens_details", None) if usage else None
             cached = getattr(details, "cached_tokens", None) if details else None
