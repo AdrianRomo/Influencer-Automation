@@ -1336,3 +1336,24 @@ hr {
 .approve-settings-summary span {
   white-space: nowrap;
 }
+
+/* ── Multi-platform video output ─────────────────────────────────────── */
+
+.platform-video-list {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  margin-bottom: 16px;
+}
+
+.platform-video-card {
+  border: 1px solid #e5e7eb;
+  border-radius: 8px;
+  padding: 12px;
+  background: #f9fafb;
+}
+
+.platform-video-meta {
+  margin-bottom: 8px;
+  color: #6b7280;
+}

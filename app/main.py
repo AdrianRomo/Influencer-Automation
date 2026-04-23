@@ -624,25 +624,29 @@ def get_article_package(article_id: str, db=Depends(get_db)):
         for r in image_rows
     ] or None
 
-    video_ref: VideoAssetRef | None = None
-    video_row = db.execute(
+    def _video_to_ref(r: VideoAsset) -> VideoAssetRef:
+        return VideoAssetRef(
+            id=r.id,
+            download_url=f"/video/{r.id}",
+            duration_seconds=r.duration_seconds,
+            width=r.width,
+            height=r.height,
+            has_subtitles=bool(r.has_subtitles),
+            status=r.status,
+            error=r.error,
+            render_mode=r.render_mode or "static",
+            platform=r.platform,
+        )
+
+    all_video_rows = db.execute(
         select(VideoAsset)
         .where(VideoAsset.article_id == article_id)
         .order_by(VideoAsset.created_at.desc())
-        .limit(1)
-    ).scalar_one_or_none()
-    if video_row:
-        video_ref = VideoAssetRef(
-            id=video_row.id,
-            download_url=f"/video/{video_row.id}",
-            duration_seconds=video_row.duration_seconds,
-            width=video_row.width,
-            height=video_row.height,
-            has_subtitles=bool(video_row.has_subtitles),
-            status=video_row.status,
-            error=video_row.error,
-            render_mode=video_row.render_mode or "static",
-        )
+    ).scalars().all()
+    video_ref: VideoAssetRef | None = _video_to_ref(all_video_rows[0]) if all_video_rows else None
+    videos_list: list[VideoAssetRef] | None = (
+        [_video_to_ref(r) for r in all_video_rows] if all_video_rows else None
+    )
 
     # Per-scene animated clip status (only populated for animated renders)
     scene_video_rows = db.execute(
@@ -698,6 +702,9 @@ def get_article_package(article_id: str, db=Depends(get_db)):
         url=article.url,
         source_id=article.source_id,
         generated_at=article.created_at,
+        language=article.language or "es-MX",
+        selected_platforms=article.selected_platforms,
+        animation_prompt=article.animation_prompt,
         script=script_asset,
         audio=audio_ref,
         storyboard=storyboard,
@@ -705,6 +712,7 @@ def get_article_package(article_id: str, db=Depends(get_db)):
         visual_prompts=visual_prompts,
         images=images,
         video=video_ref,
+        videos=videos_list,
         scene_videos=scene_videos,
         analysis=analysis,
         cost_summary=cost_summary,

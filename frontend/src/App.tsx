@@ -596,10 +596,15 @@ export default function App() {
   const [pkgLoading, setPkgLoading] = useState(false)
 
   // ── Video generation ───────────────────────────────────────────────────
-  const [videoLoading, setVideoLoading] = useState(false)
-  const [videoJob, setVideoJob] = useState<JobStatus | null>(null)
-  const [videoError, setVideoError] = useState('')
-  const [videoStage, setVideoStage] = useState('')
+  // Per-platform tracking: platform → {taskId, loading, stage, error}
+  type PlatVideoState = { taskId: string; loading: boolean; stage: string; error: string }
+  const [platVideos, setPlatVideos] = useState<Record<string, PlatVideoState>>({})
+  // Derived aggregate — any platform still running
+  const videoLoading = Object.values(platVideos).some(v => v.loading)
+  const videoError = Object.values(platVideos).map(v => v.error).filter(Boolean).join(' · ')
+  const videoStage = Object.values(platVideos).map(v => v.stage).filter(Boolean).join(' · ')
+  // Legacy single-platform compat (first platform's job for scene animation grid)
+  const videoJob: JobStatus | null = null
   const [renderMode, setRenderMode] = useState<RenderMode>('static')
 
   // ── Script prepare (preview-before-audio) ──────────────────────────────
@@ -741,7 +746,7 @@ export default function App() {
     setHistory([])
     setPkg(null)
     setAudioJob(null)
-    setVideoJob(null)
+    setPlatVideos({})
     setError('')
     setStatusText('Idle')
     setShowAuthModal(true)
@@ -774,8 +779,8 @@ export default function App() {
   async function loadFromHistory(articleId: string) {
     if (pollTimer.current) window.clearTimeout(pollTimer.current)
     if (videoPollTimer.current) window.clearTimeout(videoPollTimer.current)
-    setAudioJob(null); setVideoJob(null); setVideoError(''); setVideoStage('')
-    setError(''); setLoading(false); setVideoLoading(false)
+    setAudioJob(null); setPlatVideos({})
+    setError(''); setLoading(false)
     setPkg(null); setPkgLoading(true); setStatusText('Loading…')
     setSelectedCandidate(null); setCandidates([])
     try {
@@ -795,7 +800,7 @@ export default function App() {
   async function startAudio() {
     if (!selectedCandidate) return
     setError(''); setLoading(true); setAudioJob(null); setPkg(null)
-    setVideoJob(null); setVideoError(''); setVideoStage('')
+    setPlatVideos({})
     setStatusText('Queueing…')
     try {
       const payload: GenerateReq = {
@@ -860,34 +865,41 @@ export default function App() {
 
   // ── Video generation ─────────────────────────────────────────────────────
 
+  function _setPlatVideo(platform: string, patch: Partial<PlatVideoState>) {
+    setPlatVideos(prev => {
+      const cur: PlatVideoState = prev[platform] ?? { taskId: '', loading: false, stage: '', error: '' }
+      return { ...prev, [platform]: { ...cur, ...patch } }
+    })
+  }
+
   async function startVideo() {
     if (!articleId) return
-    setVideoError(''); setVideoLoading(true); setVideoJob(null); setVideoStage('Queueing…')
-    try {
-      const resp = await startGenerateVideo(
-        articleId, true, renderMode,
-        selectedPlatforms[0] ?? 'tiktok',
-        animationPrompt || null,
-      )
-      activeVideoTaskId.current = resp.task_id
-      pollVideo(resp.task_id)
-    } catch (e: unknown) {
-      setVideoLoading(false); setVideoStage('')
-      setVideoError(String((e as Error)?.message ?? e))
+    const platforms = selectedPlatforms.length ? selectedPlatforms : ['tiktok']
+    setPlatVideos({})
+    for (const plat of platforms) {
+      _setPlatVideo(plat, { loading: true, stage: 'Queueing…', error: '' })
+      try {
+        const resp = await startGenerateVideo(articleId, true, renderMode, plat, animationPrompt || null)
+        activeVideoTaskId.current = resp.task_id
+        _setPlatVideo(plat, { taskId: resp.task_id, loading: true, stage: 'Queued' })
+        pollVideo(resp.task_id, plat)
+      } catch (e: unknown) {
+        _setPlatVideo(plat, { loading: false, stage: '', error: String((e as Error)?.message ?? e) })
+      }
     }
   }
 
   async function retryVideo(stage: 'video' | 'images') {
     if (!articleId) return
-    setVideoError(''); setVideoLoading(true); setVideoJob(null)
-    setVideoStage(stage === 'images' ? 'Regenerating all images…' : 'Retrying video assembly…')
+    const firstPlat = selectedPlatforms[0] ?? 'tiktok'
+    _setPlatVideo(firstPlat, { loading: true, stage: stage === 'images' ? 'Regenerating images…' : 'Retrying assembly…', error: '' })
     try {
       const resp = await regenerateStage(articleId, stage, true)
       activeVideoTaskId.current = resp.task_id
-      pollVideo(resp.task_id)
+      _setPlatVideo(firstPlat, { taskId: resp.task_id })
+      pollVideo(resp.task_id, firstPlat)
     } catch (e: unknown) {
-      setVideoLoading(false); setVideoStage('')
-      setVideoError(String((e as Error)?.message ?? e))
+      _setPlatVideo(firstPlat, { loading: false, stage: '', error: String((e as Error)?.message ?? e) })
     }
   }
 
@@ -897,38 +909,39 @@ export default function App() {
     try { await cancelJob(tid) } catch { /* ignore */ }
     activeVideoTaskId.current = null
     if (videoPollTimer.current) window.clearTimeout(videoPollTimer.current)
-    setVideoLoading(false); setVideoStage('Cancelled')
+    setPlatVideos(prev => {
+      const next = { ...prev }
+      for (const k of Object.keys(next)) next[k] = { ...next[k], loading: false, stage: 'Cancelled' }
+      return next
+    })
   }
 
-  function pollVideo(taskId: string) {
+  function pollVideo(taskId: string, platform: string) {
     jobStatus(taskId).then(s => {
-      setVideoJob(s)
-      if (s.state === 'PROGRESS' && s.meta?.msg) {
-        setVideoStage(s.meta.msg)
-      } else if (s.state !== 'SUCCESS' && s.state !== 'FAILURE') {
-        setVideoStage(STATE_LABELS[s.state] ?? s.state)
-      }
+      let stage = ''
+      if (s.state === 'PROGRESS' && s.meta?.msg) stage = s.meta.msg
+      else if (s.state !== 'SUCCESS' && s.state !== 'FAILURE') stage = STATE_LABELS[s.state] ?? s.state
+      _setPlatVideo(platform, { stage })
       if (s.state === 'SUCCESS') {
-        setVideoLoading(false); setVideoStage('')
+        _setPlatVideo(platform, { loading: false, stage: '' })
         if (articleId) fetchPackage(articleId)
         loadHistory()
       } else if (s.state === 'FAILURE') {
-        setVideoLoading(false); setVideoStage('')
-        setVideoError(s.error || 'Video generation failed')
+        _setPlatVideo(platform, { loading: false, stage: '', error: s.error || 'Video generation failed' })
       } else {
-        videoPollTimer.current = window.setTimeout(() => pollVideo(taskId), 3000)
+        videoPollTimer.current = window.setTimeout(() => pollVideo(taskId, platform), 3000)
       }
     }).catch(e => {
-      setVideoLoading(false); setVideoStage('')
-      setVideoError(String((e as Error)?.message ?? e))
-    })
+      _setPlatVideo(platform, { loading: false, stage: '', error: String((e as Error)?.message ?? e) })
+
+      })
   }
 
   function reset() {
     if (pollTimer.current) window.clearTimeout(pollTimer.current)
     if (videoPollTimer.current) window.clearTimeout(videoPollTimer.current)
     setAudioJob(null); setPkg(null); setError('')
-    setVideoJob(null); setVideoError(''); setVideoLoading(false); setVideoStage('')
+    setPlatVideos({})
     setLoading(false); setPrepareLoading(false); setStatusText('Idle'); setPkgLoading(false)
     setScriptEditing(false); setScriptSaveError('')
     setFlowStep('pick'); setCandidates([]); setCandidatesError('')
@@ -971,9 +984,9 @@ export default function App() {
     setCandidates([])
     setCandidatesError('')
     setPkg(null)
-    setAudioJob(null); setVideoJob(null)
-    setError(''); setVideoError(''); setStatusText('Idle')
-    setLoading(false); setVideoLoading(false)
+    setAudioJob(null); setPlatVideos({})
+    setError(''); setStatusText('Idle')
+    setLoading(false)
   }
 
   // ── Script preview (prepare_article task) ────────────────────────────────
@@ -1435,9 +1448,20 @@ export default function App() {
                       onClick={() => {
                         if (active) {
                           const next = selectedPlatforms.filter(x => x !== p.id)
-                          if (next.length) setSelectedPlatforms(next)
+                          if (next.length) {
+                            setSelectedPlatforms(next)
+                            // Update duration hint to the new primary platform's default
+                            const primary = platformsData?.platforms.find(x => x.id === next[0])
+                            if (primary) setTargetSeconds(primary.default_duration)
+                          }
                         } else {
-                          setSelectedPlatforms([...selectedPlatforms, p.id])
+                          const next = [...selectedPlatforms, p.id]
+                          setSelectedPlatforms(next)
+                          // If this is now the only / first platform, suggest its default duration
+                          if (next.length === 1) {
+                            const pd = platformsData?.platforms.find(x => x.id === p.id)
+                            if (pd) setTargetSeconds(pd.default_duration)
+                          }
                         }
                       }}
                       disabled={loading || prepareLoading}
@@ -1688,55 +1712,64 @@ export default function App() {
           <div className="video-section card">
             <div className="video-section-header">
               <strong>Video</strong>
-              {videoStage && <span className="small">{videoStage}</span>}
-              {!videoStage && videoReady && pkg.video && (
-                <span className="small">
-                  {fmtSeconds(pkg.video.duration_seconds)} · {pkg.video.width}×{pkg.video.height}
-                  {pkg.video.has_subtitles ? ' · subtitles' : ''}
-                  {pkg.video.render_mode === 'animated' ? ' · animated' : ''}
-                  {pkg.video.platform && <span className="platform-badge">{pkg.video.platform}</span>}
-                </span>
-              )}
+              {videoLoading && videoStage && <span className="small">{videoStage}</span>}
             </div>
 
-            {videoReady && pkg.video ? (
-              <div>
-                <video controls className="video-player">
-                  <source src={resolveVideoUrl(pkg.video.id)} type="video/mp4" />
-                </video>
-                <div className="actions" style={{ marginTop: 10 }}>
-                  <a href={resolveVideoUrl(pkg.video.id)} className="dl-btn dl-btn-primary" download>
-                    Download MP4
-                  </a>
-                  {pkg.video.has_subtitles && <span className="small">subtitles burned in</span>}
-                  {articleId && (
-                    <button className="secondary" style={{ fontSize: 12, padding: '5px 10px' }}
-                      onClick={() => retryVideo('images')} disabled={videoLoading}>
-                      Regenerate Images
-                    </button>
-                  )}
-                </div>
+            {/* Per-platform video outputs */}
+            {pkg.videos && pkg.videos.length > 0 && (
+              <div className="platform-video-list">
+                {pkg.videos.map(v => (
+                  <div key={v.id} className="platform-video-card">
+                    <div className="platform-video-meta small">
+                      {v.platform && <span className="platform-badge">{v.platform}</span>}
+                      {' '}{v.width}×{v.height}
+                      {' · '}{fmtSeconds(v.duration_seconds)}
+                      {v.has_subtitles ? ' · subtitles' : ''}
+                      {v.render_mode === 'animated' ? ' · animated' : ''}
+                      {v.status === 'failed' && <span style={{ color: '#ef4444' }}> · failed</span>}
+                    </div>
+                    {v.status === 'ready' ? (
+                      <>
+                        <video controls className="video-player">
+                          <source src={resolveVideoUrl(v.id)} type="video/mp4" />
+                        </video>
+                        <div className="actions" style={{ marginTop: 8 }}>
+                          <a href={resolveVideoUrl(v.id)} className="dl-btn dl-btn-primary" download>
+                            Download MP4
+                          </a>
+                          {v.has_subtitles && <span className="small">subtitles burned in</span>}
+                        </div>
+                      </>
+                    ) : v.status === 'failed' ? (
+                      <div className="error-text" style={{ marginTop: 6, fontSize: 12 }}>{v.error || 'Generation failed'}</div>
+                    ) : (
+                      <div className="small" style={{ color: '#9ca3af', marginTop: 4 }}>Status: {v.status}</div>
+                    )}
+                  </div>
+                ))}
               </div>
-            ) : pkg.video?.status === 'failed' ? (
-              <div>
-                {pkg.video.error && (
-                  <div className="error-text" style={{ marginBottom: 10 }}>{pkg.video.error}</div>
-                )}
-                <div className="actions">
-                  <button onClick={() => retryVideo('video')} disabled={videoLoading || !articleId}>
-                    {videoLoading ? 'Retrying…' : 'Retry Video Assembly'}
-                  </button>
-                  <button className="secondary" onClick={() => retryVideo('images')}
-                    disabled={videoLoading || !articleId}>
-                    Regenerate All Images
-                  </button>
-                  {videoLoading && (
-                    <button className="secondary" onClick={cancelVideo}>Cancel</button>
-                  )}
-                </div>
+            )}
+
+            {/* Per-platform loading progress */}
+            {Object.entries(platVideos).map(([plat, state]) => state.loading && (
+              <div key={plat} className="small" style={{ color: '#6b7280', marginTop: 6 }}>
+                <span className="platform-badge" style={{ marginRight: 6 }}>{plat}</span>
+                <span className="spinner" style={{ width: 10, height: 10, marginRight: 6 }} />
+                {state.stage || 'Working…'}
               </div>
-            ) : (
-              <div>
+            ))}
+
+            {/* Error display per platform */}
+            {Object.entries(platVideos).map(([plat, state]) => state.error && (
+              <div key={plat} className="error-text" style={{ marginTop: 4 }}>
+                <span className="platform-badge" style={{ marginRight: 4 }}>{plat}</span>
+                {state.error}
+              </div>
+            ))}
+
+            {/* Generate section — shown when no video yet or to add more */}
+            {(!pkg.videos || pkg.videos.length === 0 || (!videoLoading)) && (
+              <div style={{ marginTop: pkg.videos && pkg.videos.length > 0 ? 14 : 0 }}>
                 {/* Render mode toggle */}
                 {!videoLoading && (
                   <div className="render-mode-toggle">
@@ -1758,8 +1791,7 @@ export default function App() {
                 )}
                 {renderMode === 'animated' && !videoLoading && (
                   <div className="animated-info small">
-                    Each scene image is animated by the configured provider ({'{SCENE_VIDEO_PROVIDER}'}),
-                    then assembled into one video matched to the narration audio.
+                    Each scene image is animated by the configured provider, then assembled into one video matched to the audio.
                     Falls back to static for any scene that fails.
                   </div>
                 )}
@@ -1768,22 +1800,28 @@ export default function App() {
                     {videoLoading
                       ? 'Generating…'
                       : renderMode === 'animated'
-                        ? 'Generate Animated Video'
-                        : 'Generate Video'}
+                        ? `Generate Animated Video${selectedPlatforms.length > 1 ? ` (${selectedPlatforms.length} platforms)` : ''}`
+                        : `Generate Video${selectedPlatforms.length > 1 ? ` (${selectedPlatforms.length} platforms)` : ''}`}
                   </button>
                   {videoLoading
                     ? <button className="secondary" onClick={cancelVideo}>Cancel</button>
                     : <span className="small">
                         {renderMode === 'animated'
-                          ? 'Animates each scene · ~5–15 min'
-                          : 'DALL-E images + FFmpeg · ~2–5 min'}
+                          ? 'Animates each scene · ~5–15 min per platform'
+                          : `DALL-E images + FFmpeg · ~2–5 min${selectedPlatforms.length > 1 ? ` × ${selectedPlatforms.length}` : ''}`}
                       </span>
                   }
                 </div>
+                {pkg.videos && pkg.videos.length > 0 && articleId && !videoLoading && (
+                  <div className="actions" style={{ marginTop: 8 }}>
+                    <button className="secondary" style={{ fontSize: 12, padding: '5px 10px' }}
+                      onClick={() => retryVideo('images')} disabled={videoLoading}>
+                      Regenerate All Images
+                    </button>
+                  </div>
+                )}
               </div>
             )}
-
-            {videoError && <div className="error-text">{videoError}</div>}
 
             {/* Scene animation status grid (animated renders) */}
             {pkg.scene_videos && pkg.scene_videos.length > 0 && (

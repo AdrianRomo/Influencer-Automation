@@ -274,6 +274,7 @@ export type ContentPackage = {
   visual_prompts?: VisualPromptEntry[] | null
   images?: ImageAssetRef[] | null
   video?: VideoAssetRef | null
+  videos?: VideoAssetRef[] | null
   scene_videos?: SceneVideoRef[] | null
   analysis?: AnalysisResult | null
   cost_summary?: CostSummary | null

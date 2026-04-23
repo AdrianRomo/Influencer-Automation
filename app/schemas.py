@@ -189,6 +189,7 @@ class ContentPackage(BaseModel):
     visual_prompts: Optional[List[VisualPromptEntry]] = None
     images: Optional[List[ImageAssetRef]] = None
     video: Optional[VideoAssetRef] = None
+    videos: Optional[List[VideoAssetRef]] = None
     scene_videos: Optional[List[SceneVideoRef]] = None
     analysis: Optional[AnalysisResult] = None
     cost_summary: Optional["CostSummary"] = None
