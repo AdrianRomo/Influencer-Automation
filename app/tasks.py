@@ -131,6 +131,9 @@ def prepare_article(
     target_seconds: int = TARGET_SECONDS,
     openai_api_key: str | None = None,
     user_id: str | None = None,
+    language: str | None = None,
+    selected_platforms: list | None = None,
+    animation_prompt: str | None = None,
 ) -> dict:
     """Extract article content and generate script + storyboard WITHOUT audio synthesis.
 
@@ -152,7 +155,13 @@ def prepare_article(
             except Exception:
                 pass
 
-        article = Article(source_id=src.id, title=title, url=url, published_at=published_at, user_id=user_id)
+        eff_language = language or os.getenv("TTS_OUTPUT_LANGUAGE", "es-MX")
+        article = Article(
+            source_id=src.id, title=title, url=url, published_at=published_at,
+            user_id=user_id, language=eff_language,
+            selected_platforms=selected_platforms or ["tiktok"],
+            animation_prompt=animation_prompt,
+        )
         db.add(article)
         try:
             db.commit()
@@ -163,7 +172,11 @@ def prepare_article(
             ).scalar_one()
             if user_id and not article.user_id:
                 article.user_id = user_id
-                db.commit()
+            article.language = eff_language
+            article.selected_platforms = selected_platforms or article.selected_platforms or ["tiktok"]
+            if animation_prompt:
+                article.animation_prompt = animation_prompt
+            db.commit()
 
         collector = UsageCollector(article_id=article.id, user_id=user_id)
 
@@ -188,6 +201,7 @@ def prepare_article(
             wpm_estimate=wpm_estimate,
             api_key=openai_api_key,
             collector=collector,
+            output_language=eff_language,
         )
 
         script = bundle["script"]
@@ -196,7 +210,7 @@ def prepare_article(
 
         article.raw_text = raw
         article.tts_script = script
-        article.script_language = os.getenv("TTS_OUTPUT_LANGUAGE", "es-MX")
+        article.script_language = eff_language
         article.summary_model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
         article.storyboard_json = {
             "scenes": scenes,
@@ -238,6 +252,7 @@ def generate_latest_for_source(
     article_summary: str | None = None,
     article_published_at: str | None = None,
     article_id: str | None = None,
+    language: str | None = None,
 ) -> dict:
     audio_dir = os.getenv("AUDIO_DIR", "/data/audio")
     os.makedirs(audio_dir, exist_ok=True)
@@ -265,6 +280,7 @@ def generate_latest_for_source(
             script = article.tts_script
             scenes = (article.storyboard_json or {}).get("scenes") or []
             word_count = len(script.split())
+            eff_language = language or article.language or os.getenv("TTS_OUTPUT_LANGUAGE", "es-MX")
             collector = UsageCollector(article_id=article.id, user_id=user_id)
             logger.info("TTS-only run for pre-prepared article id=%s words=%d", article.id, word_count)
         else:
@@ -298,7 +314,11 @@ def generate_latest_for_source(
                 published_at = _parse_dt(entry)
                 logger.info("Selected RSS entry: title=%r published_at=%s url=%s", title, published_at, url)
 
-            article = Article(source_id=src.id, title=title, url=url, published_at=published_at, user_id=user_id)
+            eff_language = language or os.getenv("TTS_OUTPUT_LANGUAGE", "es-MX")
+            article = Article(
+                source_id=src.id, title=title, url=url, published_at=published_at,
+                user_id=user_id, language=eff_language,
+            )
             db.add(article)
             try:
                 db.commit()
@@ -309,7 +329,8 @@ def generate_latest_for_source(
                 ).scalar_one()
                 if user_id and not article.user_id:
                     article.user_id = user_id
-                    db.commit()
+                article.language = eff_language
+                db.commit()
 
             self.update_state(state="PROGRESS", meta={"stage": "extracting", "msg": "Extracting article content…"})
             raw = extract_article_text(url, fallback_text=fallback)
@@ -334,6 +355,7 @@ def generate_latest_for_source(
                 wpm_estimate=wpm,
                 api_key=openai_api_key,
                 collector=collector,
+                output_language=eff_language,
             )
 
             script = bundle["script"]
@@ -343,7 +365,7 @@ def generate_latest_for_source(
 
             article.raw_text = raw
             article.tts_script = script
-            article.script_language = os.getenv("TTS_OUTPUT_LANGUAGE", "es-MX")
+            article.script_language = eff_language
             article.summary_model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
             article.storyboard_json = {
                 "scenes": scenes,
@@ -368,6 +390,7 @@ def generate_latest_for_source(
                     script, voice_id=used_voice_id, model_id=model_id,
                     output_format=output_format, api_key=elevenlabs_api_key,
                     collector=collector,
+                    language_code=eff_language[:2] if eff_language else None,
                 )
                 with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3", dir=audio_dir) as tmp:
                     tmp.write(audio_bytes)
@@ -471,6 +494,8 @@ def generate_video_for_article(
     audio_asset_id: str | None = None,
     burn_subtitles: bool = True,
     openai_api_key: str | None = None,
+    platform: str = "tiktok",
+    animation_prompt: str | None = None,
 ) -> dict:
     """Generate scene images with DALL-E then assemble an MP4 with FFmpeg.
 
@@ -481,11 +506,14 @@ def generate_video_for_article(
     from app.video import assemble_video
     from app.captions import storyboard_to_captions, captions_to_srt
     from app.schemas import Storyboard
+    from app.platforms import get_profile as _get_profile
 
     image_dir = os.getenv("IMAGE_DIR", "/data/images")
     video_dir = os.getenv("VIDEO_DIR", "/data/video")
     os.makedirs(image_dir, exist_ok=True)
     os.makedirs(video_dir, exist_ok=True)
+
+    plat_profile = _get_profile(platform)
 
     with SessionLocal() as db:
         article = db.get(Article, article_id)
@@ -520,6 +548,9 @@ def generate_video_for_article(
             audio_asset_id=audio.id,
             file_path="",
             status="created",
+            platform=platform,
+            width=plat_profile.width,
+            height=plat_profile.height,
         )
         db.add(video_record)
         db.commit()
@@ -588,6 +619,8 @@ def generate_video_for_article(
                 audio_path=audio.file_path,
                 output_path=output_path,
                 srt_path=srt_path,
+                width=plat_profile.width,
+                height=plat_profile.height,
             )
 
             video_record.file_path = output_path
@@ -702,6 +735,8 @@ def generate_animated_video_for_article(
     burn_subtitles: bool = True,
     openai_api_key: str | None = None,
     scene_video_provider: str | None = None,
+    platform: str = "tiktok",
+    animation_prompt: str | None = None,
 ) -> dict:
     """Generate AI-animated scene clips then assemble a final MP4.
 
@@ -723,11 +758,14 @@ def generate_animated_video_for_article(
     from app.video import normalize_clip, assemble_video_from_clips
     from app.captions import storyboard_to_captions, captions_to_srt
     from app.schemas import Storyboard
+    from app.platforms import get_profile as _get_profile
 
     image_dir = os.getenv("IMAGE_DIR", "/data/images")
     video_dir = os.getenv("VIDEO_DIR", "/data/video")
     os.makedirs(image_dir, exist_ok=True)
     os.makedirs(video_dir, exist_ok=True)
+
+    plat_profile = _get_profile(platform)
 
     # Per-scene timeout for the provider (seconds)
     scene_timeout    = float(os.getenv("SCENE_VIDEO_TIMEOUT_SECONDS", "300"))
@@ -771,6 +809,9 @@ def generate_animated_video_for_article(
             file_path="",
             status="created",
             render_mode="animated",
+            platform=platform,
+            width=plat_profile.width,
+            height=plat_profile.height,
         )
         db.add(video_record)
         db.commit()
@@ -854,10 +895,14 @@ def generate_animated_video_for_article(
                 db.commit()
                 scene_records[scene.scene_number] = sv
 
+                eff_prompt = (
+                    f"{animation_prompt}. {scene.visual_prompt}"
+                    if animation_prompt else scene.visual_prompt
+                )
                 try:
                     job_id = provider.submit(
                         image_path=img_path,
-                        prompt=scene.visual_prompt,
+                        prompt=eff_prompt,
                         duration_hint=duration_t,
                     )
                     sv.provider_job_id = job_id
@@ -943,7 +988,7 @@ def generate_animated_video_for_article(
 
                 if rec and rec.status == "ready" and rec.file_path and os.path.exists(rec.file_path):
                     try:
-                        normalize_clip(rec.file_path, clip_norm, dur)
+                        normalize_clip(rec.file_path, clip_norm, dur, width=plat_profile.width, height=plat_profile.height)
                         rec.duration_seconds = dur
                         db.commit()
                         final_clips.append({"clip_path": clip_norm, "duration": dur})
@@ -990,6 +1035,8 @@ def generate_animated_video_for_article(
                 audio_path=audio.file_path,
                 output_path=output_path,
                 srt_path=srt_path,
+                width=plat_profile.width,
+                height=plat_profile.height,
             )
 
             fallback_count = sum(

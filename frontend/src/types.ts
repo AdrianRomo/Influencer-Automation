@@ -64,6 +64,34 @@ export type RssCandidate = {
   source_name: string
 }
 
+export type PlatformProfile = {
+  id: string
+  name: string
+  width: number
+  height: number
+  aspect_ratio: string
+  default_duration: number
+  min_duration: number
+  max_duration: number
+  short_form: boolean
+  description: string
+}
+
+export type LanguageOption = {
+  code: string
+  label: string
+}
+
+export type PlatformsResp = {
+  platforms: PlatformProfile[]
+  languages: LanguageOption[]
+  defaults: {
+    platform: string
+    language: string
+    animation_prompt: string
+  }
+}
+
 export type PrepareArticleReq = {
   source_id: string
   article_url: string
@@ -72,6 +100,9 @@ export type PrepareArticleReq = {
   article_published_at?: string | null
   n_scenes?: number
   target_seconds?: number
+  language?: string
+  selected_platforms?: string[]
+  animation_prompt?: string | null
 }
 
 export type GenerateReq = {
@@ -175,6 +206,7 @@ export type VideoAssetRef = {
   status: string
   error?: string | null
   render_mode: 'static' | 'animated'
+  platform?: string | null
 }
 
 export type SceneVideoRef = {
@@ -232,6 +264,9 @@ export type ContentPackage = {
   url: string
   source_id: string
   generated_at: string
+  language?: string
+  selected_platforms?: string[] | null
+  animation_prompt?: string | null
   script?: ScriptAsset | null
   audio?: AudioAssetRef | null
   storyboard?: Storyboard | null

@@ -139,6 +139,7 @@ class VideoAssetRef(BaseModel):
     status: str
     error: Optional[str] = None
     render_mode: str = "static"   # "static" | "animated"
+    platform: Optional[str] = None
 
 
 class SceneVideoRef(BaseModel):
@@ -159,12 +160,28 @@ class AnalysisResult(BaseModel):
     audience_relevance: Optional[str] = None
 
 
+class PlatformProfileOut(BaseModel):
+    id: str
+    name: str
+    width: int
+    height: int
+    aspect_ratio: str
+    default_duration: int
+    min_duration: int
+    max_duration: int
+    short_form: bool
+    description: str = ""
+
+
 class ContentPackage(BaseModel):
     article_id: str
     title: str
     url: str
     source_id: str
     generated_at: datetime
+    language: str = "es-MX"
+    selected_platforms: Optional[List[str]] = None
+    animation_prompt: Optional[str] = None
     script: Optional[ScriptAsset] = None
     audio: Optional[AudioAssetRef] = None
     storyboard: Optional[Storyboard] = None

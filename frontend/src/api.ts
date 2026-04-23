@@ -1,7 +1,7 @@
 import type {
   ArticleSummary, PaginatedArticles, PrepareArticleReq, RssCandidate, Source,
   GenerateReq, GenerateResp, JobStatus, ContentPackage, RenderMode,
-  TokenResp, UserResp, UserKeysIn, UserKeysOut, CostSummary,
+  TokenResp, UserResp, UserKeysIn, UserKeysOut, CostSummary, PlatformsResp,
 } from './types'
 
 const rawBase = import.meta.env.VITE_API_BASE_URL as string | undefined
@@ -65,6 +65,10 @@ export function listSources(): Promise<Source[]> {
   return http<Source[]>('/sources')
 }
 
+export function getPlatforms(): Promise<PlatformsResp> {
+  return http<PlatformsResp>('/platforms')
+}
+
 export function fetchRssCandidates(sourceId?: string, limit = 10): Promise<RssCandidate[]> {
   const q = new URLSearchParams()
   if (sourceId) q.set('source_id', sourceId)
@@ -101,6 +105,8 @@ export function startGenerateVideo(
   articleId: string,
   burnSubtitles: boolean = true,
   renderMode: RenderMode = 'static',
+  platform: string = 'tiktok',
+  animationPrompt?: string | null,
 ): Promise<GenerateResp> {
   return http<GenerateResp>('/generate-video', {
     method: 'POST',
@@ -108,6 +114,8 @@ export function startGenerateVideo(
       article_id: articleId,
       burn_subtitles: burnSubtitles,
       render_mode: renderMode,
+      platform,
+      animation_prompt: animationPrompt ?? null,
     }),
   })
 }

@@ -40,6 +40,9 @@ def _detect_current_rev(inspector) -> str | None:
         ("005", lambda: "scene_video_assets" in all_tables
                         and "render_mode" in video_cols),
         ("006", lambda: "generation_usage_events" in all_tables),
+        ("007", lambda: "language" in articles_cols
+                        and "selected_platforms" in articles_cols
+                        and "platform" in video_cols),
     ]
 
     stamp = None

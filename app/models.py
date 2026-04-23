@@ -68,6 +68,11 @@ class Article(Base):
     # Sentiment + impact analysis output
     analysis_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
+    # Generation settings (set at prepare time, drive all downstream tasks)
+    language: Mapped[str] = mapped_column(String(20), default="es-MX", nullable=False)
+    selected_platforms: Mapped[list | None] = mapped_column(JSON, nullable=True)  # ["tiktok", "reels"]
+    animation_prompt: Mapped[str | None] = mapped_column(Text, nullable=True)
+
     # User content management
     is_pinned: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
 
@@ -162,6 +167,8 @@ class VideoAsset(Base):
     has_subtitles: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     # "static" = slideshow of DALL-E images; "animated" = AI-generated scene clips
     render_mode: Mapped[str] = mapped_column(String, default="static", nullable=False)
+    # platform profile used for output dimensions (tiktok, reels, youtube, etc.)
+    platform: Mapped[str | None] = mapped_column(String(50), nullable=True)
 
     status: Mapped[str] = mapped_column(String, default="created", nullable=False)  # created|ready|failed
     error: Mapped[str | None] = mapped_column(Text, nullable=True)

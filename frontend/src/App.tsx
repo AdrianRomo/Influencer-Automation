@@ -1,15 +1,15 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type {
   AnalysisResult, ArticleSummary, ContentPackage, CostSummary, GenerateReq, ImageAssetRef,
-  JobStatus, RenderMode, RssCandidate, SceneVideoRef, Source, StoryboardScene,
+  JobStatus, PlatformsResp, RenderMode, RssCandidate, SceneVideoRef, Source, StoryboardScene,
   UserResp, UserKeysOut,
 } from './types'
 import {
   cancelJob, editScript, fetchRssCandidates, getArticlePackage, getExportZipUrl,
-  jobStatus, listArticles, listSources, pinArticle, prepareArticle, regenerateStage,
-  reorderStoryboard, resolveAudioUrl, resolveCaptionUrl, resolveImageUrl, resolveVideoUrl,
-  setApiKey, startGenerate, startGenerateVideo, startRegenerateScript, uploadSceneImage,
-  register, login, getMe, getUserKeys, saveUserKeys,
+  getPlatforms, jobStatus, listArticles, listSources, pinArticle, prepareArticle,
+  regenerateStage, reorderStoryboard, resolveAudioUrl, resolveCaptionUrl, resolveImageUrl,
+  resolveVideoUrl, setApiKey, startGenerate, startGenerateVideo, startRegenerateScript,
+  uploadSceneImage, register, login, getMe, getUserKeys, saveUserKeys,
   setAuthToken, clearAuthToken,
 } from './api'
 
@@ -569,12 +569,17 @@ export default function App() {
   const [apiKey, setApiKeyState] = useState(() => localStorage.getItem('api_key') ?? '')
   const [showSettings, setShowSettings] = useState(false)
 
+  // ── Platforms / language metadata ─────────────────────────────────────
+  const [platformsData, setPlatformsData] = useState<PlatformsResp | null>(null)
+
   // ── Form state ─────────────────────────────────────────────────────────
   const [sources, setSources] = useState<Source[]>([])
   const [sourceId, setSourceId] = useState('')
-  const [voiceId, setVoiceId] = useState('')
   const [targetSeconds, setTargetSeconds] = useState(180)
   const [nScenes, setNScenes] = useState(8)
+  const [language, setLanguage] = useState('es-MX')
+  const [selectedPlatforms, setSelectedPlatforms] = useState<string[]>(['tiktok'])
+  const [animationPrompt, setAnimationPrompt] = useState('')
 
   // ── Audio generation ───────────────────────────────────────────────────
   const [loading, setLoading] = useState(false)
@@ -673,12 +678,19 @@ export default function App() {
     localStorage.setItem('api_key', apiKey)
   }, [apiKey])
 
-  // Load sources + history once authenticated
+  // Load sources + history + platform metadata once authenticated
   useEffect(() => {
     if (authLoading || showAuthModal) return
     listSources()
       .then(s => { setSources(s); if (s.length) setSourceId(String(s[0].id)) })
       .catch(e => setError(String((e as Error)?.message ?? e)))
+    getPlatforms()
+      .then(p => {
+        setPlatformsData(p)
+        setLanguage(p.defaults.language)
+        setAnimationPrompt(p.defaults.animation_prompt)
+      })
+      .catch(() => {})
     loadHistory()
     return () => {
       if (pollTimer.current) window.clearTimeout(pollTimer.current)
@@ -788,7 +800,6 @@ export default function App() {
     try {
       const payload: GenerateReq = {
         source_id: selectedCandidate.source_id,
-        voice_id: voiceId.trim() || null,
         target_seconds: targetSeconds,
         n_scenes: nScenes,
         article_url: selectedCandidate.url,
@@ -853,7 +864,11 @@ export default function App() {
     if (!articleId) return
     setVideoError(''); setVideoLoading(true); setVideoJob(null); setVideoStage('Queueing…')
     try {
-      const resp = await startGenerateVideo(articleId, true, renderMode)
+      const resp = await startGenerateVideo(
+        articleId, true, renderMode,
+        selectedPlatforms[0] ?? 'tiktok',
+        animationPrompt || null,
+      )
       activeVideoTaskId.current = resp.task_id
       pollVideo(resp.task_id)
     } catch (e: unknown) {
@@ -979,6 +994,9 @@ export default function App() {
         article_published_at: selectedCandidate.published_at ?? null,
         n_scenes: nScenes,
         target_seconds: targetSeconds,
+        language,
+        selected_platforms: selectedPlatforms,
+        animation_prompt: animationPrompt || null,
       })
       activeAudioTaskId.current = resp.task_id
       pollPrepare(resp.task_id)
@@ -1026,7 +1044,6 @@ export default function App() {
       const payload: GenerateReq = {
         source_id: selectedCandidate.source_id,
         article_id: pkg.article_id,
-        voice_id: voiceId.trim() || null,
         target_seconds: targetSeconds,
         n_scenes: nScenes,
       }
@@ -1361,34 +1378,32 @@ export default function App() {
             <div className="flow-step-header">
               <span className="flow-step-pill">2</span>
               <span className="flow-step-title">Generation Settings</span>
-              <span className="small" style={{ marginLeft: 'auto', color: '#9ca3af' }}>⌘↵ to generate</span>
             </div>
 
-            <div className="row">
+            {/* Language + Duration + Scenes */}
+            <div className="row" style={{ marginTop: 8 }}>
               <div>
-                <label>
-                  Voice ID <span className="small">
-                    {userKeys?.elevenlabs_voice_id
-                      ? `(account: ${userKeys.elevenlabs_voice_id})`
-                      : '(optional override)'}
-                  </span>
-                </label>
-                <input
-                  placeholder={userKeys?.elevenlabs_voice_id ?? 'ElevenLabs voice_id — leave blank for default'}
-                  value={voiceId}
-                  onChange={e => setVoiceId(e.target.value)}
-                  disabled={loading}
-                />
+                <label>Language</label>
+                <select
+                  value={language}
+                  onChange={e => setLanguage(e.target.value)}
+                  disabled={loading || prepareLoading}
+                  className="lang-select"
+                >
+                  {platformsData
+                    ? platformsData.languages.map(l => (
+                        <option key={l.code} value={l.code}>{l.label}</option>
+                      ))
+                    : <option value={language}>{language}</option>
+                  }
+                </select>
               </div>
-            </div>
-
-            <div className="row" style={{ marginTop: 12 }}>
               <div>
-                <label>Target duration (seconds)</label>
+                <label>Target duration (s)</label>
                 <input
                   type="number" min={30} max={600} value={targetSeconds}
                   onChange={e => setTargetSeconds(Number(e.target.value))}
-                  disabled={loading}
+                  disabled={loading || prepareLoading}
                 />
               </div>
               <div>
@@ -1396,9 +1411,57 @@ export default function App() {
                 <input
                   type="number" min={0} max={20} value={nScenes}
                   onChange={e => setNScenes(Number(e.target.value))}
-                  disabled={loading}
+                  disabled={loading || prepareLoading}
                 />
               </div>
+            </div>
+
+            {/* Platform selector */}
+            <div style={{ marginTop: 14 }}>
+              <label style={{ display: 'block', marginBottom: 8 }}>Target platforms</label>
+              <div className="platform-chips">
+                {(platformsData?.platforms ?? [
+                  { id: 'tiktok', name: 'TikTok', aspect_ratio: '9:16' },
+                  { id: 'reels', name: 'Reels', aspect_ratio: '9:16' },
+                  { id: 'youtube_shorts', name: 'YT Shorts', aspect_ratio: '9:16' },
+                  { id: 'youtube', name: 'YouTube', aspect_ratio: '16:9' },
+                  { id: 'facebook', name: 'Facebook', aspect_ratio: '9:16' },
+                ]).map(p => {
+                  const active = selectedPlatforms.includes(p.id)
+                  return (
+                    <button
+                      key={p.id}
+                      className={`platform-chip ${active ? 'platform-chip-active' : ''}`}
+                      onClick={() => {
+                        if (active) {
+                          const next = selectedPlatforms.filter(x => x !== p.id)
+                          if (next.length) setSelectedPlatforms(next)
+                        } else {
+                          setSelectedPlatforms([...selectedPlatforms, p.id])
+                        }
+                      }}
+                      disabled={loading || prepareLoading}
+                      type="button"
+                    >
+                      {p.name}
+                      <span className="platform-chip-ratio">{p.aspect_ratio}</span>
+                    </button>
+                  )
+                })}
+              </div>
+            </div>
+
+            {/* Animation prompt */}
+            <div style={{ marginTop: 14 }}>
+              <label>Animation prompt <span className="small" style={{ color: '#9ca3af' }}>used for animated video renders</span></label>
+              <textarea
+                className="animation-prompt-input"
+                value={animationPrompt}
+                onChange={e => setAnimationPrompt(e.target.value)}
+                disabled={loading || prepareLoading}
+                rows={2}
+                placeholder="e.g. Smooth, subtle camera movement. Slow cinematic zoom."
+              />
             </div>
 
             <div className="actions" style={{ marginTop: 16 }}>
@@ -1409,15 +1472,7 @@ export default function App() {
               >
                 {prepareLoading ? (
                   <><span className="spinner spinner-light" />Generating script…</>
-                ) : 'Preview Script First'}
-              </button>
-              <button
-                className="secondary"
-                onClick={startAudio}
-                disabled={loading || prepareLoading}
-                title="Skip preview and run the full pipeline in one step"
-              >
-                {loading ? 'Generating…' : 'Generate Everything'}
+                ) : 'Preview Script →'}
               </button>
               {(loading || prepareLoading) && (
                 <button className="secondary" onClick={() => { cancelAudio(); setPrepareLoading(false) }}>
@@ -1527,49 +1582,23 @@ export default function App() {
             <div className="card approve-card">
               <div className="flow-step-header" style={{ marginBottom: 12 }}>
                 <span className="flow-step-pill" style={{ background: '#7c3aed' }}>3</span>
-                <span className="flow-step-title">Generate Voiceover + Video</span>
+                <span className="flow-step-title">Approve &amp; Generate Voiceover</span>
               </div>
-              <p className="small" style={{ color: '#4b5563', margin: '0 0 14px' }}>
-                Review the script below. Edit it if needed, then synthesize the voiceover and assemble the video.
+              <p className="small" style={{ color: '#4b5563', margin: '0 0 10px' }}>
+                Review the script below. Edit if needed, then synthesize the voiceover.
               </p>
-              <div className="row">
-                <div>
-                  <label>
-                    Voice ID <span className="small">
-                      {userKeys?.elevenlabs_voice_id
-                        ? `(account: ${userKeys.elevenlabs_voice_id})`
-                        : '(optional override)'}
-                    </span>
-                  </label>
-                  <input
-                    placeholder={userKeys?.elevenlabs_voice_id ?? 'ElevenLabs voice_id'}
-                    value={voiceId}
-                    onChange={e => setVoiceId(e.target.value)}
-                    disabled={loading}
-                  />
-                </div>
-                <div className="row">
-                  <div>
-                    <label>Duration (s)</label>
-                    <input
-                      type="number" min={30} max={600} value={targetSeconds}
-                      onChange={e => setTargetSeconds(Number(e.target.value))}
-                      disabled={loading}
-                    />
-                  </div>
-                  <div>
-                    <label>Scenes</label>
-                    <input
-                      type="number" min={0} max={20} value={nScenes}
-                      onChange={e => setNScenes(Number(e.target.value))}
-                      disabled={loading}
-                    />
-                  </div>
-                </div>
+              {/* Show configured settings as read-only summary */}
+              <div className="approve-settings-summary small">
+                <span><strong>Language:</strong> {pkg.language ?? language}</span>
+                <span><strong>Duration:</strong> {targetSeconds}s</span>
+                <span><strong>Scenes:</strong> {nScenes}</span>
+                {(pkg.selected_platforms ?? selectedPlatforms).length > 0 && (
+                  <span><strong>Platforms:</strong> {(pkg.selected_platforms ?? selectedPlatforms).join(', ')}</span>
+                )}
               </div>
               <div className="actions" style={{ marginTop: 14 }}>
                 <button className="generate-btn" onClick={startAudioFromPreview} disabled={loading}>
-                  {loading ? 'Generating audio…' : 'Generate Audio + Video'}
+                  {loading ? 'Generating audio…' : 'Generate Audio →'}
                 </button>
                 {loading && <button className="secondary" onClick={cancelAudio}>Cancel</button>}
               </div>
@@ -1665,6 +1694,7 @@ export default function App() {
                   {fmtSeconds(pkg.video.duration_seconds)} · {pkg.video.width}×{pkg.video.height}
                   {pkg.video.has_subtitles ? ' · subtitles' : ''}
                   {pkg.video.render_mode === 'animated' ? ' · animated' : ''}
+                  {pkg.video.platform && <span className="platform-badge">{pkg.video.platform}</span>}
                 </span>
               )}
             </div>

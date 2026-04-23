@@ -53,8 +53,9 @@ from app.schemas import (
     AudioAssetRef, ScriptAsset, VisualPromptEntry, ContentPackage,
     ImageAssetRef, VideoAssetRef, SceneVideoRef, AnalysisResult,
     RegisterReq, LoginReq, TokenResp, UserResp, UserKeysIn, UserKeysOut,
-    CostSummary, UsageEventOut,
+    CostSummary, UsageEventOut, PlatformProfileOut,
 )
+from app.platforms import PROFILES, LANGUAGES, DEFAULT_PLATFORM, DEFAULT_LANGUAGE, DEFAULT_ANIMATION_PROMPT
 from app.captions import storyboard_to_captions, captions_to_srt, captions_to_vtt
 from app.summarize import _count_words, _estimate_seconds
 from app.tasks import celery_app
@@ -160,6 +161,9 @@ class PrepareArticleReq(BaseModel):
     article_published_at: str | None = None
     n_scenes: int = Field(default=DEFAULT_SCENES, ge=0, le=20)
     target_seconds: int = Field(default=DEFAULT_TARGET_SECONDS, ge=30, le=600)
+    language: str = DEFAULT_LANGUAGE
+    selected_platforms: list[str] = Field(default_factory=lambda: [DEFAULT_PLATFORM])
+    animation_prompt: str | None = None
 
 
 class GenerateReq(BaseModel):
@@ -181,6 +185,8 @@ class GenerateVideoReq(BaseModel):
     audio_asset_id: str | None = None
     burn_subtitles: bool = True
     render_mode: Literal["static", "animated"] = "static"
+    platform: str = DEFAULT_PLATFORM
+    animation_prompt: str | None = None
 
 
 # ── Health ─────────────────────────────────────────────────────────────────
@@ -426,6 +432,20 @@ def list_sources(db=Depends(get_db)):
         {"id": r.id, "name": r.name, "rss_url": r.rss_url, "language_hint": r.language_hint}
         for r in rows
     ]
+
+
+@app.get("/platforms", dependencies=[Depends(check_api_key)])
+def list_platforms():
+    """Return available platform output profiles and language options."""
+    return {
+        "platforms": [PlatformProfileOut(**p.to_dict()) for p in PROFILES.values()],
+        "languages": [{"code": code, "label": label} for code, label in LANGUAGES.items()],
+        "defaults": {
+            "platform": DEFAULT_PLATFORM,
+            "language": DEFAULT_LANGUAGE,
+            "animation_prompt": DEFAULT_ANIMATION_PROMPT,
+        },
+    }
 
 
 # ── Articles ───────────────────────────────────────────────────────────────
@@ -980,6 +1000,9 @@ def prepare_article_endpoint(
             "target_seconds": req.target_seconds,
             "openai_api_key": openai_key,
             "user_id": current_user.id if current_user else None,
+            "language": req.language,
+            "selected_platforms": req.selected_platforms,
+            "animation_prompt": req.animation_prompt,
         },
     )
     return {"task_id": task.id, "status": "queued"}
@@ -1082,6 +1105,8 @@ def generate_video(
             "audio_asset_id": req.audio_asset_id,
             "burn_subtitles": req.burn_subtitles,
             "openai_api_key": openai_key,
+            "platform": req.platform,
+            "animation_prompt": req.animation_prompt,
         },
     )
     _video_tasks[req.article_id] = task.id
