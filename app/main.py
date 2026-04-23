@@ -53,7 +53,7 @@ from app.schemas import (
     AudioAssetRef, ScriptAsset, VisualPromptEntry, ContentPackage,
     ImageAssetRef, VideoAssetRef, SceneVideoRef, AnalysisResult,
     RegisterReq, LoginReq, TokenResp, UserResp, UserKeysIn, UserKeysOut,
-    CostSummary, UsageEventOut, PlatformProfileOut,
+    CostSummary, UsageEventOut, PlatformProfileOut, SocialCaption,
 )
 from app.platforms import PROFILES, LANGUAGES, DEFAULT_PLATFORM, DEFAULT_LANGUAGE, DEFAULT_ANIMATION_PROMPT
 from app.captions import storyboard_to_captions, captions_to_srt, captions_to_vtt
@@ -676,6 +676,17 @@ def get_article_package(article_id: str, db=Depends(get_db)):
         except Exception:
             pass
 
+    social_captions: list[SocialCaption] | None = None
+    if article.social_captions_json:
+        try:
+            social_captions = [
+                SocialCaption(platform=plat, **data)
+                for plat, data in article.social_captions_json.items()
+                if isinstance(data, dict) and "caption" in data
+            ]
+        except Exception:
+            pass
+
     # Inline cost summary so the frontend gets everything in one request
     cost_summary: CostSummary | None = None
     try:
@@ -715,6 +726,7 @@ def get_article_package(article_id: str, db=Depends(get_db)):
         videos=videos_list,
         scene_videos=scene_videos,
         analysis=analysis,
+        social_captions=social_captions,
         cost_summary=cost_summary,
     )
 

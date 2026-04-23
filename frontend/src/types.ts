@@ -258,6 +258,12 @@ export type CostSummary = {
   pricing_note: string
 }
 
+export type SocialCaption = {
+  platform: string
+  caption: string
+  hashtags: string[]
+}
+
 export type ContentPackage = {
   article_id: string
   title: string
@@ -277,5 +283,6 @@ export type ContentPackage = {
   videos?: VideoAssetRef[] | null
   scene_videos?: SceneVideoRef[] | null
   analysis?: AnalysisResult | null
+  social_captions?: SocialCaption[] | null
   cost_summary?: CostSummary | null
 }

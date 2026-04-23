@@ -160,6 +160,12 @@ class AnalysisResult(BaseModel):
     audience_relevance: Optional[str] = None
 
 
+class SocialCaption(BaseModel):
+    platform: str
+    caption: str
+    hashtags: List[str] = []
+
+
 class PlatformProfileOut(BaseModel):
     id: str
     name: str
@@ -192,6 +198,7 @@ class ContentPackage(BaseModel):
     videos: Optional[List[VideoAssetRef]] = None
     scene_videos: Optional[List[SceneVideoRef]] = None
     analysis: Optional[AnalysisResult] = None
+    social_captions: Optional[List[SocialCaption]] = None
     cost_summary: Optional["CostSummary"] = None
 
 

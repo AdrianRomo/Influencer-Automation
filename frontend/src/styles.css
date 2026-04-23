@@ -1357,3 +1357,78 @@ hr {
   margin-bottom: 8px;
   color: #6b7280;
 }
+
+/* ── Social captions panel ───────────────────────────────────────────── */
+
+.social-captions-panel {
+  margin-top: 12px;
+  border: 1px solid #e5e7eb;
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.social-captions-tabs {
+  display: flex;
+  border-bottom: 1px solid #e5e7eb;
+  background: #f9fafb;
+}
+
+.social-tab {
+  flex: 1;
+  padding: 8px 12px;
+  font-size: 12px;
+  font-weight: 500;
+  background: none;
+  border: none;
+  border-right: 1px solid #e5e7eb;
+  cursor: pointer;
+  color: #6b7280;
+  transition: background 0.15s, color 0.15s;
+}
+
+.social-tab:last-child {
+  border-right: none;
+}
+
+.social-tab:hover {
+  background: #f3f4f6;
+  color: #111827;
+}
+
+.social-tab-active {
+  background: white;
+  color: #6366f1;
+  font-weight: 600;
+  border-bottom: 2px solid #6366f1;
+  margin-bottom: -1px;
+}
+
+.social-caption-body {
+  padding: 14px;
+  background: white;
+}
+
+.social-caption-text {
+  font-size: 13px;
+  line-height: 1.6;
+  color: #1f2937;
+  white-space: pre-wrap;
+  margin-bottom: 10px;
+}
+
+.social-hashtags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 10px;
+}
+
+.social-hashtag {
+  display: inline-block;
+  padding: 2px 8px;
+  background: #ede9fe;
+  color: #6d28d9;
+  border-radius: 12px;
+  font-size: 11px;
+  font-weight: 500;
+}

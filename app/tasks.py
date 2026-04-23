@@ -13,7 +13,7 @@ from mutagen.mp3 import MP3
 from app.db import SessionLocal
 from app.models import Source, Article, AudioAsset, VoiceCalibration, ImageAsset, VideoAsset, SceneVideoAsset
 from app.extract import extract_article_text
-from app.summarize import make_tts_bundle, rewrite_to_target_words
+from app.summarize import make_tts_bundle, rewrite_to_target_words, generate_social_captions, _pick_wpm
 from app.tts import synthesize
 from app.usage import UsageCollector
 
@@ -185,7 +185,7 @@ def prepare_article(
         if not raw:
             raw = fallback or title
 
-        wpm_estimate = 140.0
+        wpm_estimate = float(_pick_wpm(eff_language))
         target_words = _words_for_seconds(target_seconds, wpm_estimate)
         tol_words = _words_for_seconds(TOLERANCE_SECONDS, wpm_estimate)
 
@@ -225,6 +225,17 @@ def prepare_article(
             db.commit()
         except Exception as exc:
             logger.warning("Analysis failed (non-fatal): %s", exc)
+
+        try:
+            platforms = article.selected_platforms or ["tiktok"]
+            self.update_state(state="PROGRESS", meta={"stage": "captions", "msg": "Generating social captions…"})
+            article.social_captions_json = generate_social_captions(
+                title=title, script=script, platforms=platforms,
+                output_language=eff_language, api_key=openai_api_key, collector=collector,
+            )
+            db.commit()
+        except Exception as exc:
+            logger.warning("Social caption generation failed (non-fatal): %s", exc)
 
         collector.flush(db)
 
@@ -372,6 +383,16 @@ def generate_latest_for_source(
                 "total_duration_estimate": bundle.get("total_duration_estimate", 0),
             }
             db.commit()
+
+            try:
+                platforms = article.selected_platforms or ["tiktok"]
+                article.social_captions_json = generate_social_captions(
+                    title=title, script=script, platforms=platforms,
+                    output_language=eff_language, api_key=openai_api_key, collector=collector,
+                )
+                db.commit()
+            except Exception as exc:
+                logger.warning("Social caption generation failed (non-fatal): %s", exc)
 
         # ── TTS synthesis (common to all paths) ──────────────────────────────
         final_path = os.path.join(audio_dir, f"{article.id}_{used_voice_id}.mp3")

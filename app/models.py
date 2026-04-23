@@ -68,6 +68,9 @@ class Article(Base):
     # Sentiment + impact analysis output
     analysis_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
+    # Per-platform post captions + hashtags (generated after script)
+    social_captions_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+
     # Generation settings (set at prepare time, drive all downstream tasks)
     language: Mapped[str] = mapped_column(String(20), default="es-MX", nullable=False)
     selected_platforms: Mapped[list | None] = mapped_column(JSON, nullable=True)  # ["tiktok", "reels"]

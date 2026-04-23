@@ -43,6 +43,7 @@ def _detect_current_rev(inspector) -> str | None:
         ("007", lambda: "language" in articles_cols
                         and "selected_platforms" in articles_cols
                         and "platform" in video_cols),
+        ("008", lambda: "social_captions_json" in articles_cols),
     ]
 
     stamp = None

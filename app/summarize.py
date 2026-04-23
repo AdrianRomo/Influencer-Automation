@@ -337,6 +337,75 @@ def _words_for_seconds(seconds: int, wpm: float) -> int:
     return int(round(seconds * (wpm / 60.0)))
 
 
+_PLATFORM_CAPTION_HINTS: Dict[str, str] = {
+    "tiktok":         "TikTok: punchy hook in line 1, conversational, 150–220 chars, 3–5 hashtags, emojis optional",
+    "reels":          "Instagram Reels: engaging opener, 150–220 chars, 5–8 hashtags, 1–2 emojis",
+    "youtube_shorts": "YouTube Shorts: concise, curiosity-driven, 120–180 chars, 3–5 hashtags",
+    "youtube":        "YouTube: informative title-style opener, 200–350 chars, 5–10 hashtags, no emojis required",
+    "facebook":       "Facebook: conversational, slight longer form OK, 180–280 chars, 3–5 hashtags",
+}
+
+_SYSTEM_CAPTIONS = """You are a social media content writer for medical health news.
+Given a narration script, write optimized post captions for each requested platform.
+
+Rules:
+- Write in the SAME LANGUAGE as the script (do not translate or switch languages).
+- Each caption should hook the viewer immediately and accurately represent the content.
+- Do not invent health claims not present in the script.
+- Keep medical tone: accurate, clear, no sensationalism.
+- Output a valid JSON object only — no markdown, no extra text.
+
+Output format:
+{
+  "platform_id": {
+    "caption": "post body text",
+    "hashtags": ["#tag1", "#tag2", ...]
+  },
+  ...
+}
+"""
+
+
+def generate_social_captions(
+    title: str,
+    script: str,
+    platforms: List[str],
+    output_language: str = OUTPUT_LANGUAGE,
+    api_key: str | None = None,
+    collector: "UsageCollector | None" = None,
+) -> Dict[str, Any]:
+    """Generate platform-optimized post captions + hashtags for the given platforms.
+
+    Returns a dict keyed by platform id, each with 'caption' and 'hashtags' keys.
+    """
+    if not platforms:
+        return {}
+    model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+    hints = "\n".join(
+        f"- {pid}: {_PLATFORM_CAPTION_HINTS.get(pid, 'social media post, 150–250 chars, 3–5 hashtags')}"
+        for pid in platforms
+    )
+    prompt = f"""Article title: {title}
+
+Script (language: {output_language}):
+{script[:2000]}
+
+Write captions for these platforms (write in the script's language: {output_language}):
+{hints}
+
+Return ONLY a JSON object with the platform IDs as keys."""
+    raw = _call_llm(
+        _SYSTEM_CAPTIONS, prompt,
+        model=model, temperature=0.4,
+        api_key=api_key, collector=collector, operation="captions",
+    )
+    try:
+        cleaned = raw.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
+        return json.loads(cleaned)
+    except Exception:
+        return {}
+
+
 def rewrite_to_target_words(
     script: str,
     target_words: int,

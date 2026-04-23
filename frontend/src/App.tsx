@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type {
   AnalysisResult, ArticleSummary, ContentPackage, CostSummary, GenerateReq, ImageAssetRef,
-  JobStatus, PlatformsResp, RenderMode, RssCandidate, SceneVideoRef, Source, StoryboardScene,
-  UserResp, UserKeysOut,
+  JobStatus, PlatformsResp, RenderMode, RssCandidate, SceneVideoRef, SocialCaption,
+  Source, StoryboardScene, UserResp, UserKeysOut,
 } from './types'
 import {
   cancelJob, editScript, fetchRssCandidates, getArticlePackage, getExportZipUrl,
@@ -452,6 +452,66 @@ function CostPanel({ cost }: { cost: CostSummary }) {
   )
 }
 
+const PLATFORM_LABELS: Record<string, string> = {
+  tiktok: 'TikTok', reels: 'Reels', youtube_shorts: 'YT Shorts',
+  youtube: 'YouTube', facebook: 'Facebook',
+}
+
+function SocialCaptionsPanel({ captions }: { captions: SocialCaption[] }) {
+  const [copied, setCopied] = useState<string | null>(null)
+  const [activeTab, setActiveTab] = useState(captions[0]?.platform ?? '')
+
+  function copy(text: string, key: string) {
+    navigator.clipboard.writeText(text).then(() => {
+      setCopied(key)
+      window.setTimeout(() => setCopied(null), 2000)
+    }).catch(() => {})
+  }
+
+  const active = captions.find(c => c.platform === activeTab) ?? captions[0]
+  if (!active) return null
+
+  return (
+    <div className="social-captions-panel">
+      <div className="social-captions-tabs">
+        {captions.map(c => (
+          <button
+            key={c.platform}
+            className={`social-tab ${c.platform === activeTab ? 'social-tab-active' : ''}`}
+            onClick={() => setActiveTab(c.platform)}
+          >
+            {PLATFORM_LABELS[c.platform] ?? c.platform}
+          </button>
+        ))}
+      </div>
+      <div className="social-caption-body">
+        <div className="social-caption-text">{active.caption}</div>
+        {active.hashtags.length > 0 && (
+          <div className="social-hashtags">
+            {active.hashtags.map(h => (
+              <span key={h} className="social-hashtag">{h}</span>
+            ))}
+          </div>
+        )}
+        <div className="actions" style={{ marginTop: 10 }}>
+          <button
+            className="secondary settings-btn"
+            onClick={() => copy(`${active.caption}\n\n${active.hashtags.join(' ')}`, `${activeTab}-full`)}
+          >
+            {copied === `${activeTab}-full` ? 'Copied!' : 'Copy Caption + Hashtags'}
+          </button>
+          <button
+            className="secondary settings-btn"
+            onClick={() => copy(active.hashtags.join(' '), `${activeTab}-tags`)}
+          >
+            {copied === `${activeTab}-tags` ? 'Copied!' : 'Copy Hashtags'}
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 function HistoryRow({ article, sources, onLoad, onPin }: {
   article: ArticleSummary
   sources: Source[]
@@ -572,14 +632,29 @@ export default function App() {
   // ── Platforms / language metadata ─────────────────────────────────────
   const [platformsData, setPlatformsData] = useState<PlatformsResp | null>(null)
 
-  // ── Form state ─────────────────────────────────────────────────────────
+  // ── Form state (restored from localStorage) ───────────────────────────
   const [sources, setSources] = useState<Source[]>([])
   const [sourceId, setSourceId] = useState('')
-  const [targetSeconds, setTargetSeconds] = useState(180)
-  const [nScenes, setNScenes] = useState(8)
-  const [language, setLanguage] = useState('es-MX')
-  const [selectedPlatforms, setSelectedPlatforms] = useState<string[]>(['tiktok'])
-  const [animationPrompt, setAnimationPrompt] = useState('')
+  const [targetSeconds, setTargetSeconds] = useState<number>(() => {
+    const v = localStorage.getItem('gen_targetSeconds')
+    return v ? Number(v) : 180
+  })
+  const [nScenes, setNScenes] = useState<number>(() => {
+    const v = localStorage.getItem('gen_nScenes')
+    return v ? Number(v) : 8
+  })
+  const [language, setLanguage] = useState<string>(() =>
+    localStorage.getItem('gen_language') ?? 'es-MX'
+  )
+  const [selectedPlatforms, setSelectedPlatforms] = useState<string[]>(() => {
+    try {
+      const v = localStorage.getItem('gen_selectedPlatforms')
+      return v ? JSON.parse(v) : ['tiktok']
+    } catch { return ['tiktok'] }
+  })
+  const [animationPrompt, setAnimationPrompt] = useState<string>(() =>
+    localStorage.getItem('gen_animationPrompt') ?? ''
+  )
 
   // ── Audio generation ───────────────────────────────────────────────────
   const [loading, setLoading] = useState(false)
@@ -683,6 +758,13 @@ export default function App() {
     localStorage.setItem('api_key', apiKey)
   }, [apiKey])
 
+  // Persist generation settings to localStorage
+  useEffect(() => { localStorage.setItem('gen_targetSeconds', String(targetSeconds)) }, [targetSeconds])
+  useEffect(() => { localStorage.setItem('gen_nScenes', String(nScenes)) }, [nScenes])
+  useEffect(() => { localStorage.setItem('gen_language', language) }, [language])
+  useEffect(() => { localStorage.setItem('gen_selectedPlatforms', JSON.stringify(selectedPlatforms)) }, [selectedPlatforms])
+  useEffect(() => { localStorage.setItem('gen_animationPrompt', animationPrompt) }, [animationPrompt])
+
   // Load sources + history + platform metadata once authenticated
   useEffect(() => {
     if (authLoading || showAuthModal) return
@@ -692,8 +774,8 @@ export default function App() {
     getPlatforms()
       .then(p => {
         setPlatformsData(p)
-        setLanguage(p.defaults.language)
-        setAnimationPrompt(p.defaults.animation_prompt)
+        if (!localStorage.getItem('gen_language')) setLanguage(p.defaults.language)
+        if (!localStorage.getItem('gen_animationPrompt')) setAnimationPrompt(p.defaults.animation_prompt)
       })
       .catch(() => {})
     loadHistory()
@@ -1588,6 +1670,9 @@ export default function App() {
             )}
             {pkg.analysis && <AnalysisCard analysis={pkg.analysis} />}
             {pkg.cost_summary && <CostPanel cost={pkg.cost_summary} />}
+            {pkg.social_captions && pkg.social_captions.length > 0 && (
+              <SocialCaptionsPanel captions={pkg.social_captions} />
+            )}
             {pkg.storyboard && (
               <div className="download-row" style={{ marginTop: 8 }}>
                 <span className="small">Subtitles:</span>
