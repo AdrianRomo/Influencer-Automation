@@ -47,6 +47,10 @@ def _detect_current_rev(inspector) -> str | None:
         ("009", lambda: "thumbnail_path" in articles_cols),
         ("010", lambda: "dek_enc" in {c["name"] for c in inspector.get_columns("user_api_keys")}),
         ("011", lambda: "deleted_at" in articles_cols),
+        ("012", lambda: any(
+            ix["name"] == "ux_articles_source_url_live"
+            for ix in inspector.get_indexes("articles")
+        )),
     ]
 
     stamp = None

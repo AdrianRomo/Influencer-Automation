@@ -754,13 +754,13 @@ def list_articles(
     # Single query with LEFT JOIN subqueries — avoids N+1 per article
     audio_sq = (
         select(AudioAsset.article_id, func.count(AudioAsset.id).label("cnt"))
-        .where(AudioAsset.status == "ready")
+        .where(AudioAsset.status == "ready", AudioAsset.deleted_at.is_(None))
         .group_by(AudioAsset.article_id)
         .subquery()
     )
     video_sq = (
         select(VideoAsset.article_id, func.count(VideoAsset.id).label("cnt"))
-        .where(VideoAsset.status == "ready")
+        .where(VideoAsset.status == "ready", VideoAsset.deleted_at.is_(None))
         .group_by(VideoAsset.article_id)
         .subquery()
     )
@@ -948,7 +948,10 @@ def get_article_package(article_id: str, db=Depends(get_db), current_user: Optio
     # Per-scene animated clip status (only populated for animated renders)
     scene_video_rows = db.execute(
         select(SceneVideoAsset)
-        .where(SceneVideoAsset.article_id == article_id)
+        .where(
+            SceneVideoAsset.article_id == article_id,
+            SceneVideoAsset.deleted_at.is_(None),
+        )
         .order_by(SceneVideoAsset.scene_number)
     ).scalars().all()
     scene_videos: list[SceneVideoRef] | None = (
@@ -1201,6 +1204,7 @@ async def upload_scene_image(
         select(ImageAsset).where(
             ImageAsset.article_id == article_id,
             ImageAsset.scene_number == scene_number,
+            ImageAsset.deleted_at.is_(None),
         )
     ).scalar_one_or_none()
 
@@ -1321,7 +1325,11 @@ def export_article_zip(article_id: str, db: Session = Depends(get_db), current_u
 
         video_row = db.execute(
             select(VideoAsset)
-            .where(VideoAsset.article_id == article_id, VideoAsset.status == "ready")
+            .where(
+                VideoAsset.article_id == article_id,
+                VideoAsset.status == "ready",
+                VideoAsset.deleted_at.is_(None),
+            )
             .order_by(VideoAsset.created_at.desc())
             .limit(1)
         ).scalar_one_or_none()
@@ -1330,7 +1338,11 @@ def export_article_zip(article_id: str, db: Session = Depends(get_db), current_u
 
         image_rows = db.execute(
             select(ImageAsset)
-            .where(ImageAsset.article_id == article_id, ImageAsset.status == "ready")
+            .where(
+                ImageAsset.article_id == article_id,
+                ImageAsset.status == "ready",
+                ImageAsset.deleted_at.is_(None),
+            )
             .order_by(ImageAsset.scene_number)
         ).scalars().all()
         for img in image_rows:
@@ -1536,7 +1548,7 @@ def generate_video(
 @app.get("/audio/{audio_id}", dependencies=[Depends(check_api_key)])
 def get_audio(audio_id: str, db=Depends(get_db), current_user: Optional[User] = Depends(get_optional_user)):
     audio = db.get(AudioAsset, audio_id)
-    if not audio:
+    if not audio or audio.deleted_at is not None:
         raise HTTPException(status_code=404, detail="Audio not found")
     article = db.get(Article, audio.article_id)
     if article:
@@ -1549,7 +1561,7 @@ def get_audio(audio_id: str, db=Depends(get_db), current_user: Optional[User] = 
 @app.get("/image/{image_id}", dependencies=[Depends(check_api_key)])
 def get_image(image_id: str, db=Depends(get_db), current_user: Optional[User] = Depends(get_optional_user)):
     img = db.get(ImageAsset, image_id)
-    if not img:
+    if not img or img.deleted_at is not None:
         raise HTTPException(status_code=404, detail="Image not found")
     article = db.get(Article, img.article_id)
     if article:
@@ -1593,7 +1605,17 @@ def regenerate_stage(
         _check_user_task_capacity(current_user.id)
 
     if req.stage == "images":
-        db.execute(delete(ImageAsset).where(ImageAsset.article_id == article_id))
+        # Soft-delete existing image assets instead of hard-delete so audit
+        # trail + reprocess history survives across regenerations.
+        now = datetime.utcnow()
+        db.execute(
+            ImageAsset.__table__.update()
+            .where(
+                ImageAsset.article_id == article_id,
+                ImageAsset.deleted_at.is_(None),
+            )
+            .values(deleted_at=now)
+        )
         db.commit()
 
     existing = _video_tasks.get(article_id)
@@ -1621,7 +1643,7 @@ def regenerate_stage(
 @app.get("/video/{video_id}", dependencies=[Depends(check_api_key)])
 def get_video(video_id: str, db=Depends(get_db), current_user: Optional[User] = Depends(get_optional_user)):
     video = db.get(VideoAsset, video_id)
-    if not video:
+    if not video or video.deleted_at is not None:
         raise HTTPException(status_code=404, detail="Video not found")
     article = db.get(Article, video.article_id)
     if article:
@@ -1641,7 +1663,7 @@ def get_video(video_id: str, db=Depends(get_db), current_user: Optional[User] = 
 def get_scene_video_clip(scene_video_id: str, db=Depends(get_db), current_user: Optional[User] = Depends(get_optional_user)):
     """Download an individual animated scene clip."""
     sv = db.get(SceneVideoAsset, scene_video_id)
-    if not sv:
+    if not sv or sv.deleted_at is not None:
         raise HTTPException(status_code=404, detail="Scene video not found")
     article = db.get(Article, sv.article_id)
     if article:
