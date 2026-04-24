@@ -1178,14 +1178,14 @@ export default function App() {
   }
 
   async function startAudioFromPreview() {
-    if (!pkg?.article_id || !selectedCandidate) return
+    if (!pkg?.article_id || !pkg.source_id) return
     setError('')
     setLoading(true)
     setAudioJob(null)
     setStatusText('Queueing audio synthesis…')
     try {
       const payload: GenerateReq = {
-        source_id: selectedCandidate.source_id,
+        source_id: pkg.source_id,
         article_id: pkg.article_id,
         target_seconds: targetSeconds,
         n_scenes: nScenes,
