@@ -136,16 +136,34 @@ def _clear_auth_cookies(response: Response) -> None:
     response.delete_cookie(key="refresh_token", path="/auth/refresh")
 
 
-# ── Per-user task backpressure (Redis counter) ─────────────────────────────
+# ── Per-user task backpressure (Redis SET of active task IDs) ─────────────
+#
+# Each active task ID is stored in `user_tasks:{user_id}`. On capacity
+# checks we prune entries whose `task:{id}:owner` key has expired — that
+# way a worker crash can't permanently lock out the user, because the
+# owner key has a 24h TTL and the pruning is self-healing.
 
 _MAX_CONCURRENT_TASKS = int(os.getenv("MAX_CONCURRENT_TASKS_PER_USER", "10"))
+
+
+def _prune_user_tasks(r, user_id: str) -> int:
+    """Drop task IDs whose owner key has expired; return remaining count."""
+    key = f"user_tasks:{user_id}"
+    members = r.smembers(key)
+    if not members:
+        return 0
+    stale = [m for m in members if not r.exists(f"task:{m}:owner")]
+    if stale:
+        r.srem(key, *stale)
+    return r.scard(key)
 
 
 def _check_user_task_capacity(user_id: str) -> None:
     """Raise 429 if the user already has too many active tasks queued."""
     try:
-        count = _get_rl_redis().get(f"user_tasks:{user_id}")
-        if count and int(count) >= _MAX_CONCURRENT_TASKS:
+        r = _get_rl_redis()
+        active = _prune_user_tasks(r, user_id)
+        if active >= _MAX_CONCURRENT_TASKS:
             raise HTTPException(
                 status_code=429,
                 detail="Too many concurrent tasks — wait for existing jobs to complete",
@@ -156,11 +174,13 @@ def _check_user_task_capacity(user_id: str) -> None:
         pass  # fail open
 
 
-def _increment_user_task_count(user_id: str) -> None:
+def _register_user_task(user_id: str, task_id: str) -> None:
+    """Record a newly queued task under the user so capacity checks see it."""
     try:
         r = _get_rl_redis()
-        r.incr(f"user_tasks:{user_id}")
-        r.expire(f"user_tasks:{user_id}", 7200)  # 2h safety TTL
+        key = f"user_tasks:{user_id}"
+        r.sadd(key, task_id)
+        r.expire(key, 86400)  # matches task:{id}:owner TTL
     except Exception:
         pass
 
@@ -1121,8 +1141,6 @@ def generate_thumbnail_endpoint(
         _check_user_task_capacity(current_user.id)
 
     openai_key, _, _ = _resolve_user_keys(current_user, db)
-    if current_user:
-        _increment_user_task_count(current_user.id)
     task = celery_app.send_task(
         "generate_article_thumbnail",
         kwargs={
@@ -1133,6 +1151,8 @@ def generate_thumbnail_endpoint(
         },
     )
     _store_task_owner(task.id, current_user.id if current_user else None)
+    if current_user:
+        _register_user_task(current_user.id, task.id)
     return {"task_id": task.id, "status": "queued"}
 
 
@@ -1377,8 +1397,6 @@ def trigger_regenerate_script(
         _check_user_task_capacity(current_user.id)
 
     openai_key, _, _ = _resolve_user_keys(current_user, db)
-    if current_user:
-        _increment_user_task_count(current_user.id)
     task = celery_app.send_task(
         "regenerate_script_for_article",
         kwargs={
@@ -1388,6 +1406,8 @@ def trigger_regenerate_script(
         },
     )
     _store_task_owner(task.id, current_user.id if current_user else None)
+    if current_user:
+        _register_user_task(current_user.id, task.id)
     return {"task_id": task.id, "status": "queued"}
 
 
@@ -1477,8 +1497,6 @@ def prepare_article_endpoint(
     if not db.get(Source, req.source_id):
         raise HTTPException(status_code=404, detail="Unknown source_id")
     openai_key, _, _ = _resolve_user_keys(current_user, db)
-    if current_user:
-        _increment_user_task_count(current_user.id)
     task = celery_app.send_task(  # type: ignore[assignment]
         "prepare_article",
         kwargs={
@@ -1497,6 +1515,8 @@ def prepare_article_endpoint(
         },
     )
     _store_task_owner(task.id, current_user.id if current_user else None)
+    if current_user:
+        _register_user_task(current_user.id, task.id)
     return {"task_id": task.id, "status": "queued"}
 
 
@@ -1554,7 +1574,7 @@ def generate(
     _audio_tasks[task_key] = task.id
     _store_task_owner(task.id, current_user.id if current_user else None)
     if current_user:
-        _increment_user_task_count(current_user.id)
+        _register_user_task(current_user.id, task.id)
     return {"task_id": task.id, "status": "queued"}
 
 
@@ -1630,7 +1650,7 @@ def generate_video(
     _video_tasks[req.article_id] = task.id
     _store_task_owner(task.id, current_user.id if current_user else None)
     if current_user:
-        _increment_user_task_count(current_user.id)
+        _register_user_task(current_user.id, task.id)
     return {"task_id": task.id, "status": "queued", "render_mode": req.render_mode}
 
 
@@ -1727,7 +1747,7 @@ def regenerate_stage(
     _video_tasks[article_id] = task.id
     _store_task_owner(task.id, current_user.id if current_user else None)
     if current_user:
-        _increment_user_task_count(current_user.id)
+        _register_user_task(current_user.id, task.id)
     return {"task_id": task.id, "status": "queued", "stage": req.stage}
 
 

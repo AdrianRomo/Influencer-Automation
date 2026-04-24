@@ -132,16 +132,16 @@ def _article_lock(source_id: str, url: str, ttl: int = 120):
 
 @task_postrun.connect
 def _on_task_postrun(sender=None, task_id=None, kwargs=None, **_extra):
-    """Decrement the per-user active task counter on task completion."""
+    """Remove the finished task from the per-user active-task set."""
     import time as _t
     user_id = (kwargs or {}).get("user_id")
-    if user_id:
+    if user_id and task_id:
         try:
             r = _get_redis()
-            key = f"user_tasks:{user_id}"
-            count = r.decr(key)
-            if int(count) < 0:
-                r.set(key, "0")
+            r.srem(f"user_tasks:{user_id}", task_id)
+            # Clear the owner key too — capacity pruning uses its presence as
+            # the "task still alive" signal.
+            r.delete(f"task:{task_id}:owner")
         except Exception:
             pass
     # Record task duration
