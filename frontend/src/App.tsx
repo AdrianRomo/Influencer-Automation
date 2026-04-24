@@ -1831,17 +1831,37 @@ export default function App() {
                 )}
               </div>
             </div>
-            {pkg.audio && (
-              <div className="small" style={{ marginTop: 4 }}>
-                {fmtSeconds(pkg.audio.duration_seconds)}
-                {' · '}{pkg.audio.word_count?.toLocaleString()} words
-                {' · voice: '}<span className="code">{pkg.audio.voice_id}</span>
+            {pkg.audios && pkg.audios.length > 0 ? (
+              <div style={{ marginTop: 6, display: 'flex', flexDirection: 'column', gap: 10 }}>
+                {pkg.audios.map(a => (
+                  <div key={a.id}>
+                    <div className="small">
+                      <strong>{a.platform ?? 'default'}</strong>
+                      {' · '}{fmtSeconds(a.duration_seconds)}
+                      {' · '}{a.word_count?.toLocaleString()} words
+                      {' · voice: '}<span className="code">{a.voice_id}</span>
+                    </div>
+                    <audio controls className="audio-player">
+                      <source src={resolveAudioUrl(a.id)} type="audio/mpeg" />
+                    </audio>
+                  </div>
+                ))}
               </div>
-            )}
-            {audioDownloadUrl && (
-              <audio controls className="audio-player">
-                <source src={audioDownloadUrl} type="audio/mpeg" />
-              </audio>
+            ) : (
+              <>
+                {pkg.audio && (
+                  <div className="small" style={{ marginTop: 4 }}>
+                    {fmtSeconds(pkg.audio.duration_seconds)}
+                    {' · '}{pkg.audio.word_count?.toLocaleString()} words
+                    {' · voice: '}<span className="code">{pkg.audio.voice_id}</span>
+                  </div>
+                )}
+                {audioDownloadUrl && (
+                  <audio controls className="audio-player">
+                    <source src={audioDownloadUrl} type="audio/mpeg" />
+                  </audio>
+                )}
+              </>
             )}
             {pkg.analysis && <AnalysisCard analysis={pkg.analysis} />}
             {pkg.cost_summary && <CostPanel cost={pkg.cost_summary} />}
@@ -1891,9 +1911,40 @@ export default function App() {
           )}
 
           {/* Script */}
+          {/* Per-platform scripts (read-only, non-primary platforms) */}
+          {pkg.scripts && pkg.scripts.length > 1 && (
+            <Collapsible
+              title={`Platform scripts · ${pkg.scripts.length} platforms`}
+              defaultOpen={false}
+            >
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+                {pkg.scripts
+                  .slice()
+                  .sort((a, b) => (b.target_seconds ?? 0) - (a.target_seconds ?? 0))
+                  .map(s => (
+                    <div key={s.platform ?? s.text.slice(0, 16)} className="card" style={{ padding: 10 }}>
+                      <div className="small" style={{ marginBottom: 6 }}>
+                        <strong>{s.platform ?? 'default'}</strong>
+                        {' · '}target {s.target_seconds ?? '—'}s
+                        {' · '}{s.word_count} words
+                        {' · '}~{fmtSeconds(s.estimated_duration_seconds ?? null)}
+                      </div>
+                      <pre className="script-pre" style={{ maxHeight: 240, overflow: 'auto' }}>{s.text}</pre>
+                      <button
+                        className="secondary settings-btn"
+                        onClick={() => navigator.clipboard.writeText(s.text)
+                          .then(() => addToast('success', `${s.platform ?? 'script'} copied`))
+                          .catch(() => addToast('error', 'Clipboard access denied'))}
+                      >Copy</button>
+                    </div>
+                  ))}
+              </div>
+            </Collapsible>
+          )}
+
           {pkg.script && (
             <Collapsible
-              title={`Script · ${scriptEditing ? scriptDraft.split(/\s+/).filter(Boolean).length + ' words (editing)' : pkg.script.word_count + ' words'} · ${pkg.script.language}`}
+              title={`Script${pkg.script.platform ? ` · ${pkg.script.platform}` : ''} · ${scriptEditing ? scriptDraft.split(/\s+/).filter(Boolean).length + ' words (editing)' : pkg.script.word_count + ' words'} · ${pkg.script.language}`}
             >
               {!scriptEditing && (
                 <div className="script-toolbar">

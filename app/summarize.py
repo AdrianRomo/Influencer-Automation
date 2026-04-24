@@ -213,11 +213,17 @@ def make_tts_script(
 ) -> str:
     """
     Returns a narration-ready script aimed at ~target_seconds, always in Spanish by default.
-    Uses word-count targeting + up to 2 rewrite passes to hit range.
+
+    Forces the LLM toward the target word count via an explicit (min, max)
+    directive in the initial prompt, plus up to 3 corrective rewrite passes
+    that quote the measured word count so the model can adjust directionally.
     """
     model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
     target = target_words or _target_words(target_seconds, output_language)
     tol = tol_words or _tolerance_words(target_seconds, output_language)
+    # Tight band — ±tol may be generous for short targets; ±10% or ±tol (smaller) keeps us accurate.
+    tol = max(10, min(tol, int(round(target * 0.12))))
+    lo, hi = target - tol, target + tol
     src_hint = language_hint or "auto-detect"
     prompt = f"""TITLE: {title}
 
@@ -229,25 +235,44 @@ Input Language (hint): {src_hint}
 Output language:
 - Spanish ({output_language}) only.
 
-Length requirement:
-- Aim for about {target_seconds} seconds of narration.
-- Target word count: {target} words (acceptable range {target - tol} to {target + tol} words).
+LENGTH IS A HARD REQUIREMENT:
+- Write between {lo} and {hi} words (target {target}).
+- Count words carefully before finalizing.
+- Narration duration budget: ~{target_seconds} seconds at ~{int(round(target * 60 / max(target_seconds, 1)))} WPM.
+- If the article lacks content, expand with additional context, implications, or relevant background to reach the target — do NOT invent medical facts, but elaborate on what is there.
+- If the article has too much content, compress by dropping less-essential details. Never truncate mid-sentence.
 """
 
     script = _call_llm(SYSTEM_SCRIPT, prompt, model=model, temperature=0.3, api_key=api_key,
                        collector=collector, operation="script")
     wc = _count_words(script)
 
-    for _ in range(2):
-        if (target - tol) <= wc <= (target + tol):
+    for attempt in range(3):
+        if lo <= wc <= hi:
             break
 
-        direction = "shorten" if wc > (target + tol) else "expand"
-        rewrite_prompt = f"""Please {direction} the following Spanish TTS script to fit the target word count range.
+        if wc > hi:
+            direction, delta = "shorten", wc - target
+            guidance = f"Your current script is {wc} words — REMOVE about {delta} words of the least-essential detail."
+        else:
+            direction, delta = "expand", target - wc
+            guidance = (
+                f"Your current script is only {wc} words — ADD about {delta} more words "
+                "of relevant context (background, mechanism, implications, comparisons). "
+                "Do NOT invent facts. Stay faithful to the source."
+            )
+        rewrite_prompt = f"""Rewrite the Spanish TTS script to fit the target word count.
 
-TARGET RANGE: {target - tol} to {target + tol} words (target {target}).
-Do not add new facts. Preserve numbers/dates/dosages/units/drug names exactly.
-Keep it natural spoken narration. End with the brief medical disclaimer in Spanish.
+TARGET: {target} words. Acceptable range: {lo} to {hi} words.
+Current length: {wc} words ({direction} by ~{delta} words).
+
+{guidance}
+
+Rules:
+- Preserve numbers/dates/dosages/units/drug names exactly.
+- Keep it natural spoken narration.
+- End with the brief medical disclaimer in Spanish.
+- Output ONLY the finalized script, nothing else.
 
 SCRIPT:
 {script}
@@ -365,7 +390,10 @@ def make_tts_bundle(
         collector=collector,
     )
     wc = _count_words(script)
-    est = _estimate_seconds(wc, output_language)
+    # Prefer the caller's calibrated WPM over the language default so the
+    # estimate reflects the actual voice cadence.
+    eff_wpm = wpm_estimate or float(_pick_wpm(output_language))
+    est = int(round((wc / max(eff_wpm, 1)) * 60))
     scenes = make_storyboard(
         title, script,
         language_hint=language_hint,

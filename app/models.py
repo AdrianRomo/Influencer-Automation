@@ -72,6 +72,12 @@ class Article(Base):
     # Per-platform post captions + hashtags (generated after script)
     social_captions_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
+    # Per-platform tailored scripts — each entry is
+    # {script, word_count, target_seconds, estimated_duration, storyboard}.
+    # The "canonical" article.tts_script mirrors one of these (longest platform)
+    # so any legacy consumer keeps working.
+    platform_scripts_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+
     # Generation settings (set at prepare time, drive all downstream tasks)
     language: Mapped[str] = mapped_column(String(20), default="es-MX", nullable=False)
     selected_platforms: Mapped[list | None] = mapped_column(JSON, nullable=True)  # ["tiktok", "reels"]
@@ -117,6 +123,9 @@ class AudioAsset(Base):
 
     # Output
     file_path: Mapped[str] = mapped_column(String, nullable=False)
+
+    # Which platform this audio targets (None = legacy single-script era)
+    platform: Mapped[str | None] = mapped_column(String(50), nullable=True)
 
     # Observability
     status: Mapped[str] = mapped_column(String, default="created", nullable=False)  # created|ready|failed

@@ -259,6 +259,9 @@ def prepare_article(
     language: str | None = None,
     selected_platforms: list | None = None,
     animation_prompt: str | None = None,
+    voice_id: str | None = None,
+    voice_model_id: str | None = None,
+    voice_speed: float | None = None,
 ) -> dict:
     """Extract article content and generate script + storyboard WITHOUT audio synthesis.
 
@@ -282,12 +285,21 @@ def prepare_article(
 
         eff_language = language or os.getenv("TTS_OUTPUT_LANGUAGE", "es-MX")
 
-        # Cap target duration to the shortest selected platform's max_duration
+        # Per-platform targeting: each selected platform gets its own script
+        # sized to min(user_target, platform.max_duration). Platforms that land
+        # on the same effective duration share a single script to save tokens.
         eff_platforms = selected_platforms or ["tiktok"]
         from app.platforms import PROFILES as _PROFILES
-        _max_durs = [_PROFILES[p].max_duration for p in eff_platforms if p in _PROFILES]
-        if _max_durs:
-            target_seconds = min(target_seconds, min(_max_durs))
+        platform_targets: dict[str, int] = {}
+        for p in eff_platforms:
+            prof = _PROFILES.get(p)
+            if not prof:
+                continue
+            platform_targets[p] = min(target_seconds, prof.max_duration)
+        if not platform_targets:
+            platform_targets = {"tiktok": min(target_seconds, _PROFILES["tiktok"].max_duration)}
+        # User-facing summary uses the longest target (canonical script).
+        max_platform_target = max(platform_targets.values())
 
         article = Article(
             source_id=src.id, title=title, url=url, published_at=published_at,
@@ -328,28 +340,77 @@ def prepare_article(
             if not raw:
                 raw = fallback or title
 
-            wpm_estimate = float(_pick_wpm(eff_language))
-            target_words = _words_for_seconds(target_seconds, wpm_estimate)
-            tol_words = _words_for_seconds(TOLERANCE_SECONDS, wpm_estimate)
+            # Calibrated WPM: prefer the user's specific voice + model + speed
+            # observed history. Fall back to the language default only for a
+            # cold-start voice that has never been synthesized.
+            resolved_model_id = voice_model_id or os.getenv("ELEVENLABS_MODEL_ID", "eleven_multilingual_v2")
+            resolved_speed = _speed_key(voice_speed if voice_speed is not None else float(os.getenv("ELEVENLABS_SPEED", "1.0")))
+            wpm_estimate: float
+            if voice_id:
+                cal = db.get(VoiceCalibration, (voice_id, resolved_model_id, resolved_speed))
+                wpm_estimate = float(cal.wpm_estimate) if cal else float(_pick_wpm(eff_language))
+            else:
+                wpm_estimate = float(_pick_wpm(eff_language))
 
-            self.update_state(state="PROGRESS", meta={"stage": "scripting", "msg": "Generating script & storyboard…"})
-            bundle = make_tts_bundle(
-                title=title,
-                body=raw,
-                language_hint=src.language_hint,
-                target_seconds=target_seconds,
-                n_scenes=n_scenes,
-                target_words=target_words,
-                tol_words=tol_words,
-                wpm_estimate=wpm_estimate,
-                api_key=openai_api_key,
-                collector=collector,
-                output_language=eff_language,
-            )
+            # One script per unique effective duration (multiple platforms with
+            # the same duration share a script).
+            unique_targets = sorted(set(platform_targets.values()), reverse=True)
+            script_by_target: dict[int, dict] = {}
+            for idx, dur in enumerate(unique_targets, start=1):
+                target_words = _words_for_seconds(dur, wpm_estimate)
+                tol_words = max(10, int(round(target_words * 0.10)))
+                self.update_state(
+                    state="PROGRESS",
+                    meta={
+                        "stage": "scripting",
+                        "msg": f"Generating script {idx}/{len(unique_targets)} (~{dur}s, ~{target_words} words)…",
+                    },
+                )
+                bundle = make_tts_bundle(
+                    title=title,
+                    body=raw,
+                    language_hint=src.language_hint,
+                    target_seconds=dur,
+                    n_scenes=n_scenes,
+                    target_words=target_words,
+                    tol_words=tol_words,
+                    wpm_estimate=wpm_estimate,
+                    api_key=openai_api_key,
+                    collector=collector,
+                    output_language=eff_language,
+                )
+                wc = bundle.get("word_count") or len(bundle["script"].split())
+                script_by_target[dur] = {
+                    "script": bundle["script"],
+                    "word_count": wc,
+                    "target_seconds": dur,
+                    "estimated_duration_seconds": int(round((wc / max(wpm_estimate, 1)) * 60)),
+                    "scenes": bundle.get("scenes") or [],
+                    "total_duration_estimate": bundle.get("total_duration_estimate", 0),
+                }
 
-            script = bundle["script"]
-            scenes = bundle.get("scenes") or []
-            word_count = bundle.get("word_count") or len(script.split())
+            # Pack per-platform map: platform -> script payload (a reference
+            # back to the shared script-by-target entry).
+            platform_scripts: dict[str, dict] = {}
+            for platform_id, dur in platform_targets.items():
+                entry = script_by_target[dur]
+                platform_scripts[platform_id] = {
+                    "script": entry["script"],
+                    "word_count": entry["word_count"],
+                    "target_seconds": entry["target_seconds"],
+                    "estimated_duration_seconds": entry["estimated_duration_seconds"],
+                    "wpm_estimate": wpm_estimate,
+                    "storyboard": {
+                        "scenes": entry["scenes"],
+                        "total_duration_estimate": entry["total_duration_estimate"],
+                    },
+                }
+
+            # Canonical = longest-duration script (backwards-compatible surface).
+            primary = script_by_target[max_platform_target]
+            script = primary["script"]
+            scenes = primary["scenes"]
+            word_count = primary["word_count"]
 
             article.raw_text = raw
             article.tts_script = script
@@ -357,8 +418,9 @@ def prepare_article(
             article.summary_model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
             article.storyboard_json = {
                 "scenes": scenes,
-                "total_duration_estimate": bundle.get("total_duration_estimate", 0),
+                "total_duration_estimate": primary["total_duration_estimate"],
             }
+            article.platform_scripts_json = platform_scripts
             db.commit()
 
             try:
@@ -389,6 +451,223 @@ def prepare_article(
                 "word_count": word_count,
                 "estimated_duration_seconds": estimated_duration,
             }
+
+
+def _synthesize_one_script(
+    task_self,
+    *,
+    script: str,
+    word_count: int,
+    target_seconds: int,
+    used_voice_id: str,
+    model_id: str,
+    output_format: str,
+    audio_dir: str,
+    output_path: str,
+    eff_language: str,
+    elevenlabs_api_key: str | None,
+    openai_api_key: str | None,
+    collector: "UsageCollector",
+    progress_label: str = "",
+) -> tuple[str, float, str, int]:
+    """Synthesize one script to one audio file, tolerating up to MAX_TTS_ATTEMPTS.
+
+    Rewrites toward MIN..MAX duration between retries. Returns
+    (final_path, duration_seconds, final_script, final_word_count).
+    """
+    # Relative window expressed as a fraction of the script's *own* target
+    # instead of the global MIN/MAX constants, so a 60s script isn't judged
+    # against the same bounds as a 180s one.
+    tol = max(10.0, target_seconds * 0.15)
+    accept_min = target_seconds - tol
+    accept_max = target_seconds + tol
+    duration: float | None = None
+    last_error: str | None = None
+    final_path = output_path
+
+    for attempt in range(1, MAX_TTS_ATTEMPTS + 1):
+        label = f"{progress_label} " if progress_label else ""
+        task_self.update_state(
+            state="PROGRESS",
+            meta={
+                "stage": "synthesizing",
+                "msg": f"{label}Synthesizing audio (attempt {attempt}/{MAX_TTS_ATTEMPTS})…",
+            },
+        )
+        tmp_path: str | None = None
+        accepted = False
+        try:
+            audio_bytes = synthesize(
+                script, voice_id=used_voice_id, model_id=model_id,
+                output_format=output_format, api_key=elevenlabs_api_key,
+                collector=collector,
+                language_code=eff_language[:2] if eff_language else None,
+            )
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3", dir=audio_dir) as tmp:
+                tmp.write(audio_bytes)
+                tmp_path = tmp.name
+
+            duration = _mp3_duration_seconds(tmp_path)
+
+            if accept_min <= duration <= accept_max:
+                os.replace(tmp_path, final_path)
+                tmp_path = None
+                accepted = True
+                break
+
+            if attempt >= MAX_TTS_ATTEMPTS:
+                # Accept anyway on last attempt to avoid total failure.
+                os.replace(tmp_path, final_path)
+                tmp_path = None
+                accepted = True
+                break
+
+            wc = word_count or len(script.split())
+            desired = target_seconds
+            target_wc = max(30, int(round(wc * (desired / max(duration, 1)))))
+            script = rewrite_to_target_words(
+                script, target_words=target_wc, tol_words=20,
+                api_key=openai_api_key, collector=collector,
+            )
+            word_count = len(script.split())
+        except Exception as e:
+            last_error = str(e)
+            duration = None
+        finally:
+            if tmp_path and not accepted:
+                try:
+                    os.remove(tmp_path)
+                except Exception:
+                    pass
+
+    if duration is None:
+        raise RuntimeError(f"TTS failed after retries. error={last_error}")
+    return final_path, float(duration), script, int(word_count)
+
+
+def _synthesize_per_platform(
+    task_self,
+    db,
+    article: Article,
+    platform_scripts: dict,
+    *,
+    used_voice_id: str,
+    model_id: str,
+    output_format: str,
+    speed: float,
+    eff_language: str,
+    audio_dir: str,
+    openai_api_key: str | None,
+    elevenlabs_api_key: str | None,
+    collector: "UsageCollector",
+) -> dict:
+    """Synthesize one audio per unique script; fan-out AudioAsset rows per platform."""
+    # Group platforms by script text so we only hit TTS once per unique text.
+    groups: dict[str, list[str]] = {}
+    for platform_id, payload in platform_scripts.items():
+        txt = (payload or {}).get("script") or ""
+        if not txt:
+            continue
+        groups.setdefault(txt, []).append(platform_id)
+
+    if not groups:
+        raise RuntimeError("platform_scripts_json has no usable entries")
+
+    audios: list[dict] = []
+    total_groups = len(groups)
+    for idx, (script_text, platform_ids) in enumerate(groups.items(), start=1):
+        # Target duration = the script's declared target (all platforms in the
+        # group share the same target since we grouped by text).
+        first_payload = platform_scripts[platform_ids[0]]
+        target_seconds = int(first_payload.get("target_seconds") or 180)
+        word_count = int(first_payload.get("word_count") or len(script_text.split()))
+
+        joined = "+".join(sorted(platform_ids))
+        out_path = os.path.join(audio_dir, f"{article.id}_{used_voice_id}_{joined}.mp3")
+        final_path, duration, final_script, final_wc = _synthesize_one_script(
+            task_self,
+            script=script_text,
+            word_count=word_count,
+            target_seconds=target_seconds,
+            used_voice_id=used_voice_id,
+            model_id=model_id,
+            output_format=output_format,
+            audio_dir=audio_dir,
+            output_path=out_path,
+            eff_language=eff_language,
+            elevenlabs_api_key=elevenlabs_api_key,
+            openai_api_key=openai_api_key,
+            collector=collector,
+            progress_label=f"[{idx}/{total_groups} {joined}]",
+        )
+
+        # Update calibration EMA from the observed WPM of this clip.
+        try:
+            observed_wpm = (final_wc / max(duration, 1)) * 60.0
+            cal = db.get(VoiceCalibration, (used_voice_id, model_id, speed))
+            if not cal:
+                cal = VoiceCalibration(
+                    voice_id=used_voice_id, model_id=model_id, speed=speed,
+                    wpm_estimate=observed_wpm, samples=1,
+                )
+                db.add(cal)
+            else:
+                cal.wpm_estimate = (1 - CAL_ALPHA) * cal.wpm_estimate + CAL_ALPHA * observed_wpm
+                cal.samples += 1
+        except Exception as exc:
+            logger.warning("Voice calibration update failed (non-fatal): %s", exc)
+
+        # Persist the (possibly rewritten) script back into platform_scripts_json
+        # so the frontend shows the exact text that matches the audio.
+        for pid in platform_ids:
+            entry = platform_scripts.get(pid) or {}
+            entry["script"] = final_script
+            entry["word_count"] = final_wc
+            entry["estimated_duration_seconds"] = int(round(duration))
+            platform_scripts[pid] = entry
+
+        # One AudioAsset per platform, all pointing at the shared file.
+        for pid in platform_ids:
+            audio = AudioAsset(
+                article_id=article.id,
+                voice_id=used_voice_id,
+                model_id=model_id,
+                output_format=output_format,
+                file_path=final_path,
+                tts_provider="elevenlabs",
+                target_seconds=target_seconds,
+                estimated_seconds=int(round(duration)),
+                word_count=final_wc,
+                platform=pid,
+                status="ready",
+            )
+            db.add(audio)
+            db.flush()
+            audios.append({
+                "audio_id": audio.id,
+                "platform": pid,
+                "duration_seconds": duration,
+                "word_count": final_wc,
+                "file_path": final_path,
+            })
+
+    # Keep the canonical tts_script in sync with the longest-duration platform.
+    longest_platform = max(platform_scripts.items(), key=lambda kv: (kv[1] or {}).get("target_seconds", 0))[0]
+    article.tts_script = platform_scripts[longest_platform]["script"]
+    article.platform_scripts_json = dict(platform_scripts)  # force SQLAlchemy JSON diff
+    db.commit()
+
+    collector.flush(db)
+
+    return {
+        "article_id": article.id,
+        "audios": audios,
+        # Back-compat: primary audio = longest-duration platform
+        "audio_id": next((a["audio_id"] for a in audios if a["platform"] == longest_platform), None),
+        "duration_seconds": next((a["duration_seconds"] for a in audios if a["platform"] == longest_platform), None),
+        "title": article.title,
+        "url": article.url,
+    }
 
 
 @celery_app.task(name="generate_latest_for_source", bind=True)
@@ -437,6 +716,22 @@ def generate_latest_for_source(
             eff_language = language or article.language or os.getenv("TTS_OUTPUT_LANGUAGE", "es-MX")
             collector = UsageCollector(article_id=article.id, user_id=user_id)
             logger.info("TTS-only run for pre-prepared article id=%s words=%d", article.id, word_count)
+
+            # Per-platform path: synthesize one audio per unique script.
+            platform_scripts = article.platform_scripts_json or {}
+            if platform_scripts:
+                return _synthesize_per_platform(
+                    self, db, article, platform_scripts,
+                    used_voice_id=used_voice_id,
+                    model_id=model_id,
+                    output_format=output_format,
+                    speed=speed,
+                    eff_language=eff_language,
+                    audio_dir=audio_dir,
+                    openai_api_key=openai_api_key,
+                    elevenlabs_api_key=elevenlabs_api_key,
+                    collector=collector,
+                )
         else:
             # ── Full path: obtain article + extract content + generate script ─
             if article_url:
@@ -698,12 +993,26 @@ def generate_video_for_article(
             if not audio:
                 raise ValueError(f"Unknown audio_asset_id: {audio_asset_id}")
         else:
+            # Prefer an audio that was synthesized specifically for THIS platform;
+            # fall back to any ready audio when the article was generated before
+            # per-platform audio existed.
             audio = db.execute(
                 select(AudioAsset)
-                .where(AudioAsset.article_id == article_id, AudioAsset.status == "ready")
+                .where(
+                    AudioAsset.article_id == article_id,
+                    AudioAsset.status == "ready",
+                    AudioAsset.platform == platform,
+                )
                 .order_by(AudioAsset.created_at.desc())
                 .limit(1)
             ).scalar_one_or_none()
+            if not audio:
+                audio = db.execute(
+                    select(AudioAsset)
+                    .where(AudioAsset.article_id == article_id, AudioAsset.status == "ready")
+                    .order_by(AudioAsset.created_at.desc())
+                    .limit(1)
+                ).scalar_one_or_none()
         if not audio:
             raise RuntimeError("No ready audio asset — run audio generation first")
         if not os.path.exists(audio.file_path):
@@ -971,10 +1280,21 @@ def generate_animated_video_for_article(
         else:
             audio = db.execute(
                 select(AudioAsset)
-                .where(AudioAsset.article_id == article_id, AudioAsset.status == "ready")
+                .where(
+                    AudioAsset.article_id == article_id,
+                    AudioAsset.status == "ready",
+                    AudioAsset.platform == platform,
+                )
                 .order_by(AudioAsset.created_at.desc())
                 .limit(1)
             ).scalar_one_or_none()
+            if not audio:
+                audio = db.execute(
+                    select(AudioAsset)
+                    .where(AudioAsset.article_id == article_id, AudioAsset.status == "ready")
+                    .order_by(AudioAsset.created_at.desc())
+                    .limit(1)
+                ).scalar_one_or_none()
         if not audio:
             raise RuntimeError("No ready audio asset — run audio generation first")
         if not os.path.exists(audio.file_path):

@@ -180,6 +180,7 @@ export type AudioAssetRef = {
   word_count?: number | null
   voice_id: string
   model_id: string
+  platform?: string | null
 }
 
 export type ScriptAsset = {
@@ -188,6 +189,8 @@ export type ScriptAsset = {
   word_count: number
   estimated_duration_seconds?: number | null
   model?: string | null
+  target_seconds?: number | null
+  platform?: string | null
 }
 
 export type ImageAssetRef = {
@@ -278,7 +281,9 @@ export type ContentPackage = {
   animation_prompt?: string | null
   thumbnail_url?: string | null
   script?: ScriptAsset | null
+  scripts?: ScriptAsset[] | null
   audio?: AudioAssetRef | null
+  audios?: AudioAssetRef[] | null
   storyboard?: Storyboard | null
   captions?: CaptionEntry[] | null
   visual_prompts?: VisualPromptEntry[] | null

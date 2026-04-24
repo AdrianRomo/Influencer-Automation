@@ -51,6 +51,8 @@ def _detect_current_rev(inspector) -> str | None:
             ix["name"] == "ux_articles_source_url_live"
             for ix in inspector.get_indexes("articles")
         )),
+        ("013", lambda: "platform_scripts_json" in articles_cols
+                        and "platform" in {c["name"] for c in inspector.get_columns("audio_assets")}),
     ]
 
     stamp = None

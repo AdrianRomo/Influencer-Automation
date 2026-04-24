@@ -113,6 +113,7 @@ class AudioAssetRef(BaseModel):
     word_count: Optional[int] = None
     voice_id: str
     model_id: str
+    platform: Optional[str] = None
 
 
 class ScriptAsset(BaseModel):
@@ -121,6 +122,8 @@ class ScriptAsset(BaseModel):
     word_count: int
     estimated_duration_seconds: Optional[float] = None
     model: Optional[str] = None
+    target_seconds: Optional[int] = None
+    platform: Optional[str] = None
 
 
 class ImageAssetRef(BaseModel):
@@ -193,7 +196,9 @@ class ContentPackage(BaseModel):
     animation_prompt: Optional[str] = None
     thumbnail_url: Optional[str] = None
     script: Optional[ScriptAsset] = None
+    scripts: Optional[List[ScriptAsset]] = None  # one per selected platform
     audio: Optional[AudioAssetRef] = None
+    audios: Optional[List[AudioAssetRef]] = None  # one per selected platform
     storyboard: Optional[Storyboard] = None
     captions: Optional[List[CaptionEntry]] = None
     visual_prompts: Optional[List[VisualPromptEntry]] = None

@@ -901,21 +901,61 @@ def get_article_package(article_id: str, db=Depends(get_db), current_user: Optio
         raise HTTPException(status_code=404, detail="Article not found")
     _assert_article_owner(article, current_user)
 
-    audio_ref: AudioAssetRef | None = None
-    audio_row = _latest_audio(article_id, db)
-    if audio_row:
-        audio_ref = AudioAssetRef(
-            id=audio_row.id,
-            download_url=f"/audio/{audio_row.id}",
-            duration_seconds=audio_row.estimated_seconds,
-            format=audio_row.output_format,
-            word_count=audio_row.word_count,
-            voice_id=audio_row.voice_id,
-            model_id=audio_row.model_id,
+    # All ready audios for this article, grouped by platform.
+    audio_rows = db.execute(
+        select(AudioAsset)
+        .where(
+            AudioAsset.article_id == article_id,
+            AudioAsset.status == "ready",
+            AudioAsset.deleted_at.is_(None),
+        )
+        .order_by(AudioAsset.created_at.desc())
+    ).scalars().all()
+
+    def _audio_to_ref(a: AudioAsset) -> AudioAssetRef:
+        return AudioAssetRef(
+            id=a.id,
+            download_url=f"/audio/{a.id}",
+            duration_seconds=a.estimated_seconds,
+            format=a.output_format,
+            word_count=a.word_count,
+            voice_id=a.voice_id,
+            model_id=a.model_id,
+            platform=a.platform,
         )
 
+    audios_list: list[AudioAssetRef] = [_audio_to_ref(a) for a in audio_rows]
+
+    # Canonical audio = longest-duration platform's audio when present.
+    audio_ref: AudioAssetRef | None = None
+    if audios_list:
+        audio_ref = max(audios_list, key=lambda a: a.duration_seconds or 0)
+
+    # Script list: one per platform from platform_scripts_json; fall back to
+    # the legacy single-script case.
+    scripts_list: list[ScriptAsset] = []
+    platform_scripts = (article.platform_scripts_json or {}) if hasattr(article, "platform_scripts_json") else {}
+    for platform_id, entry in (platform_scripts or {}).items():
+        text = (entry or {}).get("script") or ""
+        if not text:
+            continue
+        audio_for_platform = next((a for a in audios_list if a.platform == platform_id), None)
+        actual = audio_for_platform.duration_seconds if audio_for_platform else None
+        scripts_list.append(ScriptAsset(
+            text=text,
+            language=article.script_language or "es-MX",
+            word_count=int(entry.get("word_count") or _count_words(text)),
+            estimated_duration_seconds=actual or entry.get("estimated_duration_seconds"),
+            model=article.summary_model,
+            target_seconds=int(entry.get("target_seconds") or 0) or None,
+            platform=platform_id,
+        ))
+
     script_asset: ScriptAsset | None = None
-    if article.tts_script:
+    if scripts_list:
+        # Primary script = longest target duration
+        script_asset = max(scripts_list, key=lambda s: s.target_seconds or 0)
+    elif article.tts_script:
         wc = _count_words(article.tts_script)
         actual_duration = audio_ref.duration_seconds if audio_ref else None
         script_asset = ScriptAsset(
@@ -1052,7 +1092,9 @@ def get_article_package(article_id: str, db=Depends(get_db), current_user: Optio
         animation_prompt=article.animation_prompt,
         thumbnail_url=f"/thumbnail/{article.id}" if article.thumbnail_path else None,
         script=script_asset,
+        scripts=scripts_list or None,
         audio=audio_ref,
+        audios=audios_list or None,
         storyboard=storyboard,
         captions=captions,
         visual_prompts=visual_prompts,
@@ -1496,7 +1538,10 @@ def prepare_article_endpoint(
 
     if not db.get(Source, req.source_id):
         raise HTTPException(status_code=404, detail="Unknown source_id")
-    openai_key, _, _ = _resolve_user_keys(current_user, db)
+    openai_key, _, el_voice = _resolve_user_keys(current_user, db)
+    # Model + speed drive the VoiceCalibration lookup inside the task.
+    el_model = os.getenv("ELEVENLABS_MODEL_ID", "eleven_multilingual_v2")
+    el_speed = float(os.getenv("ELEVENLABS_SPEED", "1.0"))
     task = celery_app.send_task(  # type: ignore[assignment]
         "prepare_article",
         kwargs={
@@ -1512,6 +1557,9 @@ def prepare_article_endpoint(
             "language": req.language,
             "selected_platforms": req.selected_platforms,
             "animation_prompt": req.animation_prompt,
+            "voice_id": el_voice,
+            "voice_model_id": el_model,
+            "voice_speed": el_speed,
         },
     )
     _store_task_owner(task.id, current_user.id if current_user else None)
