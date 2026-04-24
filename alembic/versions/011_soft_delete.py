@@ -24,7 +24,7 @@ def _existing_cols(conn, table: str) -> set[str]:
     if conn.dialect.name == "sqlite":
         return {r[1] for r in conn.execute(sa.text(f"PRAGMA table_info({table})")).fetchall()}
     return {
-        r["column_name"]
+        r[0]
         for r in conn.execute(
             sa.text(
                 "SELECT column_name FROM information_schema.columns WHERE table_name=:t"
