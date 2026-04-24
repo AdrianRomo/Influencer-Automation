@@ -5,6 +5,7 @@ import io
 import json
 import logging
 import os
+import re
 import zipfile
 from collections import defaultdict
 from contextlib import asynccontextmanager
@@ -290,15 +291,24 @@ app = FastAPI(title="Medical Content Generator", lifespan=lifespan)
 _cors_origins = ["http://localhost:5173", "http://127.0.0.1:5173"]
 _domain = os.getenv("DOMAIN", "").strip()
 if _domain:
-    _cors_origins.append(f"https://autonarrator.{_domain}")
-    _cors_origins.append(f"http://autonarrator.{_domain}")
+    for host in ("autonarrator", "influencer"):
+        _cors_origins.append(f"https://{host}.{_domain}")
+        _cors_origins.append(f"http://{host}.{_domain}")
+
+# Allow any subdomain of the configured DOMAIN over http/https — tolerates
+# alt hostnames (www., staging., etc.) without code changes.
+_cors_regex = (
+    rf"^https?://([a-zA-Z0-9-]+\.)?{re.escape(_domain)}$"
+    if _domain else None
+)
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_cors_origins,
+    allow_origin_regex=_cors_regex,
     allow_credentials=True,
     allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
-    allow_headers=["Content-Type", "Authorization", "X-API-Key"],
+    allow_headers=["Content-Type", "Authorization", "X-API-Key", "X-Correlation-ID"],
 )
 
 
