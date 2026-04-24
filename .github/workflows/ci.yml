@@ -41,9 +41,9 @@ jobs:
 
       - name: Run pytest
         env:
-          DATABASE_URL: sqlite:///:memory:
-          CELERY_BROKER_URL: memory://
-          CELERY_RESULT_BACKEND: cache+memory://
+          DATABASE_URL: "sqlite:///:memory:"
+          CELERY_BROKER_URL: "memory://"
+          CELERY_RESULT_BACKEND: "cache+memory://"
           SECRET_KEY: ci-test-secret-key-padding-xxxxxxxxxxxx
           OPENAI_API_KEY: sk-ci-test
           ELEVENLABS_API_KEY: el-ci-test
