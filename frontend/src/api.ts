@@ -239,6 +239,38 @@ export function resolveThumbnailUrl(articleId: string): string {
   return `${API_BASE}/thumbnail/${articleId}`
 }
 
+export function startGenerateThumbnail(
+  articleId: string,
+  prompt?: string | null,
+): Promise<{ task_id: string; status: string }> {
+  return http(`/articles/${encodeURIComponent(articleId)}/thumbnail`, {
+    method: 'POST',
+    body: JSON.stringify({ prompt: prompt?.trim() || null }),
+  })
+}
+
+export async function uploadThumbnail(
+  articleId: string,
+  file: File,
+): Promise<{ article_id: string; thumbnail_url: string }> {
+  const headers: Record<string, string> = {}
+  if (_jwtToken) headers['Authorization'] = `Bearer ${_jwtToken}`
+  else if (_apiKey) headers['X-API-Key'] = _apiKey
+
+  const form = new FormData()
+  form.append('file', file)
+
+  const res = await fetch(
+    `${API_BASE}/articles/${encodeURIComponent(articleId)}/thumbnail/upload`,
+    { method: 'POST', credentials: 'include', headers, body: form },
+  )
+  if (!res.ok) {
+    const text = await res.text().catch(() => '')
+    throw new Error(`HTTP ${res.status} ${res.statusText}${text ? `: ${text}` : ''}`)
+  }
+  return res.json()
+}
+
 export function resolveCaptionUrl(articleId: string, format: 'srt' | 'vtt'): string {
   return `${API_BASE}/articles/${articleId}/captions.${format}`
 }

@@ -380,21 +380,6 @@ def prepare_article(
             except Exception as exc:
                 logger.warning("Social caption generation failed (non-fatal): %s", exc)
 
-            try:
-                from app.image_gen import generate_thumbnail as _gen_thumb
-                self.update_state(state="PROGRESS", meta={"stage": "thumbnail", "msg": "Generating thumbnail…"})
-                image_dir = os.getenv("IMAGE_DIR", "/data/images")
-                os.makedirs(image_dir, exist_ok=True)
-                first_scene_prompt = scenes[0].get("visual_prompt") if scenes else None
-                thumb_bytes = _gen_thumb(title, scene_prompt=first_scene_prompt, api_key=openai_api_key, collector=collector)
-                thumb_path = os.path.join(image_dir, f"{article.id}_thumbnail.png")
-                with open(thumb_path, "wb") as fh:
-                    fh.write(thumb_bytes)
-                article.thumbnail_path = thumb_path
-                db.commit()
-            except Exception as exc:
-                logger.warning("Thumbnail generation failed (non-fatal): %s", exc)
-
             collector.flush(db)
 
             estimated_duration = int(round(word_count / (wpm_estimate / 60.0)))
@@ -1283,3 +1268,51 @@ def generate_animated_video_for_article(
                     os.remove(srt_path)
                 except OSError:
                     pass
+
+
+@celery_app.task(name="generate_article_thumbnail", bind=True)
+def generate_article_thumbnail(
+    self,
+    article_id: str,
+    prompt: str | None = None,
+    openai_api_key: str | None = None,
+    user_id: str | None = None,
+) -> dict:
+    """Generate a cover/thumbnail image for an already-prepared article.
+
+    When ``prompt`` is provided, it overrides the default template-based prompt
+    so the user can describe the cover they want.
+    """
+    from app.image_gen import generate_thumbnail as _gen_thumb
+    with SessionLocal() as db:
+        article = db.get(Article, article_id)
+        if not article:
+            raise ValueError(f"Unknown article_id: {article_id}")
+
+        collector = UsageCollector(article_id=article.id, user_id=user_id)
+        self.update_state(state="PROGRESS", meta={"stage": "thumbnail", "msg": "Generating thumbnail…"})
+
+        scene_prompt = None
+        if not prompt and article.storyboard_json:
+            scenes = (article.storyboard_json or {}).get("scenes") or []
+            if scenes:
+                scene_prompt = scenes[0].get("visual_prompt")
+
+        thumb_bytes = _gen_thumb(
+            article.title or "Untitled",
+            scene_prompt=scene_prompt,
+            custom_prompt=prompt,
+            api_key=openai_api_key,
+            collector=collector,
+        )
+
+        image_dir = os.getenv("IMAGE_DIR", "/data/images")
+        os.makedirs(image_dir, exist_ok=True)
+        thumb_path = os.path.join(image_dir, f"{article.id}_thumbnail.png")
+        with open(thumb_path, "wb") as fh:
+            fh.write(thumb_bytes)
+        article.thumbnail_path = thumb_path
+        db.commit()
+        collector.flush(db)
+
+        return {"article_id": article.id, "thumbnail_url": f"/thumbnail/{article.id}"}

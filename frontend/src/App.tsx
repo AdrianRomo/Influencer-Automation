@@ -11,6 +11,7 @@ import {
   resolveImageUrl, resolveThumbnailUrl, resolveVideoUrl, setApiKey, startGenerate,
   startGenerateVideo, startRegenerateScript, uploadSceneImage, register, login, getMe,
   getUserKeys, saveUserKeys, setAuthToken, clearAuthToken, setRefreshToken,
+  startGenerateThumbnail, uploadThumbnail,
 } from './api'
 
 // ── Helpers ────────────────────────────────────────────────────────────────
@@ -695,6 +696,13 @@ export default function App() {
   const [scriptSaveError, setScriptSaveError] = useState('')
   const [regenScriptLoading, setRegenScriptLoading] = useState(false)
 
+  // ── Thumbnail generation ───────────────────────────────────────────────
+  const [thumbPrompt, setThumbPrompt] = useState('')
+  const [thumbLoading, setThumbLoading] = useState(false)
+  const [thumbError, setThumbError] = useState('')
+  const [thumbCacheBust, setThumbCacheBust] = useState(0)
+  const thumbFileInputRef = useRef<HTMLInputElement | null>(null)
+
   // ── Article picker flow ──────────────────────────────────────────────────
   type FlowStep = 'pick' | 'configure'
   const [flowStep, setFlowStep] = useState<FlowStep>('pick')
@@ -1319,6 +1327,58 @@ export default function App() {
     })
   }
 
+  // ── Thumbnail ─────────────────────────────────────────────────────────────
+
+  async function handleGenerateThumbnail() {
+    if (!articleId) return
+    setThumbLoading(true)
+    setThumbError('')
+    try {
+      const resp = await startGenerateThumbnail(articleId, thumbPrompt || null)
+      pollThumbnail(resp.task_id)
+    } catch (e: unknown) {
+      setThumbLoading(false)
+      setThumbError(String((e as Error)?.message ?? e))
+    }
+  }
+
+  function pollThumbnail(taskId: string) {
+    jobStatus(taskId).then(s => {
+      if (s.state === 'SUCCESS') {
+        setThumbLoading(false)
+        setThumbCacheBust(Date.now())
+        if (articleId) fetchPackage(articleId)
+        addToast('success', 'Thumbnail ready')
+      } else if (s.state === 'FAILURE') {
+        setThumbLoading(false)
+        setThumbError(s.error || 'Thumbnail generation failed')
+      } else {
+        window.setTimeout(() => pollThumbnail(taskId), 2500)
+      }
+    }).catch(e => {
+      setThumbLoading(false)
+      setThumbError(String((e as Error)?.message ?? e))
+    })
+  }
+
+  async function handleUploadThumbnail(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0]
+    e.target.value = ''
+    if (!file || !articleId) return
+    setThumbLoading(true)
+    setThumbError('')
+    try {
+      await uploadThumbnail(articleId, file)
+      setThumbCacheBust(Date.now())
+      if (articleId) fetchPackage(articleId)
+      addToast('success', 'Thumbnail uploaded')
+    } catch (err: unknown) {
+      setThumbError(String((err as Error)?.message ?? err))
+    } finally {
+      setThumbLoading(false)
+    }
+  }
+
   // ── Derived ───────────────────────────────────────────────────────────────
 
   const articleId = pkg?.article_id ?? (audioJob?.result?.article_id as string | undefined)
@@ -1706,25 +1766,70 @@ export default function App() {
                   </div>
                 )}
               </div>
-              {pkg.thumbnail_url && (
-                <div className="thumbnail-wrap">
-                  <a href={resolveThumbnailUrl(pkg.article_id)} target="_blank" rel="noreferrer">
-                    <img
-                      src={resolveThumbnailUrl(pkg.article_id)}
-                      alt="Thumbnail"
-                      className="article-thumbnail"
+              <div className="thumbnail-wrap">
+                {pkg.thumbnail_url ? (
+                  <>
+                    <a href={`${resolveThumbnailUrl(pkg.article_id)}?t=${thumbCacheBust}`} target="_blank" rel="noreferrer">
+                      <img
+                        src={`${resolveThumbnailUrl(pkg.article_id)}?t=${thumbCacheBust}`}
+                        alt="Thumbnail"
+                        className="article-thumbnail"
+                      />
+                    </a>
+                    <a
+                      href={`${resolveThumbnailUrl(pkg.article_id)}?t=${thumbCacheBust}`}
+                      className="dl-btn dl-btn-sm"
+                      download="thumbnail.png"
+                      style={{ marginTop: 4 }}
+                    >
+                      Download
+                    </a>
+                  </>
+                ) : (
+                  <div className="thumbnail-placeholder small" style={{ color: '#6b7280' }}>
+                    No thumbnail yet
+                  </div>
+                )}
+                {pkg.script && (
+                  <div className="thumbnail-controls" style={{ marginTop: 8, display: 'flex', flexDirection: 'column', gap: 6 }}>
+                    <textarea
+                      value={thumbPrompt}
+                      onChange={e => setThumbPrompt(e.target.value)}
+                      placeholder="Optional prompt — describe the cover you want"
+                      rows={2}
+                      maxLength={900}
+                      disabled={thumbLoading}
+                      style={{ fontSize: 12, resize: 'vertical' }}
                     />
-                  </a>
-                  <a
-                    href={resolveThumbnailUrl(pkg.article_id)}
-                    className="dl-btn dl-btn-sm"
-                    download="thumbnail.png"
-                    style={{ marginTop: 4 }}
-                  >
-                    Download
-                  </a>
-                </div>
-              )}
+                    <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+                      <button
+                        type="button"
+                        className="secondary settings-btn"
+                        onClick={handleGenerateThumbnail}
+                        disabled={thumbLoading}
+                      >
+                        {thumbLoading ? 'Working…' : pkg.thumbnail_url ? 'Regenerate' : 'Generate Thumbnail'}
+                      </button>
+                      <button
+                        type="button"
+                        className="secondary settings-btn"
+                        onClick={() => thumbFileInputRef.current?.click()}
+                        disabled={thumbLoading}
+                      >
+                        Upload
+                      </button>
+                      <input
+                        ref={thumbFileInputRef}
+                        type="file"
+                        accept="image/png,image/jpeg,image/webp"
+                        onChange={handleUploadThumbnail}
+                        style={{ display: 'none' }}
+                      />
+                    </div>
+                    {thumbError && <div className="error-text small">{thumbError}</div>}
+                  </div>
+                )}
+              </div>
             </div>
             {pkg.audio && (
               <div className="small" style={{ marginTop: 4 }}>

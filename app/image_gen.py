@@ -89,17 +89,25 @@ def generate_scene_image(
 def generate_thumbnail(
     title: str,
     scene_prompt: str | None = None,
+    custom_prompt: str | None = None,
     api_key: str | None = None,
     collector: "UsageCollector | None" = None,
 ) -> bytes:
-    """Generate a DALL-E 3 cover/thumbnail image for the article."""
-    topic = title[:200]
-    visual_hint = f" Visual reference: {scene_prompt[:150]}." if scene_prompt else ""
-    prompt = (
-        f"Eye-catching social media cover image for a medical health video about: {topic}.{visual_hint} "
-        "Professional photorealistic healthcare aesthetic. Cinematic lighting. "
-        "No text, no watermarks, no logos. Clean composition."
-    )[:900]
+    """Generate a DALL-E 3 cover/thumbnail image for the article.
+
+    When ``custom_prompt`` is supplied, it replaces the template-based prompt
+    (still safety-prefixed) so users can describe the cover they want.
+    """
+    if custom_prompt and custom_prompt.strip():
+        prompt = (_PROMPT_PREFIX + custom_prompt.strip())[:_MAX_PROMPT_CHARS + len(_PROMPT_PREFIX)]
+    else:
+        topic = title[:200]
+        visual_hint = f" Visual reference: {scene_prompt[:150]}." if scene_prompt else ""
+        prompt = (
+            f"Eye-catching social media cover image for a medical health video about: {topic}.{visual_hint} "
+            "Professional photorealistic healthcare aesthetic. Cinematic lighting. "
+            "No text, no watermarks, no logos. Clean composition."
+        )[:900]
 
     from app.circuit_breakers import openai_breaker  # lazy import — no circular deps
     from app.metrics import image_gen_calls_total

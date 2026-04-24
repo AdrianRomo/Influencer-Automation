@@ -1098,6 +1098,87 @@ def get_thumbnail(article_id: str, db: Session = Depends(get_db), current_user: 
     return FileResponse(article.thumbnail_path, media_type="image/png")
 
 
+class ThumbnailReq(BaseModel):
+    prompt: str | None = Field(default=None, max_length=900)
+
+
+@app.post("/articles/{article_id}/thumbnail", dependencies=[Depends(check_api_key)])
+def generate_thumbnail_endpoint(
+    article_id: str,
+    req: ThumbnailReq,
+    db: Session = Depends(get_db),
+    current_user: Optional[User] = Depends(get_optional_user),
+):
+    """Queue a thumbnail generation job; accepts an optional custom prompt."""
+    article = db.get(Article, article_id)
+    if not article or article.deleted_at:
+        raise HTTPException(status_code=404, detail="Article not found")
+    _assert_article_owner(article, current_user)
+
+    uid = current_user.id if current_user else "anon"
+    _rate_limit(f"rl:thumbnail:{uid}", limit=10, window=60)
+    if current_user:
+        _check_user_task_capacity(current_user.id)
+
+    openai_key, _, _ = _resolve_user_keys(current_user, db)
+    if current_user:
+        _increment_user_task_count(current_user.id)
+    task = celery_app.send_task(
+        "generate_article_thumbnail",
+        kwargs={
+            "article_id": article.id,
+            "prompt": (req.prompt or "").strip() or None,
+            "openai_api_key": openai_key,
+            "user_id": current_user.id if current_user else None,
+        },
+    )
+    _store_task_owner(task.id, current_user.id if current_user else None)
+    return {"task_id": task.id, "status": "queued"}
+
+
+@app.post("/articles/{article_id}/thumbnail/upload", dependencies=[Depends(check_api_key)])
+async def upload_thumbnail(
+    article_id: str,
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    current_user: Optional[User] = Depends(get_optional_user),
+):
+    """Replace the article's thumbnail with a user-uploaded image."""
+    article = db.get(Article, article_id)
+    if not article or article.deleted_at:
+        raise HTTPException(status_code=404, detail="Article not found")
+    _assert_article_owner(article, current_user)
+
+    content_type = (file.content_type or "").lower()
+    allowed = {"image/png": "png", "image/jpeg": "jpg", "image/jpg": "jpg", "image/webp": "webp"}
+    if content_type not in allowed:
+        raise HTTPException(status_code=415, detail=f"Unsupported type: {content_type}; use PNG/JPEG/WEBP")
+
+    data = await file.read()
+    if len(data) > 10 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="File too large (max 10 MB)")
+    if len(data) < 100:
+        raise HTTPException(status_code=422, detail="File is empty or too small")
+
+    image_dir = os.getenv("IMAGE_DIR", "/data/images")
+    os.makedirs(image_dir, exist_ok=True)
+    ext = allowed[content_type]
+    thumb_path = os.path.join(image_dir, f"{article.id}_thumbnail.{ext}")
+
+    # Remove any previously generated thumbnail with a different extension
+    if article.thumbnail_path and article.thumbnail_path != thumb_path and os.path.exists(article.thumbnail_path):
+        try:
+            os.remove(article.thumbnail_path)
+        except OSError:
+            pass
+
+    with open(thumb_path, "wb") as fh:
+        fh.write(data)
+    article.thumbnail_path = thumb_path
+    db.commit()
+    return {"article_id": article.id, "thumbnail_url": f"/thumbnail/{article.id}"}
+
+
 class PinReq(BaseModel):
     pinned: bool = True
 
