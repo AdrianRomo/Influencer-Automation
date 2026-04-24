@@ -1678,7 +1678,7 @@ export default function App() {
                 title="Preview Script (⌘/Ctrl + Enter)"
               >
                 {prepareLoading ? (
-                  <><span className="spinner spinner-light" />Generating script…</>
+                  <><span className="spinner spinner-light" />{statusText || 'Generating script…'}</>
                 ) : 'Preview Script →'}
               </button>
               {(loading || prepareLoading) && (
