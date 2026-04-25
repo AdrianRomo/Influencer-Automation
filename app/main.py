@@ -35,180 +35,6 @@ configure_logging()
 logger = logging.getLogger(__name__)
 
 
-def _rate_limit(key: str, limit: int, window: int = 60) -> None:
-    """Sliding-window counter in Redis. Fails open if Redis is unavailable."""
-    try:
-        r = _get_rl_redis()
-        pipe = r.pipeline()
-        pipe.incr(key)
-        pipe.expire(key, window)
-        count, _ = pipe.execute()
-        if int(count) > limit:
-            raise HTTPException(
-                status_code=429,
-                detail="Too many requests — please wait before retrying",
-                headers={"Retry-After": str(window)},
-            )
-    except HTTPException:
-        raise
-    except Exception:
-        pass  # Redis failure should not block legitimate requests
-
-
-def _assert_article_owner(article: Article, current_user: Optional[User]) -> None:
-    """Raise 403 if a JWT user tries to access another user's article.
-
-    API-key callers (current_user=None) always pass — the API key is a
-    server-level credential with full access.
-    """
-    if current_user and article.user_id and article.user_id != current_user.id:
-        raise HTTPException(status_code=403, detail="Forbidden")
-
-
-def _store_task_owner(task_id: str, user_id: Optional[str]) -> None:
-    """Record task→owner in Redis so we can verify on status/cancel."""
-    try:
-        owner = user_id or "__anon__"
-        _get_rl_redis().set(f"task:{task_id}:owner", owner, ex=86400)
-    except Exception:
-        pass
-
-
-def _assert_task_owner(task_id: str, current_user: Optional[User]) -> None:
-    """Raise 403 if a JWT user tries to inspect/cancel another user's task."""
-    if not current_user:
-        return  # API-key callers skip the check
-    try:
-        owner = _get_rl_redis().get(f"task:{task_id}:owner")
-        if owner and owner != "__anon__" and owner != current_user.id:
-            raise HTTPException(status_code=403, detail="Forbidden")
-    except HTTPException:
-        raise
-    except Exception:
-        pass  # Redis failure → allow (fail open)
-
-
-# ── Refresh token storage (Redis-backed, 30-day TTL) ──────────────────────
-
-def _store_refresh_token(token: str, user_id: str) -> None:
-    try:
-        _get_rl_redis().set(f"rt:{token}", user_id, ex=REFRESH_TOKEN_EXPIRE_SECONDS)
-    except Exception:
-        pass
-
-
-def _consume_refresh_token(token: str) -> Optional[str]:
-    """Return user_id and atomically revoke the token (single-use rotation)."""
-    try:
-        r = _get_rl_redis()
-        key = f"rt:{token}"
-        user_id = r.get(key)
-        if user_id:
-            r.delete(key)
-        return user_id
-    except Exception:
-        return None
-
-
-def _revoke_refresh_token(token: str) -> None:
-    try:
-        _get_rl_redis().delete(f"rt:{token}")
-    except Exception:
-        pass
-
-
-def _set_auth_cookies(response: Response, access_token: str, refresh_token: str) -> None:
-    is_prod = bool(os.getenv("DOMAIN", "").strip())
-    response.set_cookie(
-        key="access_token", value=access_token,
-        httponly=True, secure=is_prod, samesite="lax",
-        max_age=ACCESS_TOKEN_EXPIRE_MINUTES * 60, path="/",
-    )
-    response.set_cookie(
-        key="refresh_token", value=refresh_token,
-        httponly=True, secure=is_prod, samesite="lax",
-        max_age=REFRESH_TOKEN_EXPIRE_SECONDS, path="/auth/refresh",
-    )
-
-
-def _clear_auth_cookies(response: Response) -> None:
-    response.delete_cookie(key="access_token", path="/")
-    response.delete_cookie(key="refresh_token", path="/auth/refresh")
-
-
-# ── Per-user task backpressure (Redis SET of active task IDs) ─────────────
-#
-# Each active task ID is stored in `user_tasks:{user_id}`. On capacity
-# checks we prune entries whose `task:{id}:owner` key has expired — that
-# way a worker crash can't permanently lock out the user, because the
-# owner key has a 24h TTL and the pruning is self-healing.
-
-_MAX_CONCURRENT_TASKS = int(os.getenv("MAX_CONCURRENT_TASKS_PER_USER", "10"))
-
-
-def _prune_user_tasks(r, user_id: str) -> int:
-    """Drop task IDs whose owner key has expired; return remaining count."""
-    key = f"user_tasks:{user_id}"
-    members = r.smembers(key)
-    if not members:
-        return 0
-    stale = [m for m in members if not r.exists(f"task:{m}:owner")]
-    if stale:
-        r.srem(key, *stale)
-    return r.scard(key)
-
-
-def _check_user_task_capacity(user_id: str) -> None:
-    """Raise 429 if the user already has too many active tasks queued."""
-    try:
-        r = _get_rl_redis()
-        active = _prune_user_tasks(r, user_id)
-        if active >= _MAX_CONCURRENT_TASKS:
-            raise HTTPException(
-                status_code=429,
-                detail="Too many concurrent tasks — wait for existing jobs to complete",
-            )
-    except HTTPException:
-        raise
-    except Exception:
-        pass  # fail open
-
-
-def _register_user_task(user_id: str, task_id: str) -> None:
-    """Record a newly queued task under the user so capacity checks see it."""
-    try:
-        r = _get_rl_redis()
-        key = f"user_tasks:{user_id}"
-        r.sadd(key, task_id)
-        r.expire(key, 86400)  # matches task:{id}:owner TTL
-    except Exception:
-        pass
-
-
-# ── Auth rate limiting (Redis-backed, works across workers) ────────────────
-_AUTH_WINDOW = 60   # seconds
-_AUTH_MAX = 10      # max attempts per window per IP
-
-
-def _check_auth_rate(request: Request) -> None:
-    ip = (request.client.host if request.client else None) or "unknown"
-    key = f"auth_attempts:{ip}"
-    try:
-        r = _get_rl_redis()
-        pipe = r.pipeline()
-        pipe.incr(key)
-        pipe.expire(key, _AUTH_WINDOW)
-        count, _ = pipe.execute()
-        if int(count) > _AUTH_MAX:
-            raise HTTPException(
-                status_code=429,
-                detail=f"Too many authentication attempts — please wait {_AUTH_WINDOW}s",
-            )
-    except HTTPException:
-        raise
-    except Exception:
-        pass  # Redis failure → allow
-
 from app.auth import (
     create_access_token, decode_access_token,
     hash_password, verify_password,
@@ -230,61 +56,34 @@ from app.platforms import PROFILES, LANGUAGES, DEFAULT_PLATFORM, DEFAULT_LANGUAG
 from app.captions import storyboard_to_captions, captions_to_srt, captions_to_vtt
 from app.summarize import _count_words, _estimate_seconds
 from app.tasks import celery_app
+from app.deps import (
+    API_KEY,
+    AUDIO_TASKS as _audio_tasks,
+    DEFAULT_SCENES,
+    DEFAULT_TARGET_SECONDS,
+    MAX_CONCURRENT_TASKS as _MAX_CONCURRENT_TASKS,
+    VIDEO_TASKS as _video_tasks,
+    assert_article_owner as _assert_article_owner,
+    assert_task_owner as _assert_task_owner,
+    check_api_key,
+    check_auth_rate as _check_auth_rate,
+    check_user_task_capacity as _check_user_task_capacity,
+    clear_auth_cookies as _clear_auth_cookies,
+    consume_refresh_token as _consume_refresh_token,
+    get_optional_user,
+    rate_limit as _rate_limit,
+    register_user_task as _register_user_task,
+    resolve_user_keys as _resolve_user_keys,
+    revoke_refresh_token as _revoke_refresh_token,
+    set_auth_cookies as _set_auth_cookies,
+    store_refresh_token as _store_refresh_token,
+    store_task_owner as _store_task_owner,
+)
+from app.routers import auth as auth_router
+from app.routers import health as health_router
+from app.routers import media as media_router
 
 Base.metadata.create_all(bind=engine)
-
-DEFAULT_TARGET_SECONDS = int(os.getenv("TTS_TARGET_SECONDS", "180"))
-DEFAULT_SCENES = int(os.getenv("STORYBOARD_SCENES", "8"))
-API_KEY = os.getenv("API_KEY", "").strip()
-
-# In-memory idempotency: one active task per source/article
-_audio_tasks: dict[str, str] = {}
-_video_tasks: dict[str, str] = {}
-
-
-# ── Auth dependencies ──────────────────────────────────────────────────────
-
-def _user_from_bearer(token: str, db: Session) -> Optional[User]:
-    user_id = decode_access_token(token)
-    if not user_id:
-        return None
-    return db.get(User, user_id)
-
-
-def get_optional_user(
-    authorization: str = Header(default=""),
-    access_token: str = Cookie(default=""),
-    db: Session = Depends(get_db),
-) -> Optional[User]:
-    """Return the authenticated User or None — never raises.
-
-    Checks the Authorization header first, then the httpOnly access_token cookie
-    (set on login/register for same-domain production deployments).
-    """
-    token: str | None = None
-    if authorization.startswith("Bearer "):
-        token = authorization[7:]
-    elif access_token:
-        token = access_token
-    if token:
-        return _user_from_bearer(token, db)
-    return None
-
-
-def check_api_key(
-    x_api_key: str = Header(default=""),
-    authorization: str = Header(default=""),
-    access_token: str = Cookie(default=""),
-):
-    """Accept a valid Bearer JWT (header or cookie) or the server-level X-API-Key."""
-    if authorization.startswith("Bearer "):
-        if decode_access_token(authorization[7:]) is not None:
-            return
-    if access_token:
-        if decode_access_token(access_token) is not None:
-            return
-    if API_KEY and x_api_key != API_KEY:
-        raise HTTPException(status_code=401, detail="Invalid or missing auth")
 
 
 @asynccontextmanager
@@ -330,6 +129,12 @@ app.add_middleware(
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["Content-Type", "Authorization", "X-API-Key", "X-Correlation-ID"],
 )
+
+# ── Split routers ─────────────────────────────────────────────────────────
+# See app/routers/__init__.py for the migration status.
+app.include_router(health_router.router)
+app.include_router(auth_router.router)
+app.include_router(media_router.router)
 
 
 @app.middleware("http")
@@ -428,54 +233,6 @@ class GenerateVideoReq(BaseModel):
     render_mode: Literal["static", "animated"] = "static"
     platform: str = DEFAULT_PLATFORM
     animation_prompt: str | None = None
-
-
-# ── Health ─────────────────────────────────────────────────────────────────
-
-@app.get("/health")
-def health(db: Session = Depends(get_db)):
-    """Returns service health including DB and Redis reachability."""
-    status = "ok"
-    db_status = "ok"
-    redis_status = "ok"
-
-    try:
-        db.execute(func.now())
-    except Exception as exc:
-        logger.error("Health check DB error: %s", exc)
-        db_status = "error"
-        status = "degraded"
-
-    try:
-        _get_rl_redis().ping()
-    except Exception as exc:
-        logger.error("Health check Redis error: %s", exc)
-        redis_status = "error"
-        status = "degraded"
-
-    return JSONResponse(
-        status_code=200 if status == "ok" else 503,
-        content={"status": status, "db": db_status, "redis": redis_status},
-    )
-
-
-@app.get("/metrics")
-def metrics():
-    """Prometheus scrape endpoint.
-
-    Also refreshes the celery_queue_depth gauge on scrape using the default
-    queue length in Redis. Low cost; Prometheus pulls every 15–30s.
-    """
-    from app.metrics import celery_queue_depth, render_metrics
-    try:
-        r = _get_rl_redis()
-        # Celery default queue is 'celery'; LLEN gives pending count.
-        depth = r.llen("celery")
-        celery_queue_depth.labels(queue="celery").set(int(depth or 0))
-    except Exception:
-        pass  # don't block scrapes on redis hiccups
-    body, content_type = render_metrics()
-    return Response(content=body, media_type=content_type)
 
 
 # ── RSS candidate picker ───────────────────────────────────────────────────
@@ -587,162 +344,7 @@ async def _unhandled_exception(request: Request, exc: Exception):
     return JSONResponse(status_code=500, content={"detail": "Internal server error"})
 
 
-# ── Auth ───────────────────────────────────────────────────────────────────
-
-@app.post("/auth/register", response_model=TokenResp)
-def register(req: RegisterReq, request: Request, response: Response, db: Session = Depends(get_db)):
-    _check_auth_rate(request)
-    email = req.email.lower().strip()
-    if db.execute(select(User).where(User.email == email)).scalar_one_or_none():
-        raise HTTPException(status_code=409, detail="Email already registered")
-    if len(req.password) < 8:
-        raise HTTPException(status_code=422, detail="Password must be at least 8 characters")
-    user = User(email=email, hashed_password=hash_password(req.password))
-    db.add(user)
-    db.commit()
-    access_token = create_access_token(user.id)
-    refresh_token = generate_refresh_token()
-    _store_refresh_token(refresh_token, user.id)
-    _set_auth_cookies(response, access_token, refresh_token)
-    return TokenResp(
-        access_token=access_token,
-        refresh_token=refresh_token,
-        user_id=user.id,
-        email=user.email,
-    )
-
-
-@app.post("/auth/login", response_model=TokenResp)
-def login(req: LoginReq, request: Request, response: Response, db: Session = Depends(get_db)):
-    _check_auth_rate(request)
-    email = req.email.lower().strip()
-    user = db.execute(select(User).where(User.email == email)).scalar_one_or_none()
-    if not user or not verify_password(req.password, user.hashed_password):
-        raise HTTPException(status_code=401, detail="Invalid email or password")
-    access_token = create_access_token(user.id)
-    refresh_token = generate_refresh_token()
-    _store_refresh_token(refresh_token, user.id)
-    _set_auth_cookies(response, access_token, refresh_token)
-    return TokenResp(
-        access_token=access_token,
-        refresh_token=refresh_token,
-        user_id=user.id,
-        email=user.email,
-    )
-
-
-class _RefreshReq(BaseModel):
-    refresh_token: Optional[str] = None
-
-
-@app.post("/auth/refresh", response_model=TokenResp)
-def refresh_access_token(
-    req: _RefreshReq,
-    response: Response,
-    refresh_token_cookie: str = Cookie(default="", alias="refresh_token"),
-    db: Session = Depends(get_db),
-):
-    """Rotate a refresh token and issue a new short-lived access token.
-
-    Reads the refresh token from the httpOnly cookie (production via Vite proxy)
-    or from the request body (dev clients that store it in localStorage).
-    """
-    token = refresh_token_cookie or req.refresh_token or ""
-    if not token:
-        raise HTTPException(status_code=401, detail="No refresh token provided")
-    user_id = _consume_refresh_token(token)
-    if not user_id:
-        _clear_auth_cookies(response)
-        raise HTTPException(status_code=401, detail="Invalid or expired refresh token")
-    user = db.get(User, user_id)
-    if not user:
-        _clear_auth_cookies(response)
-        raise HTTPException(status_code=401, detail="User not found")
-    new_access = create_access_token(user.id)
-    new_refresh = generate_refresh_token()
-    _store_refresh_token(new_refresh, user.id)
-    _set_auth_cookies(response, new_access, new_refresh)
-    return TokenResp(
-        access_token=new_access,
-        refresh_token=new_refresh,
-        user_id=user.id,
-        email=user.email,
-    )
-
-
-@app.post("/auth/logout")
-def logout(
-    req: _RefreshReq,
-    response: Response,
-    refresh_token_cookie: str = Cookie(default="", alias="refresh_token"),
-):
-    """Revoke the refresh token and clear auth cookies."""
-    token = refresh_token_cookie or req.refresh_token or ""
-    if token:
-        _revoke_refresh_token(token)
-    _clear_auth_cookies(response)
-    return {"logged_out": True}
-
-
-@app.get("/users/me", response_model=UserResp, dependencies=[Depends(check_api_key)])
-def get_me(current_user: Optional[User] = Depends(get_optional_user)):
-    if not current_user:
-        raise HTTPException(status_code=401, detail="JWT required for this endpoint")
-    return UserResp(
-        id=current_user.id,
-        email=current_user.email,
-        created_at=current_user.created_at,
-        has_keys=current_user.api_keys is not None,
-    )
-
-
-@app.put("/users/me/keys", response_model=UserKeysOut, dependencies=[Depends(check_api_key)])
-def upsert_user_keys(
-    req: UserKeysIn,
-    current_user: Optional[User] = Depends(get_optional_user),
-    db: Session = Depends(get_db),
-):
-    if not current_user:
-        raise HTTPException(status_code=401, detail="JWT required for this endpoint")
-    keys = db.get(UserApiKeys, current_user.id)
-    if not keys:
-        keys = UserApiKeys(user_id=current_user.id, updated_at=datetime.utcnow())
-        db.add(keys)
-    dek = get_or_create_dek(keys)
-    if req.openai_key is not None:
-        keys.openai_key_enc = encrypt_with_dek(req.openai_key, dek) if req.openai_key else None
-    if req.elevenlabs_key is not None:
-        keys.elevenlabs_key_enc = encrypt_with_dek(req.elevenlabs_key, dek) if req.elevenlabs_key else None
-    if req.elevenlabs_voice_id is not None:
-        keys.elevenlabs_voice_id = req.elevenlabs_voice_id or None
-    if req.elevenlabs_model_id is not None:
-        keys.elevenlabs_model_id = req.elevenlabs_model_id or None
-    keys.updated_at = datetime.utcnow()
-    db.commit()
-    return UserKeysOut(
-        has_openai_key=bool(keys.openai_key_enc),
-        has_elevenlabs_key=bool(keys.elevenlabs_key_enc),
-        elevenlabs_voice_id=keys.elevenlabs_voice_id,
-        elevenlabs_model_id=keys.elevenlabs_model_id,
-    )
-
-
-@app.get("/users/me/keys", response_model=UserKeysOut, dependencies=[Depends(check_api_key)])
-def get_user_keys(
-    current_user: Optional[User] = Depends(get_optional_user),
-    db: Session = Depends(get_db),
-):
-    if not current_user:
-        raise HTTPException(status_code=401, detail="JWT required for this endpoint")
-    keys = db.get(UserApiKeys, current_user.id)
-    if not keys:
-        return UserKeysOut(has_openai_key=False, has_elevenlabs_key=False)
-    return UserKeysOut(
-        has_openai_key=bool(keys.openai_key_enc),
-        has_elevenlabs_key=bool(keys.elevenlabs_key_enc),
-        elevenlabs_voice_id=keys.elevenlabs_voice_id,
-        elevenlabs_model_id=keys.elevenlabs_model_id,
-    )
+# Auth + users/me routes live in app.routers.auth now.
 
 
 # ── Sources ────────────────────────────────────────────────────────────────
@@ -1148,16 +750,7 @@ def list_article_images(article_id: str, db=Depends(get_db), current_user: Optio
     ]
 
 
-@app.get("/thumbnail/{article_id}", dependencies=[Depends(check_api_key)])
-def get_thumbnail(article_id: str, db: Session = Depends(get_db), current_user: Optional[User] = Depends(get_optional_user)):
-    """Serve the generated cover/thumbnail PNG for an article."""
-    article = db.get(Article, article_id)
-    if not article or not article.thumbnail_path:
-        raise HTTPException(status_code=404, detail="Thumbnail not found")
-    _assert_article_owner(article, current_user)
-    if not os.path.exists(article.thumbnail_path):
-        raise HTTPException(status_code=404, detail="Thumbnail file missing from disk")
-    return FileResponse(article.thumbnail_path, media_type="image/png")
+# GET /thumbnail/{article_id} lives in app.routers.media.
 
 
 class ThumbnailReq(BaseModel):
@@ -1702,34 +1295,8 @@ def generate_video(
     return {"task_id": task.id, "status": "queued", "render_mode": req.render_mode}
 
 
-# ── Static assets ──────────────────────────────────────────────────────────
-
-@app.get("/audio/{audio_id}", dependencies=[Depends(check_api_key)])
-def get_audio(audio_id: str, db=Depends(get_db), current_user: Optional[User] = Depends(get_optional_user)):
-    audio = db.get(AudioAsset, audio_id)
-    if not audio or audio.deleted_at is not None:
-        raise HTTPException(status_code=404, detail="Audio not found")
-    article = db.get(Article, audio.article_id)
-    if article:
-        _assert_article_owner(article, current_user)
-    if not os.path.exists(audio.file_path):
-        raise HTTPException(status_code=404, detail="File missing on disk")
-    return FileResponse(audio.file_path, media_type="audio/mpeg", filename=os.path.basename(audio.file_path))
-
-
-@app.get("/image/{image_id}", dependencies=[Depends(check_api_key)])
-def get_image(image_id: str, db=Depends(get_db), current_user: Optional[User] = Depends(get_optional_user)):
-    img = db.get(ImageAsset, image_id)
-    if not img or img.deleted_at is not None:
-        raise HTTPException(status_code=404, detail="Image not found")
-    article = db.get(Article, img.article_id)
-    if article:
-        _assert_article_owner(article, current_user)
-    if img.status != "ready":
-        raise HTTPException(status_code=409, detail=f"Image not ready: {img.status}")
-    if not os.path.exists(img.file_path):
-        raise HTTPException(status_code=404, detail="Image file missing on disk")
-    return FileResponse(img.file_path, media_type="image/png")
+# Static-asset GETs (/audio, /image, /video, /scene-videos, /thumbnail)
+# live in app.routers.media.
 
 
 class RegenerateReq(BaseModel):
@@ -1799,45 +1366,6 @@ def regenerate_stage(
     return {"task_id": task.id, "status": "queued", "stage": req.stage}
 
 
-@app.get("/video/{video_id}", dependencies=[Depends(check_api_key)])
-def get_video(video_id: str, db=Depends(get_db), current_user: Optional[User] = Depends(get_optional_user)):
-    video = db.get(VideoAsset, video_id)
-    if not video or video.deleted_at is not None:
-        raise HTTPException(status_code=404, detail="Video not found")
-    article = db.get(Article, video.article_id)
-    if article:
-        _assert_article_owner(article, current_user)
-    if video.status != "ready":
-        raise HTTPException(status_code=409, detail=f"Video not ready: status={video.status}")
-    if not os.path.exists(video.file_path):
-        raise HTTPException(status_code=404, detail="Video file missing on disk")
-    return FileResponse(
-        video.file_path,
-        media_type="video/mp4",
-        filename=os.path.basename(video.file_path),
-    )
-
-
-@app.get("/scene-videos/{scene_video_id}", dependencies=[Depends(check_api_key)])
-def get_scene_video_clip(scene_video_id: str, db=Depends(get_db), current_user: Optional[User] = Depends(get_optional_user)):
-    """Download an individual animated scene clip."""
-    sv = db.get(SceneVideoAsset, scene_video_id)
-    if not sv or sv.deleted_at is not None:
-        raise HTTPException(status_code=404, detail="Scene video not found")
-    article = db.get(Article, sv.article_id)
-    if article:
-        _assert_article_owner(article, current_user)
-    if sv.status not in ("ready", "fallback"):
-        raise HTTPException(status_code=409, detail=f"Scene clip not ready: status={sv.status}")
-    if not sv.file_path or not os.path.exists(sv.file_path):
-        raise HTTPException(status_code=404, detail="Clip file missing on disk")
-    return FileResponse(
-        sv.file_path,
-        media_type="video/mp4",
-        filename=os.path.basename(sv.file_path),
-    )
-
-
 # ── Article soft-delete ────────────────────────────────────────────────────
 
 @app.delete("/articles/{article_id}", dependencies=[Depends(check_api_key)])
@@ -1856,52 +1384,11 @@ def delete_article(
     return {"deleted": article_id}
 
 
-# ── Admin / ops ────────────────────────────────────────────────────────────
-
-@app.get("/admin/beat-info", dependencies=[Depends(check_api_key)])
-def beat_info():
-    """Return the current scheduled generation configuration."""
-    enabled = os.getenv("ENABLE_SCHEDULED_GENERATION", "false").lower() == "true"
-    interval_h = int(os.getenv("BEAT_GENERATION_INTERVAL_HOURS", "0"))
-    return {
-        "enabled": enabled,
-        "schedule": (
-            f"every {interval_h}h" if interval_h > 0
-            else f"daily at {os.getenv('BEAT_GENERATION_HOUR', '6')}:00 UTC"
-        ),
-        "skip_recent_hours": int(os.getenv("BEAT_SKIP_RECENT_HOURS", "4")),
-        "max_concurrent_tasks_per_user": _MAX_CONCURRENT_TASKS,
-    }
+# /admin/beat-info, /health, /metrics live in app.routers.health.
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────
-
-def _resolve_user_keys(
-    user: Optional[User],
-    db: Session,
-) -> tuple[Optional[str], Optional[str], Optional[str]]:
-    """Return (openai_key, elevenlabs_key, elevenlabs_voice_id) for the user.
-
-    Uses per-user DEK (envelope encryption) when available; falls back to
-    master-key decryption for rows created before the DEK migration.
-    """
-    if not user:
-        return None, None, None
-    keys = db.get(UserApiKeys, user.id)
-    if not keys:
-        return None, None, None
-    if keys.dek_enc:
-        try:
-            dek = get_or_create_dek(keys)
-            openai_key = decrypt_with_dek(keys.openai_key_enc, dek) if keys.openai_key_enc else None
-            el_key = decrypt_with_dek(keys.elevenlabs_key_enc, dek) if keys.elevenlabs_key_enc else None
-            return openai_key, el_key, keys.elevenlabs_voice_id
-        except Exception:
-            pass
-    # Legacy: master-key encryption (rows created before DEK migration)
-    openai_key = decrypt_api_key(keys.openai_key_enc) if keys.openai_key_enc else None
-    el_key = decrypt_api_key(keys.elevenlabs_key_enc) if keys.elevenlabs_key_enc else None
-    return openai_key, el_key, keys.elevenlabs_voice_id
+# _resolve_user_keys is imported from app.deps.resolve_user_keys above.
 
 
 def _load_storyboard(article: Article) -> Storyboard | None:

@@ -40,35 +40,11 @@ TOLERANCE_SECONDS = int(os.getenv("TTS_TOLERANCE_SECONDS", "30"))  # +/- 30s win
 # Storyboard
 DEFAULT_SCENES = int(os.getenv("STORYBOARD_SCENES", "8"))
 
-SYSTEM_SCRIPT = f"""You are a medical-news narrator scriptwriter.
-Rewrite the input into a clear, engaging narration script that is easy for TTS to read.
+from app.prompts import get as _prompt
 
-Hard requirements:
-- Output language MUST be Spanish (Latin American / neutral; prefer Mexican Spanish): {OUTPUT_LANGUAGE}.
-  If the input is not Spanish, translate faithfully while summarizing.
-- Do not add new facts. Preserve all numbers, dates, dosages, units, and drug names exactly.
-- Output a single narration (no bullet points, no headings).
-- No citations. No URLs.
-- Expand acronyms on first mention (e.g., “Centers for Disease Control and Prevention (CDC)” → translate the name, keep (CDC)).
-- Avoid sensationalism; be precise and calm.
-- End with a brief medical disclaimer in Spanish: this is not medical advice; consult qualified professionals.
-
-Style / delivery:
-- Short, spoken sentences.
-- Use natural prosody via punctuation (commas, periods). No stage directions like [pause], (sad), etc.
-- Tone should match the topic: serious when needed, reassuring when appropriate.
-"""
-
-SYSTEM_REWRITE = f"""You are an expert editor for TTS scripts in Spanish ({OUTPUT_LANGUAGE}).
-Rewrite the script to match the EXACT requested word count range while preserving meaning.
-Do not add new facts. Preserve numbers, dates, dosages, units, and drug names exactly.
-No bullets, no headings, no URLs, no citations. Keep it natural to speak aloud.
-End with the brief medical disclaimer in Spanish.
-"""
-
-SYSTEM_STORYBOARD = """You create a compact storyboard for short-form narrated news videos.
-Return a JSON array only. No markdown fences. No extra text outside the array.
-"""
+SYSTEM_SCRIPT = _prompt("script", output_language=OUTPUT_LANGUAGE)
+SYSTEM_REWRITE = _prompt("rewrite", output_language=OUTPUT_LANGUAGE)
+SYSTEM_STORYBOARD = _prompt("storyboard")
 
 
 def _normalize_scene(raw: dict, index: int) -> dict:
@@ -427,25 +403,7 @@ _PLATFORM_CAPTION_HINTS: Dict[str, str] = {
     "facebook":       "Facebook: conversational, slight longer form OK, 180–280 chars, 3–5 hashtags",
 }
 
-_SYSTEM_CAPTIONS = """You are a social media content writer for medical health news.
-Given a narration script, write optimized post captions for each requested platform.
-
-Rules:
-- Write in the SAME LANGUAGE as the script (do not translate or switch languages).
-- Each caption should hook the viewer immediately and accurately represent the content.
-- Do not invent health claims not present in the script.
-- Keep medical tone: accurate, clear, no sensationalism.
-- Output a valid JSON object only — no markdown, no extra text.
-
-Output format:
-{
-  "platform_id": {
-    "caption": "post body text",
-    "hashtags": ["#tag1", "#tag2", ...]
-  },
-  ...
-}
-"""
+_SYSTEM_CAPTIONS = _prompt("captions")
 
 
 def generate_social_captions(
