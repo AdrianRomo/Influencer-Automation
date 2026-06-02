@@ -68,13 +68,15 @@ export default function CatalogStudio() {
   }, [])
 
   const refreshAll = useCallback(async (wsId: string) => {
-    const [b, p, c, cm] = await Promise.all([
+    // Independent updates: a hiccup in one list must not block the others
+    // (a failed campaigns fetch should never freeze the product list).
+    const [b, p, c, cm] = await Promise.allSettled([
       listBrands(wsId), listProducts(wsId), listCatalogs(wsId), listCampaigns(wsId),
     ])
-    setBrands(b.brands)
-    setProducts(p.products)
-    setCatalogs(c.catalogs)
-    setCampaigns(cm.campaigns)
+    if (b.status === 'fulfilled') setBrands(b.value.brands)
+    if (p.status === 'fulfilled') setProducts(p.value.products)
+    if (c.status === 'fulfilled') setCatalogs(c.value.catalogs)
+    if (cm.status === 'fulfilled') setCampaigns(cm.value.campaigns)
     await loadCredits(wsId)
   }, [loadCredits])
 
@@ -279,6 +281,10 @@ function ProductsTab(props: {
     return next
   })
 
+  // Auto-select a product once it finishes analyzing, so the campaign count
+  // reflects it immediately (analyzing implies intent to use it).
+  const select = (id: string) => setSelected(prev => new Set(prev).add(id))
+
   // A product is campaign-ready only once it has been analyzed.
   const isAnalyzed = (id: string) => !!products.find(p => p.id === id)?.analysis_json
   const analyzedSelected = [...selected].filter(isAnalyzed)
@@ -346,6 +352,7 @@ function ProductsTab(props: {
           <ProductCard
             key={p.id} product={p} selected={selected.has(p.id)}
             onToggle={() => toggle(p.id)} onChanged={onChanged} run={run}
+            onAnalyzed={() => select(p.id)}
           />
         ))}
       </div>
@@ -359,8 +366,9 @@ function ProductCard(props: {
   onToggle: () => void
   onChanged: () => Promise<void>
   run: (label: string, fn: () => Promise<void>) => Promise<void>
+  onAnalyzed: () => void
 }) {
-  const { product: p, selected, onToggle, onChanged, run } = props
+  const { product: p, selected, onToggle, onChanged, run, onAnalyzed } = props
   const [editing, setEditing] = useState(false)
   const [draft, setDraft] = useState({
     title: p.title, description: p.description ?? '',
@@ -419,6 +427,7 @@ function ProductCard(props: {
               const { task_id } = await analyzeProduct(p.id)
               await pollJob(task_id)
               await onChanged()
+              onAnalyzed()  // auto-select so the campaign count reflects it
             })}>{p.analysis_json ? 'Re-analyze' : 'Analyze'}</button>
             <button className="secondary small" onClick={() => setEditing(true)}>Edit</button>
             <button className="secondary small" style={{ color: '#e5484d' }} onClick={() => {
