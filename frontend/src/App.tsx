@@ -24,6 +24,7 @@ import { KeysModal } from './components/KeysModal'
 import { SceneCard } from './components/SceneCard'
 import { SocialCaptionsPanel } from './components/SocialCaptionsPanel'
 import { ToastContainer, nextToastId, type Toast, type ToastKind } from './components/Toast'
+import CatalogStudio from './components/CatalogStudio'
 
 // Utility helpers (fmtSeconds, relativeDate, …) moved to ./utils
 // Shared UI components moved to ./components/
@@ -43,6 +44,12 @@ export default function App() {
   // ── Settings (legacy API key) ───────────────────────────────────────────
   const [apiKey, setApiKeyState] = useState(() => localStorage.getItem('api_key') ?? '')
   const [showSettings, setShowSettings] = useState(false)
+
+  // ── Top-level view: classic article pipeline vs catalog-to-ad studio ─────
+  const [mode, setMode] = useState<'articles' | 'studio'>(
+    () => (localStorage.getItem('app_mode') as 'articles' | 'studio') || 'articles',
+  )
+  useEffect(() => { localStorage.setItem('app_mode', mode) }, [mode])
 
   // ── Platforms / language metadata ─────────────────────────────────────
   const [platformsData, setPlatformsData] = useState<PlatformsResp | null>(null)
@@ -813,6 +820,33 @@ export default function App() {
     )
   }
 
+  // Catalog-to-ad studio is a separate authenticated view. Render it standalone
+  // (with a thin top bar) to avoid threading its state through the article UI.
+  if (currentUser && mode === 'studio') {
+    return (
+      <div className="container">
+        {showKeysModal && (
+          <KeysModal
+            existing={userKeys}
+            onSave={keys => { setUserKeys(keys); setShowKeysModal(false) }}
+            onSkip={() => setShowKeysModal(false)}
+          />
+        )}
+        <div className="header">
+          <button className="secondary settings-btn" onClick={() => setMode('articles')}>← Articles</button>
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+            <button className="secondary settings-btn" onClick={() => setShowKeysModal(true)} title="Manage API Keys">
+              API Keys {keysConfigured ? <span className="key-dot key-dot-ok" /> : <span className="key-dot key-dot-warn" />}
+            </button>
+            <div className="user-chip" title={currentUser.email}>{currentUser.email.split('@')[0]}</div>
+            <button className="secondary settings-btn" onClick={handleLogout}>Sign Out</button>
+          </div>
+        </div>
+        <CatalogStudio />
+      </div>
+    )
+  }
+
   return (
     <div className="container">
 
@@ -851,6 +885,9 @@ export default function App() {
               <div className="user-chip" title={currentUser.email}>
                 {currentUser.email.split('@')[0]}
               </div>
+              <button className="secondary settings-btn" onClick={() => setMode('studio')} title="Catalog-to-ad studio">
+                Ad Studio →
+              </button>
               <button className="secondary settings-btn" onClick={handleLogout}>
                 Sign Out
               </button>

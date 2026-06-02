@@ -36,14 +36,28 @@ class UsageCollector:
         self,
         article_id: str | None = None,
         user_id: str | None = None,
+        *,
+        workspace_id: str | None = None,
+        product_id: str | None = None,
+        ad_concept_id: str | None = None,
     ) -> None:
         self.article_id = article_id
         self.user_id = user_id
+        # Catalog-to-ad linkage so cost can be billed per workspace/product.
+        self.workspace_id = workspace_id
+        self.product_id = product_id
+        self.ad_concept_id = ad_concept_id
         self._events: list[dict] = []
 
     def record(self, **kwargs) -> None:
         """Buffer a single usage event dict."""
-        evt: dict = {"article_id": self.article_id, "user_id": self.user_id}
+        evt: dict = {
+            "article_id": self.article_id,
+            "user_id": self.user_id,
+            "workspace_id": self.workspace_id,
+            "product_id": self.product_id,
+            "ad_concept_id": self.ad_concept_id,
+        }
         evt.update(kwargs)
         self._events.append(evt)
 
@@ -65,6 +79,9 @@ class UsageCollector:
                 row = GenerationUsageEvent(
                     article_id=evt.get("article_id"),
                     user_id=evt.get("user_id"),
+                    workspace_id=evt.get("workspace_id"),
+                    product_id=evt.get("product_id"),
+                    ad_concept_id=evt.get("ad_concept_id"),
                     video_asset_id=video_asset_id or evt.get("video_asset_id"),
                     provider=evt["provider"],
                     operation=evt["operation"],

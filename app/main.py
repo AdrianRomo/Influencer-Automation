@@ -82,6 +82,12 @@ from app.deps import (
 from app.routers import auth as auth_router
 from app.routers import health as health_router
 from app.routers import media as media_router
+from app.routers import workspaces as workspaces_router
+from app.routers import brands as brands_router
+from app.routers import catalog as catalog_router
+from app.routers import products as products_router
+from app.routers import campaigns as campaigns_router
+from app.routers import concepts as concepts_router
 
 Base.metadata.create_all(bind=engine)
 
@@ -135,6 +141,14 @@ app.add_middleware(
 app.include_router(health_router.router)
 app.include_router(auth_router.router)
 app.include_router(media_router.router)
+
+# Catalog-to-ad B2B layer (workspace-scoped, JWT-required).
+app.include_router(workspaces_router.router)
+app.include_router(brands_router.router)
+app.include_router(catalog_router.router)
+app.include_router(products_router.router)
+app.include_router(campaigns_router.router)
+app.include_router(concepts_router.router)
 
 
 @app.middleware("http")

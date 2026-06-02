@@ -378,3 +378,156 @@ export function resolveDownloadUrl(status: JobStatus): string | undefined {
   }
   return undefined
 }
+
+// ── Catalog-to-ad (B2B) API ──────────────────────────────────────────────────
+
+import type {
+  Workspace, Brand, Product, Catalog, IngestReport, Campaign, AdConcept,
+} from './types'
+
+// Auth header from current module state (mirrors http<T>); used by raw fetch
+// paths (multipart upload, blob download) that can't go through http<T>.
+function _authHeaders(): Record<string, string> {
+  if (_jwtToken) return { Authorization: `Bearer ${_jwtToken}` }
+  if (_apiKey) return { 'X-API-Key': _apiKey }
+  return {}
+}
+
+export function listWorkspaces(): Promise<{ workspaces: Workspace[] }> {
+  return http('/workspaces')
+}
+export function createWorkspace(name: string): Promise<Workspace> {
+  return http('/workspaces', { method: 'POST', body: JSON.stringify({ name }) })
+}
+
+export function listBrands(workspaceId: string): Promise<{ brands: Brand[] }> {
+  return http(`/workspaces/${workspaceId}/brands`)
+}
+export function createBrand(workspaceId: string, body: Partial<Brand> & { name: string }): Promise<Brand> {
+  return http(`/workspaces/${workspaceId}/brands`, { method: 'POST', body: JSON.stringify(body) })
+}
+export function updateBrand(brandId: string, body: Partial<Brand>): Promise<Brand> {
+  return http(`/brands/${brandId}`, { method: 'PATCH', body: JSON.stringify(body) })
+}
+
+export function listCatalogs(workspaceId: string): Promise<{ catalogs: Catalog[] }> {
+  return http(`/workspaces/${workspaceId}/catalogs`)
+}
+
+export async function uploadCsvCatalog(
+  workspaceId: string, file: File, brandId?: string,
+): Promise<IngestReport> {
+  const form = new FormData()
+  form.append('file', file)
+  if (brandId) form.append('brand_id', brandId)
+  // No Content-Type header — the browser sets the multipart boundary.
+  const res = await fetch(`${API_BASE}/workspaces/${workspaceId}/catalogs/csv`, {
+    method: 'POST', credentials: 'include', headers: _authHeaders(), body: form,
+  })
+  if (!res.ok) {
+    const text = await res.text().catch(() => '')
+    throw new Error(`HTTP ${res.status}${text ? `: ${text}` : ''}`)
+  }
+  return res.json() as Promise<IngestReport>
+}
+
+export function ingestUrls(
+  workspaceId: string, urls: string[], brandId?: string,
+): Promise<IngestReport> {
+  return http(`/workspaces/${workspaceId}/catalogs/url`, {
+    method: 'POST', body: JSON.stringify({ urls, brand_id: brandId ?? null }),
+  })
+}
+
+export function listProducts(workspaceId: string): Promise<{ products: Product[] }> {
+  return http(`/workspaces/${workspaceId}/products`)
+}
+export function getProduct(productId: string): Promise<Product> {
+  return http(`/products/${productId}`)
+}
+export function analyzeProduct(productId: string): Promise<GenerateResp> {
+  return http(`/products/${productId}/analyze`, { method: 'POST' })
+}
+export function listProductConcepts(productId: string): Promise<{ concepts: AdConcept[] }> {
+  return http(`/products/${productId}/concepts`)
+}
+
+export function listCampaigns(workspaceId: string): Promise<{ campaigns: Campaign[] }> {
+  return http(`/workspaces/${workspaceId}/campaigns`)
+}
+export function createCampaign(
+  workspaceId: string,
+  body: { name: string; goal: string; platforms: string[]; product_ids: string[]; brand_id?: string | null },
+): Promise<Campaign> {
+  return http(`/workspaces/${workspaceId}/campaigns`, { method: 'POST', body: JSON.stringify(body) })
+}
+export function generateCampaign(
+  campaignId: string, nVariants: number, productIds?: string[],
+): Promise<{ campaign_id: string; tasks: { product_id: string; task_id: string }[]; count: number }> {
+  return http(`/campaigns/${campaignId}/generate`, {
+    method: 'POST',
+    body: JSON.stringify({ n_variants: nVariants, product_ids: productIds ?? null }),
+  })
+}
+export function listCampaignConcepts(campaignId: string): Promise<{ concepts: AdConcept[] }> {
+  return http(`/campaigns/${campaignId}/concepts`)
+}
+
+// Download the creative-library export as a Blob (json | csv | zip).
+export async function downloadCampaignExport(
+  campaignId: string, format: 'json' | 'csv' | 'zip',
+): Promise<Blob> {
+  const res = await fetch(`${API_BASE}/campaigns/${campaignId}/export?format=${format}`, {
+    credentials: 'include', headers: _authHeaders(),
+  })
+  if (!res.ok) {
+    const text = await res.text().catch(() => '')
+    throw new Error(`HTTP ${res.status}${text ? `: ${text}` : ''}`)
+  }
+  return res.blob()
+}
+
+export function getConcept(conceptId: string): Promise<AdConcept> {
+  return http(`/concepts/${conceptId}`)
+}
+export function updateConcept(
+  conceptId: string,
+  body: Partial<Pick<AdConcept, 'angle' | 'hook' | 'headline' | 'cta' | 'on_screen_text' | 'script_json' | 'captions_json'>> & { recheck?: boolean },
+): Promise<AdConcept> {
+  return http(`/concepts/${conceptId}`, { method: 'PATCH', body: JSON.stringify(body) })
+}
+export function regenerateConcept(conceptId: string, angle?: string): Promise<GenerateResp> {
+  return http(`/concepts/${conceptId}/regenerate`, {
+    method: 'POST', body: JSON.stringify({ angle: angle ?? null }),
+  })
+}
+export function deleteConcept(conceptId: string): Promise<{ deleted: string }> {
+  return http(`/concepts/${conceptId}`, { method: 'DELETE' })
+}
+
+export function generateConceptVideo(
+  conceptId: string, platform: string, burnSubtitles = true,
+): Promise<GenerateResp> {
+  return http(`/concepts/${conceptId}/video`, {
+    method: 'POST', body: JSON.stringify({ platform, burn_subtitles: burnSubtitles }),
+  })
+}
+
+export async function downloadConceptVideo(conceptId: string): Promise<Blob> {
+  const res = await fetch(`${API_BASE}/concepts/${conceptId}/video`, {
+    credentials: 'include', headers: _authHeaders(),
+  })
+  if (!res.ok) {
+    const text = await res.text().catch(() => '')
+    throw new Error(`HTTP ${res.status}${text ? `: ${text}` : ''}`)
+  }
+  return res.blob()
+}
+
+export function getWorkspaceCredits(workspaceId: string): Promise<{
+  balance: number
+  costs: Record<string, number>
+  transactions: { id: string; amount: number; reason: string; balance_after: number; created_at?: string }[]
+}> {
+  return http(`/workspaces/${workspaceId}/credits`)
+}

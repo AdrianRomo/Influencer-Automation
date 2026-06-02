@@ -295,3 +295,117 @@ export type ContentPackage = {
   social_captions?: SocialCaption[] | null
   cost_summary?: CostSummary | null
 }
+
+// ── Catalog-to-ad (B2B) types ───────────────────────────────────────────────
+
+export type Workspace = {
+  id: string
+  name: string
+  owner_user_id: string
+  plan: string
+  credits_balance: number
+  created_at?: string | null
+}
+
+export type Brand = {
+  id: string
+  workspace_id: string
+  name: string
+  site_url?: string | null
+  tone_json?: Record<string, unknown> | null
+  target_audience_json?: Record<string, unknown> | null
+  brand_voice_json?: Record<string, unknown> | null
+  prohibited_words: string[]
+  claim_policy_json?: Record<string, unknown> | null
+  ai_disclosure: boolean
+  default_language: string
+  created_at?: string | null
+}
+
+export type ProductAnalysis = {
+  audience_segments?: { name?: string; description?: string; why_they_buy?: string }[]
+  pain_points?: string[]
+  benefits?: string[]
+  emotional_triggers?: string[]
+  objections?: string[]
+  ad_angles?: { angle?: string; rationale?: string }[]
+  tone_keywords?: string[]
+  claim_risk?: 'low' | 'medium' | 'high' | string
+}
+
+export type Product = {
+  id: string
+  workspace_id: string
+  brand_id?: string | null
+  catalog_id?: string | null
+  external_id?: string | null
+  url?: string | null
+  title: string
+  description?: string | null
+  price?: number | null
+  currency?: string | null
+  category?: string | null
+  attributes_json?: Record<string, unknown> | null
+  primary_image_url?: string | null
+  analysis_json?: ProductAnalysis | null
+  status: string
+  created_at?: string | null
+}
+
+export type Catalog = {
+  id: string
+  workspace_id: string
+  brand_id?: string | null
+  source_type: string
+  source_ref?: string | null
+  status: string
+  item_count: number
+  last_synced_at?: string | null
+  created_at?: string | null
+}
+
+export type IngestReport = {
+  catalog_id: string
+  source_type: string
+  created: number
+  updated: number
+  product_ids: string[]
+  errors: string[]
+  item_count: number
+}
+
+export type Campaign = {
+  id: string
+  workspace_id: string
+  brand_id?: string | null
+  name: string
+  goal: string
+  platforms: string[]
+  product_ids: string[]
+  status: string
+  created_at?: string | null
+}
+
+export type AdConceptCompliance = {
+  risk?: 'low' | 'medium' | 'high' | string
+  flags?: { text?: string; reason?: string; suggested_fix?: string }[]
+}
+
+export type AdConcept = {
+  id: string
+  workspace_id: string
+  campaign_id?: string | null
+  product_id: string
+  variant_index: number
+  angle?: string | null
+  hook?: string | null
+  headline?: string | null
+  script_json?: { ugc?: string; demo?: string; influencer?: string } | null
+  captions_json?: Record<string, { caption?: string; hashtags?: string[] }> | null
+  cta?: string | null
+  on_screen_text?: string | null
+  storyboard_json?: { scenes?: StoryboardScene[]; total_duration_estimate?: number } | null
+  compliance_json?: AdConceptCompliance | null
+  status: string
+  created_at?: string | null
+}

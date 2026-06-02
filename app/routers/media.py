@@ -52,6 +52,10 @@ def get_video(video_id: str, db: Session = Depends(get_db), current_user: Option
     video = db.get(VideoAsset, video_id)
     if not video or video.deleted_at is not None:
         raise HTTPException(status_code=404, detail="Video not found")
+    # Catalog-to-ad videos have no article; they're served by the workspace-scoped
+    # /concepts/{id}/video route, not this article-centric one.
+    if not video.article_id:
+        raise HTTPException(status_code=404, detail="Video not found")
     article = db.get(Article, video.article_id)
     if article:
         assert_article_owner(article, current_user)

@@ -253,6 +253,72 @@ def assert_article_owner(article: Article, current_user: Optional[User]) -> None
         raise HTTPException(status_code=403, detail="Forbidden")
 
 
+# ── Workspace auth (catalog-to-ad B2B layer) ───────────────────────────────
+# The catalog product is multi-tenant: every resource is scoped to a workspace,
+# and a user may act on a workspace only if they own it or are a member.
+
+def get_current_user(
+    current_user: Optional[User] = Depends(get_optional_user),
+) -> User:
+    """Like get_optional_user but REQUIRED — raises 401 when unauthenticated.
+
+    Catalog/brand/campaign routes need a real user to resolve a workspace, so
+    anonymous + bare X-API-Key access is not allowed on them.
+    """
+    if current_user is None:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    return current_user
+
+
+def assert_workspace_member(db: Session, workspace_id: str, user: User):
+    """Return the Workspace if the user owns or is a member of it, else 404/403."""
+    from app.models import Workspace, WorkspaceMember
+    ws = db.get(Workspace, workspace_id)
+    if ws is None:
+        raise HTTPException(status_code=404, detail="Workspace not found")
+    if ws.owner_user_id == user.id:
+        return ws
+    if db.get(WorkspaceMember, (workspace_id, user.id)) is None:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    return ws
+
+
+def assert_workspace_resource(resource, workspace_id: str, name: str = "Resource"):
+    """404 if a child resource is missing or belongs to a different workspace.
+
+    Guards against cross-tenant access by id (e.g. /products/{id} where the id
+    is valid but in someone else's workspace).
+    """
+    if resource is None or getattr(resource, "workspace_id", None) != workspace_id:
+        raise HTTPException(status_code=404, detail=f"{name} not found")
+    return resource
+
+
+def get_or_create_personal_workspace(db: Session, user: User):
+    """Return the user's personal (owned) workspace, creating one on first use.
+
+    Lets existing/new single users start using the catalog product immediately
+    without an explicit workspace-creation step.
+    """
+    from sqlalchemy import select
+    from app.models import Workspace, WorkspaceMember
+    ws = db.execute(
+        select(Workspace).where(Workspace.owner_user_id == user.id).order_by(Workspace.created_at)
+    ).scalars().first()
+    if ws is not None:
+        return ws
+    ws = Workspace(name="My Workspace", owner_user_id=user.id)
+    db.add(ws)
+    db.flush()
+    db.add(WorkspaceMember(workspace_id=ws.id, user_id=user.id, role="owner"))
+    db.commit()
+    # Seed signup credits so new users can try the product immediately.
+    from app import billing
+    billing.grant(db, ws.id, billing.FREE_SIGNUP_CREDITS, reason="signup_grant",
+                  idempotency_key=f"signup:{ws.id}")
+    return ws
+
+
 # ── User-keys resolver (shared by jobs + articles routers) ─────────────────
 
 def resolve_user_keys(

@@ -12,7 +12,10 @@ from sqlalchemy.exc import IntegrityError
 from mutagen.mp3 import MP3
 
 from app.db import SessionLocal
-from app.models import Source, Article, AudioAsset, VoiceCalibration, ImageAsset, VideoAsset, SceneVideoAsset
+from app.models import (
+    Source, Article, AudioAsset, VoiceCalibration, ImageAsset, VideoAsset,
+    SceneVideoAsset, Product, Brand, Campaign, AdConcept,
+)
 from app.extract import extract_article_text
 from app.summarize import make_tts_bundle, rewrite_to_target_words, generate_social_captions, _pick_wpm
 from app.tts import synthesize
@@ -35,6 +38,23 @@ celery_app = Celery(
     broker=os.environ["CELERY_BROKER_URL"],
     backend=os.environ["CELERY_RESULT_BACKEND"],
 )
+
+
+def _refund_credits(workspace_id: str | None, amount: int | None, idem: str | None) -> None:
+    """Return credits charged at enqueue when a catalog-to-ad task fails.
+
+    Idempotent (keyed on the original charge), so retries never double-refund.
+    Never raises — billing failures must not mask the original task error.
+    """
+    if not workspace_id or not amount:
+        return
+    try:
+        from app.billing import refund
+        with SessionLocal() as db:
+            refund(db, workspace_id, int(amount), ref_type="refund",
+                   idempotency_key=f"refund:{idem}" if idem else None)
+    except Exception as exc:  # pragma: no cover - best effort
+        logger.warning("Credit refund failed for workspace=%s: %s", workspace_id, exc)
 celery_app.conf.result_expires = 86400  # purge task results after 24 h
 
 
@@ -1204,6 +1224,559 @@ def regenerate_script_for_article(
             "word_count": bundle.get("word_count"),
             "scene_count": len(bundle.get("scenes") or []),
         }
+
+
+# ── Catalog-to-ad: product analysis ─────────────────────────────────────────────
+
+@celery_app.task(name="analyze_product", bind=True)
+def analyze_product_task(
+    self,
+    product_id: str,
+    openai_api_key: str | None = None,
+    bill_workspace_id: str | None = None,
+    bill_amount: int = 0,
+    bill_idem: str | None = None,
+) -> dict:
+    """Analyze a single catalog product into ad-strategy material.
+
+    Writes the result to ``product.analysis_json`` (audience, pains, benefits,
+    angles, claim_risk). The product analogue of ``regenerate_script_for_article``'s
+    analysis step. Never blocks on tracking failures. Refunds credits on failure.
+    """
+    from app.analyze import analyze_product as _analyze_product
+
+    try:
+      with SessionLocal() as db:
+        product = db.get(Product, product_id)
+        if not product:
+            raise ValueError(f"Unknown product_id: {product_id}")
+
+        # Optional brand context shapes tone/audience of the analysis.
+        brand_context = None
+        if product.brand_id:
+            brand = db.get(Brand, product.brand_id)
+            if brand:
+                brand_context = {
+                    "name": brand.name,
+                    "tone": brand.tone_json,
+                    "target_audience": brand.target_audience_json,
+                }
+
+        self.update_state(
+            state="PROGRESS",
+            meta={"stage": "analyzing", "msg": "Analyzing product…"},
+        )
+
+        collector = UsageCollector(
+            workspace_id=product.workspace_id,
+            product_id=product.id,
+        )
+        product_data = {
+            "title": product.title,
+            "description": product.description,
+            "price": product.price,
+            "currency": product.currency,
+            "category": product.category,
+            "attributes": product.attributes_json or {},
+        }
+        analysis = _analyze_product(
+            product_data,
+            brand_context,
+            api_key=openai_api_key,
+            collector=collector,
+        )
+
+        product.analysis_json = analysis
+        product.status = "analyzed"
+        db.commit()
+        collector.flush(db)
+
+        return {
+            "product_id": product_id,
+            "claim_risk": analysis.get("claim_risk"),
+            "angle_count": len(analysis.get("ad_angles") or []),
+        }
+    except Exception:
+        _refund_credits(bill_workspace_id, bill_amount, bill_idem)
+        raise
+
+
+# ── Catalog-to-ad: ad concept generation ────────────────────────────────────────
+
+def _angle_text(entry) -> str | None:
+    """ad_angles entries may be {'angle','rationale'} dicts or plain strings."""
+    if isinstance(entry, dict):
+        return entry.get("angle")
+    return entry or None
+
+
+@celery_app.task(name="generate_ad_concepts", bind=True)
+def generate_ad_concepts(
+    self,
+    product_id: str,
+    campaign_id: str | None = None,
+    goal: str | None = None,
+    platforms: list | None = None,
+    language: str | None = None,
+    n_variants: int = 3,
+    openai_api_key: str | None = None,
+    bill_workspace_id: str | None = None,
+    bill_amount: int = 0,
+    bill_idem: str | None = None,
+) -> dict:
+    """Generate N ad creative variants for a product → ``ad_concepts`` rows.
+
+    Each variant: hook, headline, ugc/demo/influencer scripts, per-platform
+    captions, CTA, on-screen text, a render-ready storyboard, and a compliance
+    review. Auto-analyzes the product first if it has no analysis yet.
+
+    A campaign (if given) supplies goal/platforms and links the concepts.
+    Refunds credits on failure.
+    """
+    from app.analyze import analyze_product as _analyze_product
+    from app.ad_concepts import generate_creative_pack, run_compliance
+
+    try:
+      with SessionLocal() as db:
+        product = db.get(Product, product_id)
+        if not product:
+            raise ValueError(f"Unknown product_id: {product_id}")
+
+        # Campaign drives goal/platforms when present; task args are the fallback.
+        campaign = db.get(Campaign, campaign_id) if campaign_id else None
+        eff_goal = (campaign.goal if campaign else None) or goal or "awareness"
+        eff_platforms = (campaign.platforms if campaign else None) or platforms or ["tiktok"]
+        eff_language = language or "en"
+        # Brand context (voice + prohibited words + category).
+        brand_context = None
+        prohibited_words: list = []
+        if product.brand_id:
+            brand = db.get(Brand, product.brand_id)
+            if brand:
+                brand_context = {"name": brand.name, "tone": brand.tone_json}
+                prohibited_words = brand.prohibited_words or []
+                eff_language = language or brand.default_language or eff_language
+
+        # Ensure analysis exists — generate inline if the product was never analyzed.
+        analysis = product.analysis_json
+        if not analysis:
+            self.update_state(state="PROGRESS", meta={"stage": "analyzing", "msg": "Analyzing product…"})
+            pre_collector = UsageCollector(workspace_id=product.workspace_id, product_id=product.id)
+            analysis = _analyze_product(
+                {
+                    "title": product.title, "description": product.description,
+                    "price": product.price, "currency": product.currency,
+                    "category": product.category, "attributes": product.attributes_json or {},
+                },
+                brand_context,
+                api_key=openai_api_key,
+                collector=pre_collector,
+            )
+            product.analysis_json = analysis
+            product.status = "analyzed"
+            db.commit()
+            pre_collector.flush(db)
+
+        angles = analysis.get("ad_angles") or []
+        product_data = {
+            "title": product.title, "description": product.description,
+            "price": product.price, "currency": product.currency,
+            "category": product.category,
+        }
+
+        collector = UsageCollector(workspace_id=product.workspace_id, product_id=product.id)
+        concept_ids: list[str] = []
+
+        for i in range(max(1, n_variants)):
+            angle = _angle_text(angles[i % len(angles)]) if angles else None
+
+            # Create the row first so usage events can carry its id.
+            concept = AdConcept(
+                workspace_id=product.workspace_id,
+                campaign_id=campaign_id,
+                product_id=product.id,
+                variant_index=i,
+                angle=angle,
+                status="generating",
+            )
+            db.add(concept)
+            db.flush()
+            collector.ad_concept_id = concept.id
+
+            self.update_state(
+                state="PROGRESS",
+                meta={"stage": "generating", "msg": f"Generating ad variant {i + 1}/{n_variants}…"},
+            )
+
+            pack = generate_creative_pack(
+                product_data, analysis, brand_context,
+                goal=eff_goal, platforms=eff_platforms, language=eff_language,
+                angle=angle, api_key=openai_api_key, collector=collector,
+            )
+            compliance = run_compliance(
+                pack, category=product.category, prohibited_words=prohibited_words,
+                api_key=openai_api_key, collector=collector,
+            )
+
+            scenes = pack.get("storyboard") or []
+            concept.angle = pack.get("angle") or angle
+            concept.hook = pack.get("hook")
+            concept.headline = pack.get("headline")
+            concept.script_json = pack.get("scripts") or {}
+            concept.captions_json = pack.get("captions") or {}
+            concept.cta = pack.get("cta")
+            concept.on_screen_text = pack.get("on_screen_text")
+            concept.storyboard_json = {
+                "scenes": scenes,
+                "total_duration_estimate": round(
+                    sum(s.get("duration_estimate", 0.0) for s in scenes), 1
+                ),
+            }
+            concept.compliance_json = compliance
+            # High-risk concepts are held for review rather than marked ready.
+            concept.status = "flagged" if compliance.get("risk") == "high" else "ready"
+            concept_ids.append(concept.id)
+
+        db.commit()
+        collector.flush(db)
+
+        return {
+            "product_id": product_id,
+            "campaign_id": campaign_id,
+            "concept_ids": concept_ids,
+            "count": len(concept_ids),
+        }
+    except Exception:
+        _refund_credits(bill_workspace_id, bill_amount, bill_idem)
+        raise
+
+
+# ── Catalog-to-ad: single-concept regeneration ──────────────────────────────────
+
+@celery_app.task(name="regenerate_ad_concept", bind=True)
+def regenerate_ad_concept(
+    self,
+    concept_id: str,
+    angle: str | None = None,
+    openai_api_key: str | None = None,
+    bill_workspace_id: str | None = None,
+    bill_amount: int = 0,
+    bill_idem: str | None = None,
+) -> dict:
+    """Regenerate one existing ad concept in place (fresh creative + compliance).
+
+    Reuses the product's existing analysis. ``angle`` overrides the variant's
+    angle; otherwise the concept's current angle is reused. The row id is kept
+    so the frontend can update it without reordering. Refunds credits on failure.
+    """
+    from app.ad_concepts import generate_creative_pack, run_compliance
+
+    try:
+      with SessionLocal() as db:
+        concept = db.get(AdConcept, concept_id)
+        if not concept or concept.deleted_at is not None:
+            raise ValueError(f"Unknown concept_id: {concept_id}")
+
+        product = db.get(Product, concept.product_id)
+        if not product:
+            raise ValueError("Concept's product no longer exists")
+
+        # Brand context + campaign goal/platforms.
+        brand_context = None
+        prohibited_words: list = []
+        eff_language = "en"
+        if product.brand_id:
+            brand = db.get(Brand, product.brand_id)
+            if brand:
+                brand_context = {"name": brand.name, "tone": brand.tone_json}
+                prohibited_words = brand.prohibited_words or []
+                eff_language = brand.default_language or eff_language
+
+        eff_goal = "awareness"
+        eff_platforms = ["tiktok"]
+        if concept.campaign_id:
+            campaign = db.get(Campaign, concept.campaign_id)
+            if campaign:
+                eff_goal = campaign.goal or eff_goal
+                eff_platforms = campaign.platforms or eff_platforms
+
+        analysis = product.analysis_json or {}
+        eff_angle = angle or concept.angle
+
+        self.update_state(state="PROGRESS", meta={"stage": "generating", "msg": "Regenerating concept…"})
+
+        collector = UsageCollector(
+            workspace_id=concept.workspace_id,
+            product_id=product.id,
+            ad_concept_id=concept.id,
+        )
+        pack = generate_creative_pack(
+            {
+                "title": product.title, "description": product.description,
+                "price": product.price, "currency": product.currency,
+                "category": product.category,
+            },
+            analysis, brand_context,
+            goal=eff_goal, platforms=eff_platforms, language=eff_language,
+            angle=eff_angle, api_key=openai_api_key, collector=collector,
+        )
+        compliance = run_compliance(
+            pack, category=product.category, prohibited_words=prohibited_words,
+            api_key=openai_api_key, collector=collector,
+        )
+
+        scenes = pack.get("storyboard") or []
+        concept.angle = pack.get("angle") or eff_angle
+        concept.hook = pack.get("hook")
+        concept.headline = pack.get("headline")
+        concept.script_json = pack.get("scripts") or {}
+        concept.captions_json = pack.get("captions") or {}
+        concept.cta = pack.get("cta")
+        concept.on_screen_text = pack.get("on_screen_text")
+        concept.storyboard_json = {
+            "scenes": scenes,
+            "total_duration_estimate": round(
+                sum(s.get("duration_estimate", 0.0) for s in scenes), 1
+            ),
+        }
+        concept.compliance_json = compliance
+        concept.status = "flagged" if compliance.get("risk") == "high" else "ready"
+        db.commit()
+        collector.flush(db)
+
+        return {
+            "concept_id": concept.id,
+            "product_id": product.id,
+            "status": concept.status,
+            "risk": compliance.get("risk"),
+        }
+    except Exception:
+        _refund_credits(bill_workspace_id, bill_amount, bill_idem)
+        raise
+
+
+# ── Catalog-to-ad: video render off an ad concept storyboard ─────────────────────
+
+@celery_app.task(name="generate_ad_concept_video", bind=True, time_limit=900, soft_time_limit=840)
+def generate_ad_concept_video(
+    self,
+    concept_id: str,
+    platform: str = "tiktok",
+    burn_subtitles: bool = True,
+    voice_id: str | None = None,
+    openai_api_key: str | None = None,
+    elevenlabs_api_key: str | None = None,
+    bill_workspace_id: str | None = None,
+    bill_amount: int = 0,
+    bill_idem: str | None = None,
+) -> dict:
+    """Render an MP4 from an ad concept's storyboard.
+
+    Reuses the article video pipeline (DALL-E scene images → ElevenLabs voiceover
+    → FFmpeg assembly). Voiceover text is the storyboard narration (falls back to
+    the UGC script). Assets are tagged with workspace/product/concept ids and have
+    no article_id. Re-runs reuse already-generated scene images.
+    """
+    from app.image_gen import generate_and_save
+    from app.video import assemble_video
+    from app.tts import synthesize
+    from app.captions import storyboard_to_captions, captions_to_srt
+    from app.schemas import Storyboard
+    from app.platforms import get_profile as _get_profile
+
+    image_dir = os.getenv("IMAGE_DIR", "/data/images")
+    video_dir = os.getenv("VIDEO_DIR", "/data/video")
+    audio_dir = os.getenv("AUDIO_DIR", "/data/audio")
+    for d in (image_dir, video_dir, audio_dir):
+        os.makedirs(d, exist_ok=True)
+
+    plat_profile = _get_profile(platform)
+
+    with SessionLocal() as db:
+        concept = db.get(AdConcept, concept_id)
+        if not concept or concept.deleted_at is not None:
+            raise ValueError(f"Unknown concept_id: {concept_id}")
+        if not concept.storyboard_json:
+            raise RuntimeError("Concept has no storyboard — regenerate the concept first")
+
+        try:
+            storyboard = Storyboard(**concept.storyboard_json)
+        except Exception as exc:
+            raise RuntimeError(f"Storyboard format incompatible — regenerate the concept: {exc}") from exc
+        if not storyboard.scenes:
+            raise RuntimeError("Storyboard has no scenes")
+
+        # Voiceover text: prefer narration, fall back to the UGC script.
+        narration = " ".join(s.narration for s in storyboard.scenes if s.narration).strip()
+        if not narration:
+            narration = (concept.script_json or {}).get("ugc", "").strip()
+        if not narration:
+            raise RuntimeError("No narration/script text to voice")
+
+        resolved_voice = voice_id or os.getenv("ELEVENLABS_VOICE_ID")
+        model_id = os.getenv("ELEVENLABS_MODEL_ID", "eleven_multilingual_v2")
+
+        video_record = VideoAsset(
+            article_id=None,
+            workspace_id=concept.workspace_id,
+            product_id=concept.product_id,
+            ad_concept_id=concept.id,
+            file_path="",
+            status="created",
+            platform=platform,
+            width=plat_profile.width,
+            height=plat_profile.height,
+        )
+        db.add(video_record)
+        db.commit()
+
+        collector = UsageCollector(
+            workspace_id=concept.workspace_id,
+            product_id=concept.product_id,
+            ad_concept_id=concept.id,
+        )
+        total_scenes = len(storyboard.scenes)
+        srt_path: str | None = None
+
+        try:
+            # ── Voiceover ─────────────────────────────────────────────────────
+            self.update_state(state="PROGRESS", meta={"stage": "voicing", "msg": "Synthesizing voiceover…"})
+            audio_record = AudioAsset(
+                article_id=None,
+                workspace_id=concept.workspace_id,
+                product_id=concept.product_id,
+                ad_concept_id=concept.id,
+                voice_id=resolved_voice or "default",
+                model_id=model_id,
+                output_format=os.getenv("ELEVENLABS_OUTPUT_FORMAT", "mp3_44100_128"),
+                file_path="",
+                platform=platform,
+                status="created",
+            )
+            db.add(audio_record)
+            db.commit()
+
+            audio_bytes = synthesize(
+                narration,
+                voice_id=resolved_voice,
+                api_key=elevenlabs_api_key,
+                model_id=model_id,
+                language_code=(concept_language(db, concept) or "en")[:2],
+                collector=collector,
+            )
+            audio_path = os.path.join(audio_dir, f"{concept_id}_{audio_record.id}.mp3")
+            with open(audio_path, "wb") as fh:
+                fh.write(audio_bytes)
+            audio_record.file_path = audio_path
+            audio_record.status = "ready"
+            video_record.audio_asset_id = audio_record.id
+            db.commit()
+
+            # ── Scene images ──────────────────────────────────────────────────
+            scene_inputs: list[dict] = []
+            for i, scene in enumerate(storyboard.scenes):
+                self.update_state(
+                    state="PROGRESS",
+                    meta={"stage": "imaging", "msg": f"Generating scene images… {i}/{total_scenes}",
+                          "progress": i / max(total_scenes, 1)},
+                )
+                img_path = os.path.join(image_dir, f"{concept_id}_scene_{scene.scene_number}.png")
+
+                existing = db.execute(
+                    select(ImageAsset).where(
+                        ImageAsset.ad_concept_id == concept_id,
+                        ImageAsset.scene_number == scene.scene_number,
+                        ImageAsset.status == "ready",
+                    )
+                ).scalar_one_or_none()
+
+                if existing and os.path.exists(existing.file_path):
+                    img_path = existing.file_path
+                else:
+                    success = generate_and_save(
+                        scene.visual_prompt, img_path, api_key=openai_api_key,
+                        collector=collector, scene_number=scene.scene_number,
+                    )
+                    db.add(ImageAsset(
+                        article_id=None,
+                        workspace_id=concept.workspace_id,
+                        product_id=concept.product_id,
+                        ad_concept_id=concept.id,
+                        scene_number=scene.scene_number,
+                        visual_prompt=scene.visual_prompt,
+                        file_path=img_path,
+                        status="ready" if success else "failed",
+                        error=None if success else "generation failed, placeholder used",
+                    ))
+                    db.commit()
+
+                if not os.path.exists(img_path):
+                    raise RuntimeError(f"Scene {scene.scene_number} image missing from disk ({img_path})")
+                scene_inputs.append({"image_path": img_path, "duration": max(scene.duration_estimate, 1.0)})
+
+            # ── Captions ──────────────────────────────────────────────────────
+            if burn_subtitles:
+                try:
+                    audio_seconds = float(_mp3_duration_seconds(audio_path))
+                except Exception:
+                    audio_seconds = None
+                captions = storyboard_to_captions(storyboard, actual_audio_duration=audio_seconds)
+                srt_path = os.path.join(video_dir, f"{concept_id}.srt")
+                with open(srt_path, "w", encoding="utf-8") as fh:
+                    fh.write(captions_to_srt(captions))
+
+            # ── Assembly ──────────────────────────────────────────────────────
+            self.update_state(state="PROGRESS", meta={"stage": "rendering", "msg": "Assembling video…"})
+            output_path = os.path.join(video_dir, f"{concept_id}_{video_record.id}.mp4")
+            actual_duration = assemble_video(
+                scenes=scene_inputs,
+                audio_path=audio_path,
+                output_path=output_path,
+                srt_path=srt_path,
+                width=plat_profile.width,
+                height=plat_profile.height,
+            )
+
+            video_record.file_path = output_path
+            video_record.duration_seconds = actual_duration
+            video_record.has_subtitles = burn_subtitles and srt_path is not None
+            video_record.status = "ready"
+            db.commit()
+            collector.flush(db, video_asset_id=video_record.id)
+
+            return {
+                "concept_id": concept_id,
+                "video_id": video_record.id,
+                "duration_seconds": actual_duration,
+                "scene_count": total_scenes,
+                "has_subtitles": video_record.has_subtitles,
+            }
+
+        except Exception as exc:
+            video_record.status = "failed"
+            video_record.error = str(exc)[:500]
+            db.commit()
+            collector.flush(db, video_asset_id=video_record.id)
+            _refund_credits(bill_workspace_id, bill_amount, bill_idem)
+            raise
+        finally:
+            if srt_path and os.path.exists(srt_path):
+                try:
+                    os.remove(srt_path)
+                except OSError:
+                    pass
+
+
+def concept_language(db, concept) -> str | None:
+    """Resolve the output language for a concept from its product's brand."""
+    if not concept.product_id:
+        return None
+    product = db.get(Product, concept.product_id)
+    if product and product.brand_id:
+        brand = db.get(Brand, product.brand_id)
+        if brand:
+            return brand.default_language
+    return None
 
 
 # ── Animated video task ────────────────────────────────────────────────────────
