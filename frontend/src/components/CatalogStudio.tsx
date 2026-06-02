@@ -3,11 +3,11 @@ import type {
   AdConcept, Brand, Campaign, Catalog, IngestReport, Product, Workspace,
 } from '../types'
 import {
-  analyzeProduct, createBrand, createCampaign, deleteConcept, downloadCampaignExport,
-  downloadConceptVideo, generateCampaign, generateConceptVideo, getWorkspaceCredits,
-  ingestUrls, jobStatus, listBrands, listCampaignConcepts, listCampaigns, listCatalogs,
-  listProductConcepts, listProducts, listWorkspaces, regenerateConcept, updateConcept,
-  uploadCsvCatalog,
+  analyzeProduct, createBrand, createCampaign, createCheckout, deleteConcept,
+  downloadCampaignExport, downloadConceptVideo, generateCampaign, generateConceptVideo,
+  getCreditPacks, getWorkspaceCredits, ingestUrls, jobStatus, listBrands,
+  listCampaignConcepts, listCampaigns, listCatalogs, listProductConcepts, listProducts,
+  listWorkspaces, regenerateConcept, updateConcept, uploadCsvCatalog,
 } from '../api'
 
 type Tab = 'catalog' | 'products' | 'campaigns'
@@ -114,9 +114,10 @@ export default function CatalogStudio() {
         <div style={{ textAlign: 'right' }}>
           <div className="status">{busy || `${workspace.name} · ${products.length} products`}</div>
           {credits != null && (
-            <div className="small" style={{ marginTop: 2 }}>
-              <b style={{ color: credits > 0 ? '#30a46c' : '#e5484d' }}>{credits}</b> credits
-              {costs.video != null && <span> · analyze {costs.analyze} · concept {costs.concept} · video {costs.video}</span>}
+            <div className="small" style={{ marginTop: 2, display: 'flex', gap: 6, alignItems: 'center', justifyContent: 'flex-end' }}>
+              <span><b style={{ color: credits > 0 ? '#30a46c' : '#e5484d' }}>{credits}</b> credits</span>
+              {costs.video != null && <span>· analyze {costs.analyze} · concept {costs.concept} · video {costs.video}</span>}
+              <BuyCredits workspaceId={workspace.id} run={run} />
             </div>
           )}
         </div>
@@ -539,5 +540,45 @@ function ConceptCard(props: {
         </div>
       )}
     </div>
+  )
+}
+
+// ── Buy credits (Stripe Checkout) ────────────────────────────────────────────
+
+function BuyCredits(props: {
+  workspaceId: string
+  run: (label: string, fn: () => Promise<void>) => Promise<void>
+}) {
+  const { workspaceId, run } = props
+  const [packs, setPacks] = useState<{ id: string; credits: number; label: string; price_configured: boolean }[]>([])
+  const [configured, setConfigured] = useState(false)
+  const [pack, setPack] = useState('')
+
+  useEffect(() => {
+    getCreditPacks().then(r => {
+      setConfigured(r.configured)
+      setPacks(r.packs)
+      const first = r.packs.find(p => p.price_configured) ?? r.packs[0]
+      if (first) setPack(first.id)
+    }).catch(() => {})
+  }, [])
+
+  // Hide entirely when billing isn't wired up (keeps the header clean in dev).
+  if (!configured || !packs.length) return null
+
+  return (
+    <span style={{ display: 'inline-flex', gap: 4, alignItems: 'center' }}>
+      <select value={pack} onChange={e => setPack(e.target.value)} className="small">
+        {packs.map(p => (
+          <option key={p.id} value={p.id} disabled={!p.price_configured}>
+            {p.label}{p.price_configured ? '' : ' (n/a)'}
+          </option>
+        ))}
+      </select>
+      <button className="primary small" onClick={() => run('Opening checkout…', async () => {
+        const { url } = await createCheckout(workspaceId, pack)
+        window.location.href = url  // redirect to Stripe-hosted Checkout
+      })}>Buy credits</button>
+    </span>
   )
 }

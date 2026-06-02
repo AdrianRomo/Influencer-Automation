@@ -24,6 +24,7 @@ dependencies = [
     "uvicorn[standard]>=0.40.0",
     "prometheus-client>=0.25.0",
     "sentry-sdk[celery,fastapi]>=2.58.0",
+    "stripe>=15.2.0",
 ]
 
 [dependency-groups]

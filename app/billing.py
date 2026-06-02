@@ -26,6 +26,23 @@ _DEFAULT_COSTS = {"analyze": 1, "concept": 1, "video": 10}
 
 FREE_SIGNUP_CREDITS = int(os.getenv("FREE_SIGNUP_CREDITS", "50"))
 
+# ── Stripe credit packs ──────────────────────────────────────────────────────
+# Purchasable bundles. The Stripe Price id for each pack is supplied via env
+# (STRIPE_PRICE_STARTER etc.) so the same code works across test/live modes.
+CREDIT_PACKS: dict[str, dict] = {
+    "starter": {"credits": 100, "label": "Starter — 100 credits"},
+    "growth": {"credits": 500, "label": "Growth — 500 credits"},
+    "pro": {"credits": 2000, "label": "Pro — 2,000 credits"},
+}
+
+
+def stripe_price_id(pack: str) -> str | None:
+    return os.getenv(f"STRIPE_PRICE_{pack.upper()}")
+
+
+def stripe_configured() -> bool:
+    return bool(os.getenv("STRIPE_SECRET_KEY", "").strip())
+
 
 class InsufficientCredits(Exception):
     def __init__(self, needed: int, available: int) -> None:

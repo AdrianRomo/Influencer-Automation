@@ -531,3 +531,15 @@ export function getWorkspaceCredits(workspaceId: string): Promise<{
 }> {
   return http(`/workspaces/${workspaceId}/credits`)
 }
+
+export function getCreditPacks(): Promise<{
+  configured: boolean
+  packs: { id: string; credits: number; label: string; price_configured: boolean }[]
+}> {
+  return http('/billing/packs')
+}
+export function createCheckout(workspaceId: string, pack: string): Promise<{ url: string; session_id: string }> {
+  return http(`/workspaces/${workspaceId}/billing/checkout`, {
+    method: 'POST', body: JSON.stringify({ pack }),
+  })
+}
