@@ -1129,7 +1129,7 @@ def generate_video_for_article(
 
             video_record.file_path = output_path
             video_record.duration_seconds = actual_duration
-            video_record.has_subtitles = burn_subtitles and srt_path is not None
+            video_record.has_subtitles = 1 if (burn_subtitles and srt_path is not None) else 0
             video_record.status = "ready"
             db.commit()
 
@@ -1739,7 +1739,7 @@ def generate_ad_concept_video(
 
             video_record.file_path = output_path
             video_record.duration_seconds = actual_duration
-            video_record.has_subtitles = burn_subtitles and srt_path is not None
+            video_record.has_subtitles = 1 if (burn_subtitles and srt_path is not None) else 0
             video_record.status = "ready"
             db.commit()
             collector.flush(db, video_asset_id=video_record.id)
