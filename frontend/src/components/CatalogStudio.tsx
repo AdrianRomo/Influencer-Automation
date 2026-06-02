@@ -4,10 +4,11 @@ import type {
 } from '../types'
 import {
   analyzeProduct, createBrand, createCampaign, createCheckout, deleteConcept,
-  downloadCampaignExport, downloadConceptVideo, generateCampaign, generateConceptVideo,
-  getCreditPacks, getWorkspaceCredits, ingestUrls, jobStatus, listBrands,
-  listCampaignConcepts, listCampaigns, listCatalogs, listProductConcepts, listProducts,
-  listWorkspaces, regenerateConcept, updateConcept, uploadCsvCatalog,
+  deleteProduct, downloadCampaignExport, downloadConceptVideo, generateCampaign,
+  generateConceptVideo, getCreditPacks, getWorkspaceCredits, ingestUrls, jobStatus,
+  listBrands, listCampaignConcepts, listCampaigns, listCatalogs, listProductConcepts,
+  listProducts, listWorkspaces, regenerateConcept, updateConcept, updateProduct,
+  uploadCsvCatalog,
 } from '../api'
 
 type Tab = 'catalog' | 'products' | 'campaigns'
@@ -278,14 +279,41 @@ function ProductsTab(props: {
     return next
   })
 
+  // A product is campaign-ready only once it has been analyzed.
+  const isAnalyzed = (id: string) => !!products.find(p => p.id === id)?.analysis_json
+  const analyzedSelected = [...selected].filter(isAnalyzed)
+  const unanalyzedSelected = selected.size - analyzedSelected.length
+
   if (!products.length) {
     return <div className="card"><div className="small">No products yet — import a catalog first.</div></div>
+  }
+
+  const createCampaignNow = () => {
+    const ids = analyzedSelected
+    if (!ids.length) return
+    const ok = window.confirm(
+      `Create a campaign with ${ids.length} analyzed product(s)?` +
+      (unanalyzedSelected > 0 ? `\n\n${unanalyzedSelected} unanalyzed selection(s) will be skipped.` : '')
+    )
+    if (!ok) return
+    run('Creating campaign…', async () => {
+      await createCampaign(workspaceId, {
+        name: name.trim(), goal, platforms,
+        product_ids: ids, brand_id: brandId || null,
+      })
+      setName(''); setSelected(new Set()); await onCampaignCreated()
+    })
   }
 
   return (
     <div style={{ display: 'grid', gap: 12 }}>
       <div className="card" style={{ display: 'grid', gap: 8 }}>
-        <label>Create campaign from {selected.size} selected product(s)</label>
+        <label>
+          Create campaign from {analyzedSelected.length} analyzed product(s)
+          {unanalyzedSelected > 0 && (
+            <span className="small" style={{ color: '#f5a623' }}> · {unanalyzedSelected} unanalyzed will be skipped</span>
+          )}
+        </label>
         <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
           <input placeholder="Campaign name" value={name} onChange={e => setName(e.target.value)} />
           <select value={goal} onChange={e => setGoal(e.target.value)}>
@@ -302,49 +330,109 @@ function ProductsTab(props: {
               {p}
             </label>
           ))}
-          <button className="primary" disabled={!name.trim() || !selected.size}
-            onClick={() => run('Creating campaign…', async () => {
-              await createCampaign(workspaceId, {
-                name: name.trim(), goal, platforms,
-                product_ids: [...selected], brand_id: brandId || null,
-              })
-              setName(''); setSelected(new Set()); await onCampaignCreated()
-            })}>Create campaign →</button>
+          <button className="primary" disabled={!name.trim() || !analyzedSelected.length}
+            title={!analyzedSelected.length ? 'Select at least one analyzed product' : ''}
+            onClick={createCampaignNow}>Create campaign →</button>
         </div>
+        {!analyzedSelected.length && selected.size > 0 && (
+          <div className="small" style={{ color: '#f5a623' }}>
+            None of the selected products are analyzed yet — click Analyze on a product first.
+          </div>
+        )}
       </div>
 
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(280px, 1fr))', gap: 10 }}>
         {products.map(p => (
-          <div key={p.id} className="card" style={{ borderColor: selected.has(p.id) ? '#3b82f6' : undefined }}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', gap: 6 }}>
-              <label style={{ display: 'flex', gap: 6, fontWeight: 600 }}>
-                <input type="checkbox" checked={selected.has(p.id)} onChange={() => toggle(p.id)} />
-                {p.title}
-              </label>
-              <span className="small">{p.status}</span>
-            </div>
-            <div className="small">{p.category || '—'}{p.price != null ? ` · ${p.price} ${p.currency || ''}` : ''}</div>
-            {p.analysis_json?.claim_risk && (
-              <div className="small">
-                risk: <span style={{ color: riskColor(p.analysis_json.claim_risk) }}>{p.analysis_json.claim_risk}</span>
-                {' · '}{(p.analysis_json.ad_angles?.length ?? 0)} angles
-              </div>
-            )}
-            <div style={{ display: 'flex', gap: 6, marginTop: 6 }}>
-              <button className="secondary" onClick={() => run('Analyzing…', async () => {
-                const { task_id } = await analyzeProduct(p.id)
-                await pollJob(task_id)
-                await onChanged()
-              })}>{p.analysis_json ? 'Re-analyze' : 'Analyze'}</button>
-            </div>
-            {p.analysis_json?.ad_angles && p.analysis_json.ad_angles.length > 0 && (
-              <ul className="small" style={{ margin: '6px 0 0', paddingLeft: 16 }}>
-                {p.analysis_json.ad_angles.slice(0, 3).map((a, i) => <li key={i}>{a.angle}</li>)}
-              </ul>
-            )}
-          </div>
+          <ProductCard
+            key={p.id} product={p} selected={selected.has(p.id)}
+            onToggle={() => toggle(p.id)} onChanged={onChanged} run={run}
+          />
         ))}
       </div>
+    </div>
+  )
+}
+
+function ProductCard(props: {
+  product: Product
+  selected: boolean
+  onToggle: () => void
+  onChanged: () => Promise<void>
+  run: (label: string, fn: () => Promise<void>) => Promise<void>
+}) {
+  const { product: p, selected, onToggle, onChanged, run } = props
+  const [editing, setEditing] = useState(false)
+  const [draft, setDraft] = useState({
+    title: p.title, description: p.description ?? '',
+    price: p.price != null ? String(p.price) : '', category: p.category ?? '',
+  })
+
+  const save = () => run('Saving product…', async () => {
+    if (!draft.title.trim()) throw new Error('Title cannot be empty')
+    await updateProduct(p.id, {
+      title: draft.title.trim(),
+      description: draft.description || null,
+      price: draft.price.trim() === '' ? null : Number(draft.price),
+      category: draft.category || null,
+    })
+    setEditing(false); await onChanged()
+  })
+
+  return (
+    <div className="card" style={{ borderColor: selected ? '#3b82f6' : undefined }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', gap: 6 }}>
+        <label style={{ display: 'flex', gap: 6, fontWeight: 600 }}>
+          <input type="checkbox" checked={selected} onChange={onToggle} />
+          {p.title}
+        </label>
+        <span className="small">{p.status}</span>
+      </div>
+
+      {editing ? (
+        <div style={{ display: 'grid', gap: 4, marginTop: 6 }}>
+          <input value={draft.title} placeholder="Title"
+            onChange={e => setDraft(d => ({ ...d, title: e.target.value }))} />
+          <textarea rows={2} value={draft.description} placeholder="Description"
+            onChange={e => setDraft(d => ({ ...d, description: e.target.value }))} />
+          <div style={{ display: 'flex', gap: 4 }}>
+            <input value={draft.price} placeholder="Price" style={{ width: 90 }}
+              onChange={e => setDraft(d => ({ ...d, price: e.target.value }))} />
+            <input value={draft.category} placeholder="Category"
+              onChange={e => setDraft(d => ({ ...d, category: e.target.value }))} />
+          </div>
+          <div style={{ display: 'flex', gap: 6 }}>
+            <button className="primary small" onClick={save}>Save</button>
+            <button className="secondary small" onClick={() => setEditing(false)}>Cancel</button>
+          </div>
+        </div>
+      ) : (
+        <>
+          <div className="small">{p.category || '—'}{p.price != null ? ` · ${p.price} ${p.currency || ''}` : ''}</div>
+          {p.analysis_json?.claim_risk && (
+            <div className="small">
+              risk: <span style={{ color: riskColor(p.analysis_json.claim_risk) }}>{p.analysis_json.claim_risk}</span>
+              {' · '}{(p.analysis_json.ad_angles?.length ?? 0)} angles
+            </div>
+          )}
+          <div style={{ display: 'flex', gap: 6, marginTop: 6, flexWrap: 'wrap' }}>
+            <button className="secondary small" onClick={() => run('Analyzing…', async () => {
+              const { task_id } = await analyzeProduct(p.id)
+              await pollJob(task_id)
+              await onChanged()
+            })}>{p.analysis_json ? 'Re-analyze' : 'Analyze'}</button>
+            <button className="secondary small" onClick={() => setEditing(true)}>Edit</button>
+            <button className="secondary small" style={{ color: '#e5484d' }} onClick={() => {
+              if (!window.confirm(`Delete "${p.title}"?`)) return
+              run('Deleting product…', async () => { await deleteProduct(p.id); await onChanged() })
+            }}>Delete</button>
+          </div>
+          {p.analysis_json?.ad_angles && p.analysis_json.ad_angles.length > 0 && (
+            <ul className="small" style={{ margin: '6px 0 0', paddingLeft: 16 }}>
+              {p.analysis_json.ad_angles.slice(0, 3).map((a, i) => <li key={i}>{a.angle}</li>)}
+            </ul>
+          )}
+        </>
+      )}
     </div>
   )
 }

@@ -1,7 +1,11 @@
-"""Product routes — browse products, queue analysis, list generated concepts."""
+"""Product routes — browse, edit, delete, queue analysis, list generated concepts."""
 from __future__ import annotations
 
+from datetime import datetime
+from typing import Optional
+
 from fastapi import APIRouter, Depends, HTTPException, Request
+from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -93,6 +97,48 @@ def get_product(
     user: User = Depends(get_current_user),
 ):
     return serialize_product(_get_owned_product(db, product_id, user))
+
+
+class ProductUpdate(BaseModel):
+    """Manual edits to an imported product. Only provided fields change."""
+    title: Optional[str] = None
+    description: Optional[str] = None
+    price: Optional[float] = None
+    currency: Optional[str] = None
+    category: Optional[str] = None
+    primary_image_url: Optional[str] = None
+
+
+@router.patch("/products/{product_id}")
+def update_product(
+    product_id: str,
+    body: ProductUpdate,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Edit an imported product's fields. Editing leaves any prior analysis in
+    place; re-run Analyze to refresh it against the new copy."""
+    product = _get_owned_product(db, product_id, user)
+    data = body.model_dump(exclude_unset=True)
+    if "title" in data and not (data["title"] or "").strip():
+        raise HTTPException(status_code=422, detail="Title cannot be empty")
+    for field, value in data.items():
+        setattr(product, field, value)
+    db.commit()
+    return serialize_product(product)
+
+
+@router.delete("/products/{product_id}")
+def delete_product(
+    product_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Soft-delete a product (drops it from lists; existing concepts are kept)."""
+    product = _get_owned_product(db, product_id, user)
+    product.deleted_at = datetime.utcnow()
+    db.commit()
+    return {"deleted": product_id}
 
 
 @router.post("/products/{product_id}/analyze")

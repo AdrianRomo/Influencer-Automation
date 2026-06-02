@@ -543,3 +543,13 @@ export function createCheckout(workspaceId: string, pack: string): Promise<{ url
     method: 'POST', body: JSON.stringify({ pack }),
   })
 }
+
+export function updateProduct(
+  productId: string,
+  body: Partial<Pick<Product, 'title' | 'description' | 'price' | 'currency' | 'category' | 'primary_image_url'>>,
+): Promise<Product> {
+  return http(`/products/${productId}`, { method: 'PATCH', body: JSON.stringify(body) })
+}
+export function deleteProduct(productId: string): Promise<{ deleted: string }> {
+  return http(`/products/${productId}`, { method: 'DELETE' })
+}
