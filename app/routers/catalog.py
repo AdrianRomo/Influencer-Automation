@@ -6,11 +6,12 @@ right adapter and upserts products. Returns the import report (counts + errors).
 """
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Optional
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.catalog import ingest_catalog
@@ -30,18 +31,43 @@ class UrlIngestReq(BaseModel):
     brand_id: Optional[str] = None
 
 
-def _serialize_catalog(c: Catalog) -> dict:
+class CatalogUpdate(BaseModel):
+    name: str = Field(..., min_length=1, max_length=200)
+
+
+def _active_item_count(db: Session, catalog_id: str) -> int:
+    return int(db.execute(
+        select(func.count(Product.id)).where(
+            Product.catalog_id == catalog_id, Product.deleted_at.is_(None)
+        )
+    ).scalar() or 0)
+
+
+def _serialize_catalog(c: Catalog, active_count: Optional[int] = None) -> dict:
     return {
         "id": c.id,
         "workspace_id": c.workspace_id,
         "brand_id": c.brand_id,
+        "name": c.name,
+        # Display name the UI can show directly.
+        "display_name": c.name or c.source_ref or f"{c.source_type} catalog",
         "source_type": c.source_type,
         "source_ref": c.source_ref,
         "status": c.status,
+        # item_count is the import snapshot; active_count reflects live (post-delete) state.
         "item_count": c.item_count,
+        "active_item_count": active_count if active_count is not None else c.item_count,
         "last_synced_at": c.last_synced_at.isoformat() if c.last_synced_at else None,
         "created_at": c.created_at.isoformat() if c.created_at else None,
     }
+
+
+def _get_owned_catalog(db: Session, catalog_id: str, user: User) -> Catalog:
+    catalog = db.get(Catalog, catalog_id)
+    if catalog is None or catalog.deleted_at is not None:
+        raise HTTPException(status_code=404, detail="Catalog not found")
+    assert_workspace_member(db, catalog.workspace_id, user)
+    return catalog
 
 
 @router.get("/workspaces/{workspace_id}/catalogs")
@@ -52,9 +78,60 @@ def list_catalogs(
 ):
     assert_workspace_member(db, workspace_id, user)
     catalogs = db.execute(
-        select(Catalog).where(Catalog.workspace_id == workspace_id).order_by(Catalog.created_at.desc())
+        select(Catalog).where(
+            Catalog.workspace_id == workspace_id,
+            Catalog.deleted_at.is_(None),
+        ).order_by(Catalog.created_at.desc())
     ).scalars().all()
-    return {"catalogs": [_serialize_catalog(c) for c in catalogs]}
+    return {"catalogs": [
+        _serialize_catalog(c, _active_item_count(db, c.id)) for c in catalogs
+    ]}
+
+
+@router.get("/catalogs/{catalog_id}")
+def get_catalog(
+    catalog_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    catalog = _get_owned_catalog(db, catalog_id, user)
+    return _serialize_catalog(catalog, _active_item_count(db, catalog.id))
+
+
+@router.patch("/catalogs/{catalog_id}")
+def update_catalog(
+    catalog_id: str,
+    body: CatalogUpdate,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Rename a catalog. Only the display name is editable."""
+    catalog = _get_owned_catalog(db, catalog_id, user)
+    catalog.name = body.name.strip()
+    db.commit()
+    return _serialize_catalog(catalog, _active_item_count(db, catalog.id))
+
+
+@router.delete("/catalogs/{catalog_id}")
+def delete_catalog(
+    catalog_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Soft-delete a catalog and its active products. The products stay
+    soft-deleted (so they can be re-imported later via CSV)."""
+    catalog = _get_owned_catalog(db, catalog_id, user)
+    now = datetime.utcnow()
+    products = db.execute(
+        select(Product).where(
+            Product.catalog_id == catalog_id, Product.deleted_at.is_(None)
+        )
+    ).scalars().all()
+    for p in products:
+        p.deleted_at = now
+    catalog.deleted_at = now
+    db.commit()
+    return {"deleted": catalog_id, "items_removed": len(products)}
 
 
 @router.post("/workspaces/{workspace_id}/catalogs/csv", status_code=201)

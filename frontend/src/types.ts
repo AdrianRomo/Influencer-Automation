@@ -356,10 +356,13 @@ export type Catalog = {
   id: string
   workspace_id: string
   brand_id?: string | null
+  name?: string | null
+  display_name?: string
   source_type: string
   source_ref?: string | null
   status: string
   item_count: number
+  active_item_count?: number
   last_synced_at?: string | null
   created_at?: string | null
 }
@@ -369,6 +372,7 @@ export type IngestReport = {
   source_type: string
   created: number
   updated: number
+  restored?: number
   product_ids: string[]
   errors: string[]
   item_count: number

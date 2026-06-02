@@ -553,3 +553,13 @@ export function updateProduct(
 export function deleteProduct(productId: string): Promise<{ deleted: string }> {
   return http(`/products/${productId}`, { method: 'DELETE' })
 }
+
+export function getCatalog(catalogId: string): Promise<Catalog> {
+  return http(`/catalogs/${catalogId}`)
+}
+export function updateCatalog(catalogId: string, name: string): Promise<Catalog> {
+  return http(`/catalogs/${catalogId}`, { method: 'PATCH', body: JSON.stringify({ name }) })
+}
+export function deleteCatalog(catalogId: string): Promise<{ deleted: string; items_removed: number }> {
+  return http(`/catalogs/${catalogId}`, { method: 'DELETE' })
+}

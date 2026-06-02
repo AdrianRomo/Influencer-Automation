@@ -373,9 +373,12 @@ class Catalog(Base):
     # csv | url | shopify | woocommerce | merchant | meta | manual | rss
     source_type: Mapped[str] = mapped_column(String(30), nullable=False)
     source_ref: Mapped[str | None] = mapped_column(String, nullable=True)  # filename, store domain, feed url
+    # User-editable display name; falls back to source_ref in the UI when unset.
+    name: Mapped[str | None] = mapped_column(String, nullable=True)
     status: Mapped[str] = mapped_column(String(20), default="created", nullable=False)
     item_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     last_synced_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    deleted_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
 
 

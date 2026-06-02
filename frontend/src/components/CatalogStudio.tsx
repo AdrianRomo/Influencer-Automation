@@ -3,12 +3,12 @@ import type {
   AdConcept, Brand, Campaign, Catalog, IngestReport, Product, Workspace,
 } from '../types'
 import {
-  analyzeProduct, createBrand, createCampaign, createCheckout, deleteConcept,
-  deleteProduct, downloadCampaignExport, downloadConceptVideo, generateCampaign,
-  generateConceptVideo, getCreditPacks, getWorkspaceCredits, ingestUrls, jobStatus,
-  listBrands, listCampaignConcepts, listCampaigns, listCatalogs, listProductConcepts,
-  listProducts, listWorkspaces, regenerateConcept, updateConcept, updateProduct,
-  uploadCsvCatalog,
+  analyzeProduct, createBrand, createCampaign, createCheckout, deleteCatalog,
+  deleteConcept, deleteProduct, downloadCampaignExport, downloadConceptVideo,
+  generateCampaign, generateConceptVideo, getCreditPacks, getWorkspaceCredits,
+  ingestUrls, jobStatus, listBrands, listCampaignConcepts, listCampaigns, listCatalogs,
+  listProductConcepts, listProducts, listWorkspaces, regenerateConcept, updateCatalog,
+  updateConcept, updateProduct, uploadCsvCatalog,
 } from '../api'
 
 type Tab = 'catalog' | 'products' | 'campaigns'
@@ -58,6 +58,8 @@ export default function CatalogStudio() {
   const [error, setError] = useState('')
   const [credits, setCredits] = useState<number | null>(null)
   const [costs, setCosts] = useState<Record<string, number>>({})
+  // When set, the Products tab is scoped to one catalog ("opened" from Catalogs).
+  const [catalogFilter, setCatalogFilter] = useState<{ id: string; name: string } | null>(null)
 
   const loadCredits = useCallback(async (wsId: string) => {
     try {
@@ -149,13 +151,17 @@ export default function CatalogStudio() {
         <CatalogTab
           workspaceId={workspace.id} brands={brands} catalogs={catalogs}
           onBrandCreated={async () => { await refreshAll(workspace.id) }}
-          onIngested={async () => { await refreshAll(workspace.id); setTab('products') }}
+          onIngested={async () => { await refreshAll(workspace.id); setCatalogFilter(null); setTab('products') }}
+          onOpenCatalog={(c) => { setCatalogFilter({ id: c.id, name: c.display_name || c.source_ref || 'catalog' }); setTab('products') }}
+          onCatalogChanged={async () => { await refreshAll(workspace.id) }}
           run={run}
         />
       )}
       {tab === 'products' && (
         <ProductsTab
           products={products} workspaceId={workspace.id} brands={brands}
+          catalogFilter={catalogFilter}
+          onClearFilter={() => setCatalogFilter(null)}
           onChanged={async () => { await refreshAll(workspace.id) }}
           onCampaignCreated={async () => { await refreshAll(workspace.id); setTab('campaigns') }}
           run={run}
@@ -177,9 +183,11 @@ function CatalogTab(props: {
   catalogs: Catalog[]
   onBrandCreated: () => Promise<void>
   onIngested: () => Promise<void>
+  onOpenCatalog: (c: Catalog) => void
+  onCatalogChanged: () => Promise<void>
   run: (label: string, fn: () => Promise<void>) => Promise<void>
 }) {
-  const { workspaceId, brands, catalogs, onBrandCreated, onIngested, run } = props
+  const { workspaceId, brands, catalogs, onBrandCreated, onIngested, onOpenCatalog, onCatalogChanged, run } = props
   const [brandId, setBrandId] = useState('')
   const [urls, setUrls] = useState('')
   const [report, setReport] = useState<IngestReport | null>(null)
@@ -236,7 +244,11 @@ function CatalogTab(props: {
 
       {report && (
         <div className="card">
-          <div><b>{report.created}</b> created · <b>{report.updated}</b> updated · {report.item_count} total</div>
+          <div>
+            <b>{report.created}</b> added · <b>{report.updated}</b> updated
+            {report.restored ? <> · <b style={{ color: '#30a46c' }}>{report.restored}</b> restored</> : null}
+            {' · '}{report.item_count} total
+          </div>
           {report.errors.length > 0 && (
             <ul className="small" style={{ color: '#f5a623' }}>
               {report.errors.slice(0, 8).map((e, i) => <li key={i}>{e}</li>)}
@@ -247,13 +259,51 @@ function CatalogTab(props: {
 
       <div className="card">
         <label>Catalogs ({catalogs.length})</label>
+        {catalogs.length === 0 && <div className="small">No catalogs yet — import a CSV or URLs above.</div>}
         {catalogs.map(c => (
-          <div key={c.id} className="small" style={{ display: 'flex', justifyContent: 'space-between', padding: '2px 0' }}>
-            <span>{c.source_ref || c.source_type} · {c.source_type}</span>
-            <span>{c.item_count} items · {c.status}</span>
-          </div>
+          <CatalogRow key={c.id} catalog={c} onOpen={() => onOpenCatalog(c)}
+            onChanged={onCatalogChanged} run={run} />
         ))}
       </div>
+    </div>
+  )
+}
+
+function CatalogRow(props: {
+  catalog: Catalog
+  onOpen: () => void
+  onChanged: () => Promise<void>
+  run: (label: string, fn: () => Promise<void>) => Promise<void>
+}) {
+  const { catalog: c, onOpen, onChanged, run } = props
+  const [renaming, setRenaming] = useState(false)
+  const [name, setName] = useState(c.display_name ?? c.source_ref ?? '')
+  const count = c.active_item_count ?? c.item_count
+
+  return (
+    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8, padding: '4px 0', borderTop: '1px solid #0000000f' }}>
+      {renaming ? (
+        <div style={{ display: 'flex', gap: 4, flex: 1 }}>
+          <input value={name} onChange={e => setName(e.target.value)} style={{ flex: 1 }} />
+          <button className="primary small" disabled={!name.trim()} onClick={() => run('Renaming catalog…', async () => {
+            await updateCatalog(c.id, name.trim()); setRenaming(false); await onChanged()
+          })}>Save</button>
+          <button className="secondary small" onClick={() => setRenaming(false)}>Cancel</button>
+        </div>
+      ) : (
+        <>
+          <button className="secondary small" onClick={onOpen} title="Open catalog items">
+            {c.display_name || c.source_ref || c.source_type}
+          </button>
+          <span className="small" style={{ flex: 1 }}>{count} items · {c.source_type} · {c.status}</span>
+          <button className="secondary small" onClick={onOpen}>Open</button>
+          <button className="secondary small" onClick={() => { setName(c.display_name ?? ''); setRenaming(true) }}>Rename</button>
+          <button className="secondary small" style={{ color: '#e5484d' }} onClick={() => {
+            if (!window.confirm(`Delete catalog "${c.display_name || c.source_ref}" and its ${count} item(s)? Items can be re-imported later.`)) return
+            run('Deleting catalog…', async () => { await deleteCatalog(c.id); await onChanged() })
+          }}>Delete</button>
+        </>
+      )}
     </div>
   )
 }
@@ -264,11 +314,15 @@ function ProductsTab(props: {
   products: Product[]
   workspaceId: string
   brands: Brand[]
+  catalogFilter?: { id: string; name: string } | null
+  onClearFilter?: () => void
   onChanged: () => Promise<void>
   onCampaignCreated: () => Promise<void>
   run: (label: string, fn: () => Promise<void>) => Promise<void>
 }) {
-  const { products, workspaceId, brands, onChanged, onCampaignCreated, run } = props
+  const { products: allProducts, workspaceId, brands, catalogFilter, onClearFilter, onChanged, onCampaignCreated, run } = props
+  // Scope to one catalog when "opened" from the Catalogs tab.
+  const products = catalogFilter ? allProducts.filter(p => p.catalog_id === catalogFilter.id) : allProducts
   const [selected, setSelected] = useState<Set<string>>(new Set())
   const [name, setName] = useState('')
   const [goal, setGoal] = useState('conversion')
@@ -290,8 +344,22 @@ function ProductsTab(props: {
   const analyzedSelected = [...selected].filter(isAnalyzed)
   const unanalyzedSelected = selected.size - analyzedSelected.length
 
+  const filterBanner = catalogFilter ? (
+    <div className="card" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', borderColor: '#3b82f6' }}>
+      <span className="small">Showing items from <b>{catalogFilter.name}</b></span>
+      <button className="secondary small" onClick={onClearFilter}>Show all products</button>
+    </div>
+  ) : null
+
   if (!products.length) {
-    return <div className="card"><div className="small">No products yet — import a catalog first.</div></div>
+    return (
+      <div style={{ display: 'grid', gap: 12 }}>
+        {filterBanner}
+        <div className="card"><div className="small">
+          {catalogFilter ? 'This catalog has no items (they may have been deleted). Re-import the CSV to restore them.' : 'No products yet — import a catalog first.'}
+        </div></div>
+      </div>
+    )
   }
 
   const createCampaignNow = () => {
@@ -313,6 +381,7 @@ function ProductsTab(props: {
 
   return (
     <div style={{ display: 'grid', gap: 12 }}>
+      {filterBanner}
       <div className="card" style={{ display: 'grid', gap: 8 }}>
         <label>
           Create campaign from {analyzedSelected.length} analyzed product(s)

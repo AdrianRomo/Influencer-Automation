@@ -28,36 +28,40 @@ def _find_existing(
     catalog_id: Optional[str],
     np: NormalizedProduct,
 ) -> Optional[Product]:
-    """Locate an existing product to update, by the strongest available key.
+    """Locate an existing product to update/restore, by the strongest available key.
 
     Priority: (catalog_id, external_id) → (workspace_id, url) → (workspace_id, title).
+    Matches active AND soft-deleted rows (a deleted row must be found so it can be
+    restored). When several rows match a weak key, prefer the active one, then the
+    most recent — so we never raise on duplicates and don't resurrect the wrong row.
     """
+    def _pick(stmt):
+        # Active first (deleted_at IS NULL), then newest.
+        rows = db.execute(
+            stmt.order_by(Product.deleted_at.is_(None).desc(), Product.created_at.desc())
+        ).scalars().all()
+        return rows[0] if rows else None
+
     if np.external_id and catalog_id:
-        found = db.execute(
-            select(Product).where(
-                Product.catalog_id == catalog_id,
-                Product.external_id == np.external_id,
-            )
-        ).scalar_one_or_none()
+        found = _pick(select(Product).where(
+            Product.catalog_id == catalog_id,
+            Product.external_id == np.external_id,
+        ))
         if found:
             return found
 
     if np.url:
-        found = db.execute(
-            select(Product).where(
-                Product.workspace_id == workspace_id,
-                Product.url == np.url,
-            )
-        ).scalar_one_or_none()
+        found = _pick(select(Product).where(
+            Product.workspace_id == workspace_id,
+            Product.url == np.url,
+        ))
         if found:
             return found
 
-    return db.execute(
-        select(Product).where(
-            Product.workspace_id == workspace_id,
-            Product.title == np.title,
-        )
-    ).scalar_one_or_none()
+    return _pick(select(Product).where(
+        Product.workspace_id == workspace_id,
+        Product.title == np.title,
+    ))
 
 
 def _apply_fields(product: Product, np: NormalizedProduct) -> None:
@@ -96,23 +100,42 @@ def upsert_products(
     """
     created = 0
     updated = 0
+    restored = 0
     product_ids: list[str] = []
+    # Track ids touched in THIS run so a duplicate CSV row resolves to the row we
+    # just inserted/restored rather than creating a second copy.
+    seen_ids: set[str] = set()
 
     for np in products:
         if not np.is_valid():
             continue
 
+        # Dedup matches BOTH active and soft-deleted rows on purpose: a deleted
+        # row must be restored (not re-inserted), otherwise the unique
+        # constraint on (catalog_id, external_id) would block the re-import.
         existing = _find_existing(
             db, workspace_id=workspace_id, catalog_id=catalog_id, np=np
         )
 
         if existing is not None:
+            was_deleted = existing.deleted_at is not None
             _apply_fields(existing, np)
-            if catalog_id and not existing.catalog_id:
-                existing.catalog_id = catalog_id
-            if brand_id and not existing.brand_id:
-                existing.brand_id = brand_id
-            updated += 1
+            if was_deleted:
+                # Resurrect: clear the soft-delete and re-home to this upload's
+                # catalog so the re-imported item shows up again.
+                existing.deleted_at = None
+                existing.catalog_id = catalog_id or existing.catalog_id
+                existing.brand_id = brand_id or existing.brand_id
+                # Keep prior analysis if it survived; reflect it in status.
+                existing.status = "analyzed" if existing.analysis_json else "created"
+                restored += 1
+            else:
+                if catalog_id and not existing.catalog_id:
+                    existing.catalog_id = catalog_id
+                if brand_id and not existing.brand_id:
+                    existing.brand_id = brand_id
+                updated += 1
+            seen_ids.add(existing.id)
             product_ids.append(existing.id)
         else:
             product = Product(
@@ -133,10 +156,16 @@ def upsert_products(
                 ))
 
             created += 1
+            seen_ids.add(product.id)
             product_ids.append(product.id)
 
     db.commit()
-    return {"created": created, "updated": updated, "product_ids": product_ids}
+    return {
+        "created": created,
+        "updated": updated,
+        "restored": restored,
+        "product_ids": product_ids,
+    }
 
 
 def ingest_catalog(
@@ -173,6 +202,7 @@ def ingest_catalog(
         "source_type": source_type,
         "created": 0,
         "updated": 0,
+        "restored": 0,
         "product_ids": [],
         "errors": [],
         "item_count": 0,
