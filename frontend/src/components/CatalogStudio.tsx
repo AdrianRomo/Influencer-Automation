@@ -10,16 +10,99 @@ import {
   listProductConcepts, listProducts, listWorkspaces, regenerateConcept, updateCatalog,
   updateConcept, updateProduct, uploadCsvCatalog,
 } from '../api'
+import { ErrorRecoveryCard } from './ErrorRecoveryCard'
+import { AdvancedSettingsDisclosure } from './AdvancedSettingsDisclosure'
 
 type Tab = 'catalog' | 'products' | 'campaigns'
 
 const GOALS = ['awareness', 'conversion', 'ugc']
 const PLATFORMS = ['tiktok', 'reels', 'youtube_shorts', 'facebook']
 
+// Goal copy for the seg-card selector — jargon-free labels + what each goal does.
+const GOAL_META: Record<string, { label: string; blurb: string }> = {
+  awareness: { label: 'Awareness', blurb: 'Reach + brand recognition' },
+  conversion: { label: 'Conversion', blurb: 'Drive clicks + sales' },
+  ugc: { label: 'UGC', blurb: 'Authentic creator style' },
+}
+
+// Human labels for platform ids (chips + selects).
+const PLATFORM_LABELS: Record<string, string> = {
+  tiktok: 'TikTok', reels: 'Reels', youtube_shorts: 'YT Shorts', facebook: 'Facebook',
+}
+const platformLabel = (id: string) => PLATFORM_LABELS[id] ?? id
+
+// Risk → token color. Centralized so cards/badges stay consistent.
 function riskColor(risk?: string): string {
-  if (risk === 'high') return '#e5484d'
-  if (risk === 'medium') return '#f5a623'
-  return '#30a46c'
+  if (risk === 'high') return 'var(--color-danger)'
+  if (risk === 'medium') return 'var(--color-warn)'
+  return 'var(--color-success)'
+}
+
+// ── Shared primitives (Articles-Pull design language) ────────────────────────
+
+/** Numbered flow-card header, matching the article pipeline's step cards. */
+function StepHeader({ n, title }: { n: number | string; title: string }) {
+  return (
+    <div className="flow-step-header">
+      <span className="flow-step-pill">{n}</span>
+      <span className="flow-step-title">{title}</span>
+    </div>
+  )
+}
+
+/** Guided empty state — icon, message, optional CTA toward the next action. */
+function EmptyState({ title, hint, cta }: {
+  title: string
+  hint?: string
+  cta?: { label: string; onClick: () => void }
+}) {
+  return (
+    <div className="picker-empty" style={{ display: 'grid', gap: 8, justifyItems: 'center', textAlign: 'center' }}>
+      <div>{title}</div>
+      {hint && <div className="small" style={{ color: 'var(--color-text-subtle)' }}>{hint}</div>}
+      {cta && <button className="secondary settings-btn" onClick={cta.onClick}>{cta.label}</button>}
+    </div>
+  )
+}
+
+/**
+ * Pipeline stepper for Ad Studio. Unlike the article stepper (forward-only),
+ * every node is clickable so it doubles as tab navigation. `done` reflects real
+ * data (catalogs/analyzed products/campaigns exist), `active` is the open tab.
+ */
+function AdStudioStepper({ tab, setTab, done }: {
+  tab: Tab
+  setTab: (t: Tab) => void
+  done: Record<Tab, boolean>
+}) {
+  const steps: { id: Tab; label: string }[] = [
+    { id: 'catalog', label: 'Catalog' },
+    { id: 'products', label: 'Products' },
+    { id: 'campaigns', label: 'Campaigns' },
+  ]
+  return (
+    <nav className="stepper" aria-label="Ad Studio progress">
+      <ol className="stepper-list">
+        {steps.map((s, i) => {
+          const state = s.id === tab ? 'active' : done[s.id] ? 'done' : 'pending'
+          return (
+            <li key={s.id} className={`stepper-item stepper-${state}`}>
+              <button
+                type="button"
+                className="stepper-node"
+                onClick={() => setTab(s.id)}
+                aria-current={state === 'active' ? 'step' : undefined}
+              >
+                <span className="stepper-dot" aria-hidden>{done[s.id] && s.id !== tab ? '✓' : i + 1}</span>
+                <span className="stepper-label">{s.label}</span>
+              </button>
+              {i < steps.length - 1 && <span className="stepper-bar" aria-hidden />}
+            </li>
+          )
+        })}
+      </ol>
+    </nav>
+  )
 }
 
 function triggerDownload(blob: Blob, filename: string) {
@@ -103,7 +186,7 @@ export default function CatalogStudio() {
   if (!workspace) {
     return (
       <div className="card">
-        {error ? <div className="small" style={{ color: '#e5484d' }}>{error}</div>
+        {error ? <div className="small" style={{ color: 'var(--color-danger)' }}>{error}</div>
           : <div className="small">Loading workspace…</div>}
       </div>
     )
@@ -120,7 +203,7 @@ export default function CatalogStudio() {
           <div className="status">{busy || `${workspace.name} · ${products.length} products`}</div>
           {credits != null && (
             <div className="small" style={{ marginTop: 2, display: 'flex', gap: 6, alignItems: 'center', justifyContent: 'flex-end' }}>
-              <span><b style={{ color: credits > 0 ? '#30a46c' : '#e5484d' }}>{credits}</b> credits</span>
+              <span><b style={{ color: credits > 0 ? 'var(--color-success)' : 'var(--color-danger)' }}>{credits}</b> credits</span>
               {costs.video != null && <span>· analyze {costs.analyze} · concept {costs.concept} · video {costs.video}</span>}
               <BuyCredits workspaceId={workspace.id} run={run} />
             </div>
@@ -129,23 +212,20 @@ export default function CatalogStudio() {
       </div>
 
       {error && (
-        <div className="card" style={{ borderColor: '#e5484d', marginBottom: 8 }}>
-          <div className="small" style={{ color: '#e5484d' }}>{error}</div>
+        <div style={{ marginBottom: 8 }}>
+          <ErrorRecoveryCard error={error} onRetry={() => setError('')} retryLabel="Dismiss" />
         </div>
       )}
 
-      <div style={{ display: 'flex', gap: 8, marginBottom: 12 }}>
-        {(['catalog', 'products', 'campaigns'] as Tab[]).map(t => (
-          <button
-            key={t}
-            className={t === tab ? 'primary' : 'secondary'}
-            onClick={() => setTab(t)}
-            style={{ textTransform: 'capitalize' }}
-          >
-            {t}
-          </button>
-        ))}
-      </div>
+      <AdStudioStepper
+        tab={tab}
+        setTab={setTab}
+        done={{
+          catalog: catalogs.length > 0,
+          products: products.some(p => p.analysis_json),
+          campaigns: campaigns.length > 0,
+        }}
+      />
 
       {tab === 'catalog' && (
         <CatalogTab
@@ -197,7 +277,8 @@ function CatalogTab(props: {
 
   return (
     <div style={{ display: 'grid', gap: 12 }}>
-      <div className="card">
+      <div className="card flow-card">
+        <StepHeader n="1" title="Brand & compliance" />
         <label>Brand <span className="small">(optional — drives voice + compliance)</span></label>
         <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
           <select value={brandId} onChange={e => setBrandId(e.target.value)}>
@@ -216,7 +297,8 @@ function CatalogTab(props: {
         </div>
       </div>
 
-      <div className="card">
+      <div className="card flow-card">
+        <StepHeader n="2" title="Import products" />
         <label>Upload CSV catalog</label>
         <div className="small">Columns auto-detected (Shopify / Woo / Merchant exports).</div>
         <div style={{ display: 'flex', gap: 8, marginTop: 6 }}>
@@ -246,21 +328,25 @@ function CatalogTab(props: {
         <div className="card">
           <div>
             <b>{report.created}</b> added · <b>{report.updated}</b> updated
-            {report.restored ? <> · <b style={{ color: '#30a46c' }}>{report.restored}</b> restored</> : null}
+            {report.restored ? <> · <b style={{ color: 'var(--color-success)' }}>{report.restored}</b> restored</> : null}
             {' · '}{report.item_count} total
           </div>
           {report.errors.length > 0 && (
-            <ul className="small" style={{ color: '#f5a623' }}>
+            <ul className="small" style={{ color: 'var(--color-warn)' }}>
               {report.errors.slice(0, 8).map((e, i) => <li key={i}>{e}</li>)}
             </ul>
           )}
         </div>
       )}
 
-      <div className="card">
-        <label>Catalogs ({catalogs.length})</label>
-        {catalogs.length === 0 && <div className="small">No catalogs yet — import a CSV or URLs above.</div>}
-        {catalogs.map(c => (
+      <div className="card flow-card">
+        <StepHeader n="3" title={`Your catalogs${catalogs.length ? ` · ${catalogs.length}` : ''}`} />
+        {catalogs.length === 0 ? (
+          <EmptyState
+            title="No catalogs yet"
+            hint="Import a CSV export or paste product URLs above to pull in your products."
+          />
+        ) : catalogs.map(c => (
           <CatalogRow key={c.id} catalog={c} onOpen={() => onOpenCatalog(c)}
             onChanged={onCatalogChanged} run={run} />
         ))}
@@ -298,7 +384,7 @@ function CatalogRow(props: {
           <span className="small" style={{ flex: 1 }}>{count} items · {c.source_type} · {c.status}</span>
           <button className="secondary small" onClick={onOpen}>Open</button>
           <button className="secondary small" onClick={() => { setName(c.display_name ?? ''); setRenaming(true) }}>Rename</button>
-          <button className="secondary small" style={{ color: '#e5484d' }} onClick={() => {
+          <button className="secondary small" style={{ color: 'var(--color-danger)' }} onClick={() => {
             if (!window.confirm(`Delete catalog "${c.display_name || c.source_ref}" and its ${count} item(s)? Items can be re-imported later.`)) return
             run('Deleting catalog…', async () => { await deleteCatalog(c.id); await onChanged() })
           }}>Delete</button>
@@ -345,7 +431,7 @@ function ProductsTab(props: {
   const unanalyzedSelected = selected.size - analyzedSelected.length
 
   const filterBanner = catalogFilter ? (
-    <div className="card" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', borderColor: '#3b82f6' }}>
+    <div className="card" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', borderColor: 'var(--color-accent)' }}>
       <span className="small">Showing items from <b>{catalogFilter.name}</b></span>
       <button className="secondary small" onClick={onClearFilter}>Show all products</button>
     </div>
@@ -355,9 +441,20 @@ function ProductsTab(props: {
     return (
       <div style={{ display: 'grid', gap: 12 }}>
         {filterBanner}
-        <div className="card"><div className="small">
-          {catalogFilter ? 'This catalog has no items (they may have been deleted). Re-import the CSV to restore them.' : 'No products yet — import a catalog first.'}
-        </div></div>
+        <div className="card">
+          {catalogFilter ? (
+            <EmptyState
+              title="This catalog is empty"
+              hint="Its items may have been deleted. Re-import the CSV to restore them."
+              cta={onClearFilter ? { label: 'Show all products', onClick: onClearFilter } : undefined}
+            />
+          ) : (
+            <EmptyState
+              title="No products yet"
+              hint="Head to the Catalog step to import a CSV or paste product URLs."
+            />
+          )}
+        </div>
       </div>
     )
   }
@@ -382,35 +479,76 @@ function ProductsTab(props: {
   return (
     <div style={{ display: 'grid', gap: 12 }}>
       {filterBanner}
-      <div className="card" style={{ display: 'grid', gap: 8 }}>
-        <label>
-          Create campaign from {analyzedSelected.length} analyzed product(s)
+      <div className="card flow-card" style={{ display: 'grid', gap: 12 }}>
+        <StepHeader n="→" title="Create a campaign" />
+        <div className="small" style={{ color: 'var(--color-text-muted)' }}>
+          {analyzedSelected.length
+            ? `${analyzedSelected.length} analyzed product(s) selected`
+            : 'Select one or more analyzed products below to start.'}
           {unanalyzedSelected > 0 && (
-            <span className="small" style={{ color: '#f5a623' }}> · {unanalyzedSelected} unanalyzed will be skipped</span>
+            <span style={{ color: 'var(--color-warn)' }}> · {unanalyzedSelected} unanalyzed will be skipped</span>
           )}
-        </label>
-        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
-          <input placeholder="Campaign name" value={name} onChange={e => setName(e.target.value)} />
-          <select value={goal} onChange={e => setGoal(e.target.value)}>
-            {GOALS.map(g => <option key={g} value={g}>{g}</option>)}
-          </select>
-          <select value={brandId} onChange={e => setBrandId(e.target.value)}>
+        </div>
+
+        <div>
+          <label>Campaign name</label>
+          <input placeholder="e.g. Spring supplement push" value={name}
+            onChange={e => setName(e.target.value)} style={{ width: '100%' }} />
+        </div>
+
+        <div>
+          <label style={{ display: 'block', marginBottom: 8 }}>Goal</label>
+          <div className="seg-group" role="radiogroup" aria-label="Campaign goal">
+            {GOALS.map(g => {
+              const m = GOAL_META[g]
+              const active = goal === g
+              return (
+                <button key={g} type="button" role="radio" aria-checked={active}
+                  className={`seg-card${active ? ' seg-card-active' : ''}`}
+                  onClick={() => setGoal(g)}>
+                  <span className="seg-card-title">{m?.label ?? g}</span>
+                  <span className="seg-card-blurb">{m?.blurb ?? ''}</span>
+                </button>
+              )
+            })}
+          </div>
+        </div>
+
+        <div>
+          <label style={{ display: 'block', marginBottom: 8 }}>Platforms</label>
+          <div className="platform-chips">
+            {PLATFORMS.map(p => {
+              const active = platforms.includes(p)
+              return (
+                <button key={p} type="button" aria-pressed={active}
+                  className={`platform-chip${active ? ' platform-chip-active' : ''}`}
+                  onClick={() => setPlatforms(prev =>
+                    prev.includes(p) ? prev.filter(x => x !== p) : [...prev, p])}>
+                  {platformLabel(p)}
+                </button>
+              )
+            })}
+          </div>
+        </div>
+
+        <AdvancedSettingsDisclosure>
+          <label>Brand voice <span className="small">(optional — drives tone + compliance)</span></label>
+          <select value={brandId} onChange={e => setBrandId(e.target.value)} style={{ width: '100%' }}>
             <option value="">No brand</option>
             {brands.map(b => <option key={b.id} value={b.id}>{b.name}</option>)}
           </select>
-          {PLATFORMS.map(p => (
-            <label key={p} className="small" style={{ display: 'flex', gap: 4, alignItems: 'center' }}>
-              <input type="checkbox" checked={platforms.includes(p)} onChange={() =>
-                setPlatforms(prev => prev.includes(p) ? prev.filter(x => x !== p) : [...prev, p])} />
-              {p}
-            </label>
-          ))}
-          <button className="primary" disabled={!name.trim() || !analyzedSelected.length}
-            title={!analyzedSelected.length ? 'Select at least one analyzed product' : ''}
+        </AdvancedSettingsDisclosure>
+
+        <div className="actions">
+          <button className="generate-btn"
+            disabled={!name.trim() || !analyzedSelected.length || !platforms.length}
+            title={!analyzedSelected.length ? 'Select at least one analyzed product'
+              : !platforms.length ? 'Pick at least one platform' : ''}
             onClick={createCampaignNow}>Create campaign →</button>
         </div>
+
         {!analyzedSelected.length && selected.size > 0 && (
-          <div className="small" style={{ color: '#f5a623' }}>
+          <div className="small" style={{ color: 'var(--color-warn)' }}>
             None of the selected products are analyzed yet — click Analyze on a product first.
           </div>
         )}
@@ -456,7 +594,7 @@ function ProductCard(props: {
   })
 
   return (
-    <div className="card" style={{ borderColor: selected ? '#3b82f6' : undefined }}>
+    <div className="card" style={{ borderColor: selected ? 'var(--color-accent)' : undefined }}>
       <div style={{ display: 'flex', justifyContent: 'space-between', gap: 6 }}>
         <label style={{ display: 'flex', gap: 6, fontWeight: 600 }}>
           <input type="checkbox" checked={selected} onChange={onToggle} />
@@ -499,7 +637,7 @@ function ProductCard(props: {
               onAnalyzed()  // auto-select so the campaign count reflects it
             })}>{p.analysis_json ? 'Re-analyze' : 'Analyze'}</button>
             <button className="secondary small" onClick={() => setEditing(true)}>Edit</button>
-            <button className="secondary small" style={{ color: '#e5484d' }} onClick={() => {
+            <button className="secondary small" style={{ color: 'var(--color-danger)' }} onClick={() => {
               if (!window.confirm(`Delete "${p.title}"?`)) return
               run('Deleting product…', async () => { await deleteProduct(p.id); await onChanged() })
             }}>Delete</button>
@@ -524,7 +662,14 @@ function CampaignsTab(props: {
 }) {
   const { campaigns, onChanged, run } = props
   if (!campaigns.length) {
-    return <div className="card"><div className="small">No campaigns yet — select products and create one.</div></div>
+    return (
+      <div className="card">
+        <EmptyState
+          title="No campaigns yet"
+          hint="Go to the Products step, analyze a few products, select them, and create your first campaign."
+        />
+      </div>
+    )
   }
   return (
     <div style={{ display: 'grid', gap: 12 }}>
@@ -621,7 +766,7 @@ function ConceptCard(props: {
           <div className="small">v{c.variant_index + 1} · {c.angle || '—'}</div>
         </div>
         <div style={{ textAlign: 'right' }}>
-          <span className="small" style={{ color: c.status === 'flagged' ? '#e5484d' : '#30a46c' }}>{c.status}</span>
+          <span className="small" style={{ color: c.status === 'flagged' ? 'var(--color-danger)' : 'var(--color-success)' }}>{c.status}</span>
           {risk && <div className="small">risk: <span style={{ color: riskColor(risk) }}>{risk}</span></div>}
           <div style={{ display: 'flex', gap: 4, marginTop: 4, justifyContent: 'flex-end' }}>
             <button className="secondary small" onClick={() => { setEditing(e => !e); setOpen(true) }}>
@@ -635,7 +780,7 @@ function ConceptCard(props: {
             <button className="secondary small" onClick={() => {
               if (!window.confirm('Delete this concept?')) return
               run('Deleting…', async () => { await deleteConcept(c.id); await reload() })
-            }} style={{ color: '#e5484d' }}>Delete</button>
+            }} style={{ color: 'var(--color-danger)' }}>Delete</button>
             <button className="secondary small" onClick={() => setOpen(v => !v)}>{open ? 'Hide' : 'Details'}</button>
           </div>
           <div style={{ display: 'flex', gap: 4, marginTop: 4, justifyContent: 'flex-end' }}>
@@ -694,7 +839,7 @@ function ConceptCard(props: {
             <div key={plat}><b>{plat}:</b> {cap?.caption} {(cap?.hashtags || []).join(' ')}</div>
           ))}
           {(c.compliance_json?.flags || []).length > 0 && (
-            <div style={{ color: '#e5484d' }}>
+            <div style={{ color: 'var(--color-danger)' }}>
               <b>Flags:</b>
               <ul style={{ margin: 0, paddingLeft: 16 }}>
                 {c.compliance_json!.flags!.map((f, i) => (
