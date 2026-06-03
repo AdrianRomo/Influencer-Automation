@@ -2055,3 +2055,46 @@ hr {
   .concept-meta { width: 100%; }
   .concept-badges { justify-content: center; }
 }
+
+/* ── Ad Studio: active job banner ────────────────────────────────────────── */
+.ad-progress {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  margin-bottom: var(--space-3);
+  border-color: var(--color-accent);
+  background: var(--color-accent-soft);
+}
+.ad-progress-text { display: grid; gap: 2px; min-width: 0; }
+.ad-progress-label { font-weight: 700; }
+.ad-progress-msg { color: var(--color-text-muted); }
+
+/* ── Ad Studio: campaign row header ──────────────────────────────────────── */
+.campaign-head {
+  display: flex;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: var(--space-3);
+  align-items: flex-start;
+}
+.campaign-head-info { min-width: 0; }
+.campaign-head-actions {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.variants-field { display: inline-flex; align-items: center; gap: 4px; }
+.variants-field input { width: 56px; }
+.export-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding-left: var(--space-2);
+  border-left: 1px solid var(--color-border);
+}
+.export-label { color: var(--color-text-subtle); font-weight: 600; }
+@media (max-width: 560px) {
+  .campaign-head-actions { width: 100%; }
+  .export-group { border-left: none; padding-left: 0; }
+}

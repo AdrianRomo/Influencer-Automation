@@ -31,6 +31,12 @@ const PLATFORM_LABELS: Record<string, string> = {
 }
 const platformLabel = (id: string) => PLATFORM_LABELS[id] ?? id
 
+// run() executes an async action under a busy label. The action receives an
+// onProgress callback so long jobs (analyze / concepts / video) can surface the
+// backend's live PROGRESS messages instead of a bare spinner.
+type ProgressFn = (msg: string) => void
+type RunFn = (label: string, fn: (onProgress: ProgressFn) => Promise<void>) => Promise<void>
+
 // Risk → token color. Centralized so cards/badges stay consistent.
 function riskColor(risk?: string): string {
   if (risk === 'high') return 'var(--color-danger)'
@@ -105,6 +111,23 @@ function AdStudioStepper({ tab, setTab, done }: {
   )
 }
 
+/**
+ * Active-job banner. Shows the busy label as the stage title and the latest
+ * backend PROGRESS message below it (instead of a bare spinner). Announced via
+ * aria-live so screen readers hear progress updates.
+ */
+function AdGenerationProgress({ label, msg }: { label: string; msg?: string }) {
+  return (
+    <div className="ad-progress card" role="status" aria-live="polite">
+      <span className="spinner" aria-hidden />
+      <div className="ad-progress-text">
+        <div className="ad-progress-label">{label}</div>
+        {msg && <div className="ad-progress-msg small">{msg}</div>}
+      </div>
+    </div>
+  )
+}
+
 function triggerDownload(blob: Blob, filename: string) {
   const url = URL.createObjectURL(blob)
   const a = document.createElement('a')
@@ -138,6 +161,7 @@ export default function CatalogStudio() {
   const [catalogs, setCatalogs] = useState<Catalog[]>([])
   const [campaigns, setCampaigns] = useState<Campaign[]>([])
   const [busy, setBusy] = useState('')
+  const [busyMsg, setBusyMsg] = useState('')
   const [error, setError] = useState('')
   const [credits, setCredits] = useState<number | null>(null)
   const [costs, setCosts] = useState<Record<string, number>>({})
@@ -175,10 +199,10 @@ export default function CatalogStudio() {
     })()
   }, [refreshAll])
 
-  const run = useCallback(async (label: string, fn: () => Promise<void>) => {
-    setError(''); setBusy(label)
-    try { await fn() } catch (e) { setError(String(e)) } finally {
-      setBusy('')
+  const run = useCallback<RunFn>(async (label, fn) => {
+    setError(''); setBusy(label); setBusyMsg('')
+    try { await fn(m => setBusyMsg(m)) } catch (e) { setError(String(e)) } finally {
+      setBusy(''); setBusyMsg('')
       if (workspace) loadCredits(workspace.id)  // balance may have changed
     }
   }, [workspace, loadCredits])
@@ -227,6 +251,8 @@ export default function CatalogStudio() {
         }}
       />
 
+      {busy && <AdGenerationProgress label={busy} msg={busyMsg} />}
+
       {tab === 'catalog' && (
         <CatalogTab
           workspaceId={workspace.id} brands={brands} catalogs={catalogs}
@@ -265,7 +291,7 @@ function CatalogTab(props: {
   onIngested: () => Promise<void>
   onOpenCatalog: (c: Catalog) => void
   onCatalogChanged: () => Promise<void>
-  run: (label: string, fn: () => Promise<void>) => Promise<void>
+  run: RunFn
 }) {
   const { workspaceId, brands, catalogs, onBrandCreated, onIngested, onOpenCatalog, onCatalogChanged, run } = props
   const [brandId, setBrandId] = useState('')
@@ -359,7 +385,7 @@ function CatalogRow(props: {
   catalog: Catalog
   onOpen: () => void
   onChanged: () => Promise<void>
-  run: (label: string, fn: () => Promise<void>) => Promise<void>
+  run: RunFn
 }) {
   const { catalog: c, onOpen, onChanged, run } = props
   const [renaming, setRenaming] = useState(false)
@@ -404,7 +430,7 @@ function ProductsTab(props: {
   onClearFilter?: () => void
   onChanged: () => Promise<void>
   onCampaignCreated: () => Promise<void>
-  run: (label: string, fn: () => Promise<void>) => Promise<void>
+  run: RunFn
 }) {
   const { products: allProducts, workspaceId, brands, catalogFilter, onClearFilter, onChanged, onCampaignCreated, run } = props
   // Scope to one catalog when "opened" from the Catalogs tab.
@@ -572,7 +598,7 @@ function ProductCard(props: {
   selected: boolean
   onToggle: () => void
   onChanged: () => Promise<void>
-  run: (label: string, fn: () => Promise<void>) => Promise<void>
+  run: RunFn
   onAnalyzed: () => void
 }) {
   const { product: p, selected, onToggle, onChanged, run, onAnalyzed } = props
@@ -630,9 +656,9 @@ function ProductCard(props: {
             </div>
           )}
           <div style={{ display: 'flex', gap: 6, marginTop: 6, flexWrap: 'wrap' }}>
-            <button className="secondary small" onClick={() => run('Analyzing…', async () => {
+            <button className="secondary small" onClick={() => run('Analyzing product…', async (onProgress) => {
               const { task_id } = await analyzeProduct(p.id)
-              await pollJob(task_id)
+              await pollJob(task_id, onProgress)
               await onChanged()
               onAnalyzed()  // auto-select so the campaign count reflects it
             })}>{p.analysis_json ? 'Re-analyze' : 'Analyze'}</button>
@@ -658,7 +684,7 @@ function ProductCard(props: {
 function CampaignsTab(props: {
   campaigns: Campaign[]
   onChanged: () => Promise<void>
-  run: (label: string, fn: () => Promise<void>) => Promise<void>
+  run: RunFn
 }) {
   const { campaigns, onChanged, run } = props
   if (!campaigns.length) {
@@ -681,7 +707,7 @@ function CampaignsTab(props: {
 function CampaignRow(props: {
   campaign: Campaign
   onChanged: () => Promise<void>
-  run: (label: string, fn: () => Promise<void>) => Promise<void>
+  run: RunFn
 }) {
   const { campaign, onChanged, run } = props
   const [nVariants, setNVariants] = useState(3)
@@ -694,28 +720,40 @@ function CampaignRow(props: {
 
   return (
     <div className="card">
-      <div style={{ display: 'flex', justifyContent: 'space-between', flexWrap: 'wrap', gap: 8 }}>
-        <div>
+      <div className="campaign-head">
+        <div className="campaign-head-info">
           <b>{campaign.name}</b>
-          <div className="small">{campaign.goal} · {(campaign.platforms || []).join(', ')} · {campaign.product_ids.length} products · {campaign.status}</div>
+          <div className="small">
+            {GOAL_META[campaign.goal]?.label ?? campaign.goal}
+            {' · '}{(campaign.platforms || []).map(platformLabel).join(', ')}
+            {' · '}{campaign.product_ids.length} products
+            {' · '}{campaign.status}
+          </div>
         </div>
-        <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap' }}>
-          <label className="small">variants
-            <input type="number" min={1} max={10} value={nVariants} style={{ width: 56, marginLeft: 4 }}
+        <div className="campaign-head-actions">
+          <label className="small variants-field">Variants
+            <input type="number" min={1} max={10} value={nVariants}
               onChange={e => setNVariants(Math.max(1, Math.min(10, Number(e.target.value) || 1)))} />
           </label>
-          <button className="primary" onClick={() => run('Generating concepts…', async () => {
+          <button className="primary" onClick={() => run('Generating ad variants…', async (onProgress) => {
             const { tasks } = await generateCampaign(campaign.id, nVariants)
-            await Promise.all(tasks.map(t => pollJob(t.task_id)))
+            let done = 0
+            onProgress(`Generating ${tasks.length} variant${tasks.length !== 1 ? 's' : ''}…`)
+            await Promise.all(tasks.map(t => pollJob(t.task_id, m => onProgress(m)).then(() => {
+              done++; onProgress(`Finished ${done} of ${tasks.length} variants`)
+            })))
             await onChanged(); await loadConcepts()
           })}>Generate</button>
           <button className="secondary" onClick={() => run('Loading concepts…', loadConcepts)}>View concepts</button>
-          {(['json', 'csv', 'zip'] as const).map(fmt => (
-            <button key={fmt} className="secondary" onClick={() => run(`Exporting ${fmt}…`, async () => {
-              const blob = await downloadCampaignExport(campaign.id, fmt)
-              triggerDownload(blob, `campaign_${campaign.name.replace(/\W+/g, '-').toLowerCase()}.${fmt}`)
-            })}>{fmt.toUpperCase()}</button>
-          ))}
+          <span className="export-group">
+            <span className="small export-label">Export</span>
+            {(['json', 'csv', 'zip'] as const).map(fmt => (
+              <button key={fmt} className="secondary small" onClick={() => run(`Exporting ${fmt.toUpperCase()}…`, async () => {
+                const blob = await downloadCampaignExport(campaign.id, fmt)
+                triggerDownload(blob, `campaign_${campaign.name.replace(/\W+/g, '-').toLowerCase()}.${fmt}`)
+              })}>{fmt.toUpperCase()}</button>
+            ))}
+          </span>
         </div>
       </div>
 
@@ -777,7 +815,7 @@ function AdPreviewFrame({ concept: c }: { concept: AdConcept }) {
 function ConceptCard(props: {
   concept: AdConcept
   reload: () => Promise<void>
-  run: (label: string, fn: () => Promise<void>) => Promise<void>
+  run: RunFn
 }) {
   const { concept: c, reload, run } = props
   const [open, setOpen] = useState(false)
@@ -821,9 +859,9 @@ function ConceptCard(props: {
             <button className="secondary small" onClick={() => { setEditing(e => !e); setOpen(true) }}>
               {editing ? 'Cancel' : 'Edit'}
             </button>
-            <button className="secondary small" onClick={() => run('Regenerating…', async () => {
+            <button className="secondary small" onClick={() => run('Regenerating variant…', async (onProgress) => {
               const { task_id } = await regenerateConcept(c.id, c.angle ?? undefined)
-              await pollJob(task_id)
+              await pollJob(task_id, onProgress)
               await reload()
             })}>Regenerate</button>
             <button className="secondary small" onClick={() => setOpen(v => !v)} aria-expanded={open}>
@@ -840,9 +878,9 @@ function ConceptCard(props: {
               className="small" aria-label="Video platform">
               {PLATFORMS.map(p => <option key={p} value={p}>{platformLabel(p)}</option>)}
             </select>
-            <button className="secondary small" onClick={() => run('Rendering video…', async () => {
+            <button className="secondary small" onClick={() => run('Rendering video…', async (onProgress) => {
               const { task_id } = await generateConceptVideo(c.id, vidPlatform)
-              await pollJob(task_id, () => {})
+              await pollJob(task_id, onProgress)
               setHasVideo(true)
             })}>🎬 Make video</button>
             {hasVideo && (
@@ -911,7 +949,7 @@ function ConceptCard(props: {
 
 function BuyCredits(props: {
   workspaceId: string
-  run: (label: string, fn: () => Promise<void>) => Promise<void>
+  run: RunFn
 }) {
   const { workspaceId, run } = props
   const [packs, setPacks] = useState<{ id: string; credits: number; label: string; price_configured: boolean }[]>([])
