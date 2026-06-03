@@ -977,6 +977,7 @@ def generate_video_for_article(
     openai_api_key: str | None = None,
     platform: str = "tiktok",
     animation_prompt: str | None = None,
+    subtitle_style: dict | None = None,
 ) -> dict:
     """Generate scene images with DALL-E then assemble an MP4 with FFmpeg.
 
@@ -1125,6 +1126,7 @@ def generate_video_for_article(
                 srt_path=srt_path,
                 width=plat_profile.width,
                 height=plat_profile.height,
+                subtitle_style=subtitle_style,
             )
 
             video_record.file_path = output_path
@@ -1796,6 +1798,7 @@ def generate_animated_video_for_article(
     scene_video_provider: str | None = None,
     platform: str = "tiktok",
     animation_prompt: str | None = None,
+    subtitle_style: dict | None = None,
 ) -> dict:
     """Generate AI-animated scene clips then assemble a final MP4.
 
@@ -1813,7 +1816,10 @@ def generate_animated_video_for_article(
     import time as _time
 
     from app.image_gen import generate_and_save
-    from app.scene_video import get_scene_video_provider, JobState, StaticImageProvider
+    from app.scene_video import (
+        get_scene_video_provider, JobState, StaticImageProvider,
+        build_video_prompt, resolve_render_plan,
+    )
     from app.video import normalize_clip, assemble_video_from_clips
     from app.captions import storyboard_to_captions, captions_to_srt
     from app.schemas import Storyboard
@@ -1831,8 +1837,24 @@ def generate_animated_video_for_article(
     # How long to sleep between poll sweeps
     poll_interval    = float(os.getenv("SCENE_VIDEO_POLL_INTERVAL_SECONDS", "6"))
 
-    provider = get_scene_video_provider(scene_video_provider)
-    logger.info("Animated video task starting: article=%s provider=%s", article_id, provider.name)
+    # Resolve cost mode (resolution + premium-scene gating). Provider instances
+    # are cached by name so premium + base providers each init only once.
+    plan = resolve_render_plan(
+        plat_profile.width, plat_profile.height, base_provider=scene_video_provider,
+    )
+    width, height = plan.width, plan.height
+    _provider_cache: dict = {}
+
+    def _provider(name: str):
+        if name not in _provider_cache:
+            _provider_cache[name] = get_scene_video_provider(name)
+        return _provider_cache[name]
+
+    logger.info(
+        "Animated video task starting: article=%s cost_mode=%s base=%s premium=%s premium_scenes=%s res=%dx%d",
+        article_id, plan.cost_mode, plan.base_provider,
+        plan.premium_provider, sorted(plan.premium_indices), width, height,
+    )
 
     with SessionLocal() as db:
         article = db.get(Article, article_id)
@@ -1880,8 +1902,8 @@ def generate_animated_video_for_article(
             status="created",
             render_mode="animated",
             platform=platform,
-            width=plat_profile.width,
-            height=plat_profile.height,
+            width=width,
+            height=height,
         )
         db.add(video_record)
         db.commit()
@@ -1936,7 +1958,7 @@ def generate_animated_video_for_article(
                 state="PROGRESS",
                 meta={
                     "stage": "submitting",
-                    "msg": f"Submitting {total_scenes} scenes to {provider.name}…",
+                    "msg": f"Submitting {total_scenes} scenes to {plan.base_provider}…",
                     "progress": 0.2,
                 },
             )
@@ -1950,27 +1972,29 @@ def generate_animated_video_for_article(
             db.commit()
 
             scene_records: dict[int, SceneVideoAsset] = {}
-            for scene in storyboard.scenes:
+            for scene_index, scene in enumerate(storyboard.scenes):
                 img_path   = image_map[scene.scene_number]
                 clip_raw   = os.path.join(video_dir, f"{article_id}_scene_{scene.scene_number}_raw.mp4")
                 duration_t = max(scene.duration_estimate, 1.0)
 
+                # Premium scenes (e.g. the hook) may use a higher-tier provider.
+                prov      = _provider(plan.provider_for(scene_index))
+                eff_prompt = build_video_prompt(
+                    scene.visual_prompt, animation_prompt=animation_prompt,
+                )
+
                 sv = SceneVideoAsset(
                     article_id=article_id,
                     scene_number=scene.scene_number,
-                    provider=provider.name,
+                    provider=prov.name,
                     status="pending",
                 )
                 db.add(sv)
                 db.commit()
                 scene_records[scene.scene_number] = sv
 
-                eff_prompt = (
-                    f"{animation_prompt}. {scene.visual_prompt}"
-                    if animation_prompt else scene.visual_prompt
-                )
                 try:
-                    job_id = provider.submit(
+                    job_id = prov.submit(
                         image_path=img_path,
                         prompt=eff_prompt,
                         duration_hint=duration_t,
@@ -2017,13 +2041,14 @@ def generate_animated_video_for_article(
                         db.commit()
                         continue
                     try:
-                        job = provider.poll(rec.provider_job_id)
+                        prov = _provider(rec.provider)
+                        job = prov.poll(rec.provider_job_id)
                         if job.state == JobState.READY:
                             # Download raw clip
                             clip_raw = os.path.join(
                                 video_dir, f"{article_id}_scene_{sn}_raw.mp4"
                             )
-                            provider.download(job, clip_raw)
+                            prov.download(job, clip_raw)
                             rec.status = "ready"
                             rec.file_path = clip_raw
                             db.commit()
@@ -2048,7 +2073,9 @@ def generate_animated_video_for_article(
                 meta={"stage": "normalizing", "msg": "Normalising scene clips…", "progress": 0.82},
             )
             final_clips: list[dict] = []
-            static_fallback = StaticImageProvider()
+            # Fallback clip must match the chosen render resolution so it concats
+            # cleanly alongside the AI clips (matters in low-cost mode).
+            static_fallback = StaticImageProvider(width=width, height=height)
 
             for scene in storyboard.scenes:
                 sn = scene.scene_number
@@ -2058,7 +2085,7 @@ def generate_animated_video_for_article(
 
                 if rec and rec.status == "ready" and rec.file_path and os.path.exists(rec.file_path):
                     try:
-                        normalize_clip(rec.file_path, clip_norm, dur, width=plat_profile.width, height=plat_profile.height)
+                        normalize_clip(rec.file_path, clip_norm, dur, width=width, height=height)
                         rec.duration_seconds = dur
                         db.commit()
                         final_clips.append({"clip_path": clip_norm, "duration": dur})
@@ -2110,8 +2137,9 @@ def generate_animated_video_for_article(
                 audio_path=audio.file_path,
                 output_path=output_path,
                 srt_path=srt_path,
-                width=plat_profile.width,
-                height=plat_profile.height,
+                width=width,
+                height=height,
+                subtitle_style=subtitle_style,
             )
 
             fallback_count = sum(

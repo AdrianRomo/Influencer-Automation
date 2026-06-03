@@ -25,6 +25,7 @@ def assemble_video(
     srt_path: str | None = None,
     width: int = DEFAULT_WIDTH,
     height: int = DEFAULT_HEIGHT,
+    subtitle_style: dict | None = None,
 ) -> float:
     """Assemble an MP4 from scene images, audio, and optional subtitles.
 
@@ -39,7 +40,7 @@ def assemble_video(
 
     concat_file = _write_concat_file(scenes)
     try:
-        vf = _build_vf(width, height, srt_path)
+        vf = _build_vf(width, height, srt_path, subtitle_style)
         cmd = [
             "ffmpeg", "-y",
             "-f", "concat", "-safe", "0", "-i", concat_file,
@@ -57,7 +58,7 @@ def assemble_video(
             # If subtitle filter failed, retry without subtitles
             if srt_path and "subtitles" in result.stderr:
                 logger.warning("Subtitle filter failed, retrying without subtitles")
-                return assemble_video(scenes, audio_path, output_path, srt_path=None, width=width, height=height)
+                return assemble_video(scenes, audio_path, output_path, srt_path=None, width=width, height=height, subtitle_style=subtitle_style)
             # Log full stderr server-side; surface only a safe summary to callers
             last_line = result.stderr.strip().split("\n")[-1][:200] if result.stderr else ""
             logger.error("FFmpeg failed (exit %d):\n%s", result.returncode, result.stderr[-2000:])
@@ -154,6 +155,7 @@ def assemble_video_from_clips(
     srt_path: str | None = None,
     width: int  = DEFAULT_WIDTH,
     height: int = DEFAULT_HEIGHT,
+    subtitle_style: dict | None = None,
 ) -> float:
     """Concatenate pre-normalised video clips, attach audio, burn optional subtitles.
 
@@ -169,7 +171,7 @@ def assemble_video_from_clips(
 
     concat_file = _write_clips_concat_file(scene_clips)
     try:
-        vf  = _build_vf(width, height, srt_path)
+        vf  = _build_vf(width, height, srt_path, subtitle_style)
         cmd = [
             "ffmpeg", "-y",
             "-f", "concat", "-safe", "0", "-i", concat_file,
@@ -189,6 +191,7 @@ def assemble_video_from_clips(
                 return assemble_video_from_clips(
                     scene_clips, audio_path, output_path,
                     srt_path=None, width=width, height=height,
+                    subtitle_style=subtitle_style,
                 )
             last_line = result.stderr.strip().split("\n")[-1][:200] if result.stderr else ""
             logger.error("FFmpeg animated assembly failed (exit %d):\n%s", result.returncode, result.stderr[-2000:])
@@ -216,7 +219,55 @@ def _write_clips_concat_file(clips: list[dict]) -> str:
     return f.name
 
 
-def _build_vf(width: int, height: int, srt_path: str | None) -> str:
+# ── Subtitle styling ────────────────────────────────────────────────────────
+# Creator-facing subtitle controls map onto a libass force_style string. We
+# only ever build the style from a constrained set of enums (never raw user
+# text) so nothing can be injected into the FFmpeg filtergraph.
+
+# size enum → ASS FontSize
+_SUB_FONT_SIZE = {"small": 16, "medium": 20, "large": 26}
+# position enum → (ASS Alignment numpad, MarginV)
+_SUB_POSITION = {"bottom": (2, 60), "center": (5, 0), "top": (8, 60)}
+
+
+def _subtitle_force_style(style: dict | None) -> str:
+    """Build a libass force_style string from a constrained style dict.
+
+    Recognised keys (all optional): ``position`` (bottom|center|top),
+    ``size`` (small|medium|large), ``preset`` (boxed|outline|bold). Unknown or
+    missing values fall back to the previous default look (boxed, bottom,
+    medium) so behaviour is unchanged when no style is supplied.
+    """
+    style = style or {}
+    size = _SUB_FONT_SIZE.get(str(style.get("size", "medium")), 20)
+    align, margin_v = _SUB_POSITION.get(str(style.get("position", "bottom")), (2, 60))
+    preset = str(style.get("preset", "boxed"))
+
+    parts = [
+        f"FontSize={size}",
+        "PrimaryColour=&H00ffffff",
+        "OutlineColour=&H00000000",
+        f"Alignment={align}",
+        f"MarginV={margin_v}",
+    ]
+    if preset == "outline":
+        # Crisp outline, no background box.
+        parts += ["BorderStyle=1", "Outline=2", "Shadow=1"]
+    elif preset == "bold":
+        # Heavy yellow caption with thick outline (high-energy short-form look).
+        parts = [
+            f"FontSize={max(size, 22)}",
+            "PrimaryColour=&H0000ffff",   # yellow (BGR)
+            "OutlineColour=&H00000000",
+            "Bold=1", "BorderStyle=1", "Outline=3", "Shadow=1",
+            f"Alignment={align}", f"MarginV={margin_v}",
+        ]
+    else:  # boxed (default) — translucent black box behind the text
+        parts += ["BackColour=&H80000000", "BorderStyle=4", "Outline=2"]
+    return ",".join(parts)
+
+
+def _build_vf(width: int, height: int, srt_path: str | None, subtitle_style: dict | None = None) -> str:
     """Build the FFmpeg -vf filtergraph string."""
     # Scale the image to fit within target dimensions preserving aspect ratio,
     # then pad with black bars to reach exactly target dimensions.
@@ -230,10 +281,5 @@ def _build_vf(width: int, height: int, srt_path: str | None) -> str:
 
     # Escape the SRT path for the subtitles filter (colon is a separator char)
     escaped = srt_path.replace("\\", "/").replace(":", r"\:")
-    subtitle_style = (
-        "FontSize=20,PrimaryColour=&H00ffffff,"
-        "OutlineColour=&H00000000,Outline=2,"
-        "BackColour=&H80000000,BorderStyle=4,"
-        "Alignment=2,MarginV=30"
-    )
-    return f"{scale},subtitles='{escaped}':force_style='{subtitle_style}'"
+    force_style = _subtitle_force_style(subtitle_style)
+    return f"{scale},subtitles='{escaped}':force_style='{force_style}'"

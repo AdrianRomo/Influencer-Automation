@@ -8,9 +8,9 @@ export function Collapsible({ title, children, defaultOpen = false }: {
   const [open, setOpen] = useState(defaultOpen)
   return (
     <div className="collapsible">
-      <button className="collapsible-header" onClick={() => setOpen(o => !o)}>
+      <button className="collapsible-header" onClick={() => setOpen(o => !o)} aria-expanded={open}>
         <span>{title}</span>
-        <span className="chevron">{open ? '▲' : '▼'}</span>
+        <span className="chevron" aria-hidden>{open ? '▲' : '▼'}</span>
       </button>
       {open && <div className="collapsible-body">{children}</div>}
     </div>

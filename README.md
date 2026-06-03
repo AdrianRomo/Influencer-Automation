@@ -185,6 +185,92 @@ Example fields:
 
 ---
 
+## AI video backgrounds (scene-video providers)
+
+The final MP4 is built from the same audio + burned-in subtitle pipeline
+regardless of what fills the frame. The **background** behind each scene is
+produced by a pluggable provider, so you can keep the free black/still-image
+output or swap in AI-generated motion without touching the export logic.
+
+### Pipeline
+
+```
+script + audio + subtitles
+  → storyboard scenes (each with a visual prompt + duration)
+  → per-scene background clip  (provider: static | runway | seedance)
+  → normalize each clip (9:16, target resolution, fps, exact duration, silent)
+  → concat clips into one background track
+  → reuse existing subtitle overlay + audio mux  (-shortest = audio drives length)
+  → export final MP4
+```
+
+Trigger an animated render by posting `render_mode: "animated"` to the video
+endpoint; `static` keeps the original still-image behaviour.
+
+### Providers
+
+| Value              | Behaviour                                         |
+| ------------------ | ------------------------------------------------- |
+| `static` / `black` | FFmpeg still-image clip. Free, no API. **Fallback.** |
+| `runway`           | Runway Gen-4 image-to-video (`RUNWAY_API_KEY`).   |
+| `seedance`         | Seedance AI image-to-video (`SEEDANCE_API_KEY`).  |
+
+Select with `SCENE_VIDEO_PROVIDER`. **Fallback is automatic and per-scene:** if a
+provider can't init (missing key), times out, fails, or returns an invalid file,
+that scene falls back to a `static` clip — you always get a valid MP4 with audio
+and subtitles.
+
+```env
+SCENE_VIDEO_PROVIDER=runway        # or: seedance | static | black
+RUNWAY_API_KEY=...                 # required for runway
+RUNWAY_MODEL=gen4_turbo
+RUNWAY_RATIO=720:1280              # vertical 9:16
+SEEDANCE_API_KEY=...               # required for seedance
+SCENE_VIDEO_TIMEOUT_SECONDS=600
+SCENE_VIDEO_POLL_INTERVAL_SECONDS=10
+```
+
+Every clip prompt automatically appends a negative directive forbidding
+captions/text/logos/watermarks, so AI footage never fights the subtitle overlay.
+
+### Cost modes
+
+`VIDEO_COST_MODE` trades spend for quality:
+
+| Mode       | Resolution                  | Premium model            |
+| ---------- | --------------------------- | ------------------------ |
+| `low`      | `VIDEO_LOW_COST_RESOLUTION` (default 720×1280) | disabled |
+| `balanced` | platform default (1080×1920) | only on configured scenes |
+| `quality`  | platform default (1080×1920) | enabled (hook scene 0)   |
+
+### Premium scene strategy
+
+Route only your highest-impact scenes (e.g. the hook) to a pricier provider:
+
+```env
+VIDEO_PREMIUM_PROVIDER=seedance    # blank = disabled
+VIDEO_PREMIUM_SCENES=0             # 0-based indices; default first scene
+```
+
+In `quality` mode the hook (scene 0) gets the premium provider automatically;
+all other scenes use `SCENE_VIDEO_PROVIDER`.
+
+### Example: generate a vertical TikTok/Reels/Shorts video
+
+```bash
+curl -X POST http://localhost:8085/generate-video \
+  -H "Content-Type: application/json" \
+  -d '{
+        "article_id": "<id>",
+        "render_mode": "animated",
+        "platform": "tiktok",
+        "burn_subtitles": true
+      }'
+# poll the returned task_id, then download the MP4 from /video/{video_id}
+```
+
+---
+
 ## API endpoints (baseline)
 
 > Your actual routes may vary, but these are the expected “MVP” endpoints.

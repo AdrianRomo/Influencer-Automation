@@ -24,6 +24,18 @@ import { KeysModal } from './components/KeysModal'
 import { SceneCard } from './components/SceneCard'
 import { SocialCaptionsPanel } from './components/SocialCaptionsPanel'
 import { ToastContainer, nextToastId, type Toast, type ToastKind } from './components/Toast'
+import { ErrorRecoveryCard } from './components/ErrorRecoveryCard'
+import { GenerationProgress } from './components/GenerationProgress'
+import { CostModeSelector, StylePresetSelector } from './components/VisualStyle'
+import { AdvancedSettingsDisclosure } from './components/AdvancedSettingsDisclosure'
+import { SubtitleControls, SubtitleStylePreview, DEFAULT_SUBTITLE_STYLE } from './components/SubtitleControls'
+import { GenerationStepper } from './components/GenerationStepper'
+import { VideoPreviewPanel, ResultActions } from './components/ResultPanel'
+import type { SubtitleStyle } from './types'
+import {
+  COST_MODES, STYLE_PRESETS, costModeFor, stylePresetFor,
+  type CostMode, type StylePresetId,
+} from './presets'
 import CatalogStudio from './components/CatalogStudio'
 
 // Utility helpers (fmtSeconds, relativeDate, …) moved to ./utils
@@ -103,6 +115,40 @@ export default function App() {
   // Legacy single-platform compat (first platform's job for scene animation grid)
   const videoJob: JobStatus | null = null
   const [renderMode, setRenderMode] = useState<RenderMode>('static')
+
+  // ── Visual-style presets (creator-facing controls over render params) ────
+  // Cost mode + style preset are *derived* from the underlying renderMode /
+  // nScenes / animationPrompt so Advanced overrides stay in sync.
+  const costMode: CostMode = costModeFor(renderMode, nScenes)
+  const stylePreset: StylePresetId = stylePresetFor(animationPrompt)
+
+  function applyCostMode(mode: CostMode) {
+    const preset = COST_MODES.find(m => m.id === mode)
+    if (!preset) return
+    setRenderMode(preset.renderMode)
+    setNScenes(preset.nScenes)
+  }
+
+  function applyStylePreset(id: StylePresetId) {
+    const preset = STYLE_PRESETS.find(p => p.id === id)
+    if (!preset) return
+    // Custom keeps whatever text is already there; presets overwrite it.
+    if (id !== 'custom') setAnimationPrompt(preset.prompt)
+  }
+
+  // ── Subtitles ────────────────────────────────────────────────────────────
+  const [burnSubtitles, setBurnSubtitles] = useState<boolean>(() => {
+    const v = localStorage.getItem('gen_burnSubtitles')
+    return v == null ? true : v === '1'
+  })
+  const [subtitleStyle, setSubtitleStyle] = useState<SubtitleStyle>(() => {
+    try {
+      const v = localStorage.getItem('gen_subtitleStyle')
+      return v ? { ...DEFAULT_SUBTITLE_STYLE, ...JSON.parse(v) } : DEFAULT_SUBTITLE_STYLE
+    } catch { return DEFAULT_SUBTITLE_STYLE }
+  })
+  useEffect(() => { localStorage.setItem('gen_burnSubtitles', burnSubtitles ? '1' : '0') }, [burnSubtitles])
+  useEffect(() => { localStorage.setItem('gen_subtitleStyle', JSON.stringify(subtitleStyle)) }, [subtitleStyle])
 
   // ── Script prepare (preview-before-audio) ──────────────────────────────
   const [prepareLoading, setPrepareLoading] = useState(false)
@@ -426,7 +472,10 @@ export default function App() {
     for (const plat of platforms) {
       _setPlatVideo(plat, { loading: true, stage: 'Queueing…', error: '' })
       try {
-        const resp = await startGenerateVideo(articleId, true, renderMode, plat, animationPrompt || null)
+        const resp = await startGenerateVideo(
+          articleId, burnSubtitles, renderMode, plat, animationPrompt || null,
+          burnSubtitles ? subtitleStyle : null,
+        )
         activeVideoTaskId.current = resp.task_id
         _setPlatVideo(plat, { taskId: resp.task_id, loading: true, stage: 'Queued' })
         pollVideo(resp.task_id, plat)
@@ -803,6 +852,17 @@ export default function App() {
   const videoReady = pkg?.video?.status === 'ready'
   const audioDownloadUrl = pkg?.audio?.id ? resolveAudioUrl(pkg.audio.id) : undefined
 
+  // ── Wizard progress (derived from real package state) ─────────────────────
+  const readyVideos = (pkg?.videos ?? []).filter(v => v.status === 'ready')
+  const WIZARD_STEPS = ['Article', 'Script', 'Voiceover', 'Video', 'Done']
+  const currentStep = readyVideos.length ? 4
+    : videoLoading ? 3
+    : pkg?.audio ? 2
+    : pkg?.script ? 1
+    : 0
+  // Primary finished video for the result hero (first ready, prefer vertical).
+  const heroVideo = readyVideos[0]
+
   const imageMap = useMemo(
     () => Object.fromEntries((pkg?.images ?? []).map(img => [img.scene_number, img])),
     [pkg?.images],
@@ -924,6 +984,9 @@ export default function App() {
           </button>
         </div>
       )}
+
+      {/* Progress stepper — reflects how far the current article has come */}
+      {currentUser && <GenerationStepper steps={WIZARD_STEPS} current={currentStep} />}
 
       {/* ── Step 1: Article Picker ───────────────────────────────────── */}
       {!pkg && flowStep === 'pick' && (
@@ -1136,7 +1199,14 @@ export default function App() {
               )}
             </div>
 
-            {error && <div className="error-text">{error}</div>}
+            {error && (
+              <ErrorRecoveryCard
+                error={error}
+                onRetry={handlePrepareArticle}
+                retryLabel="Try again"
+                onAddKeys={() => setShowKeysModal(true)}
+              />
+            )}
           </div>
         </>
       )}
@@ -1354,7 +1424,14 @@ export default function App() {
                 </button>
                 {loading && <button className="secondary" onClick={cancelAudio}>Cancel</button>}
               </div>
-              {error && <div className="error-text">{error}</div>}
+              {error && (
+                <ErrorRecoveryCard
+                  error={error}
+                  onRetry={startAudioFromPreview}
+                  retryLabel="Try again"
+                  onAddKeys={() => setShowKeysModal(true)}
+                />
+              )}
             </div>
           )}
 
@@ -1467,6 +1544,36 @@ export default function App() {
             </Collapsible>
           )}
 
+          {/* Result hero — finished video in a phone frame + primary actions */}
+          {heroVideo && !videoLoading && (
+            <div className="card result-hero">
+              <div className="result-hero-head">
+                <span className="result-hero-badge">✓ Your video is ready</span>
+                <span className="small" style={{ color: '#9ca3af' }}>
+                  {heroVideo.platform ?? 'video'} · {heroVideo.width}×{heroVideo.height}
+                  {' · '}{fmtSeconds(heroVideo.duration_seconds)}
+                  {heroVideo.render_mode === 'animated' ? ' · animated' : ''}
+                  {heroVideo.has_subtitles ? ' · subtitles' : ''}
+                </span>
+              </div>
+              <div className="result-hero-body">
+                <VideoPreviewPanel>
+                  <video controls src={resolveVideoUrl(heroVideo.id)} />
+                </VideoPreviewPanel>
+                <div className="result-hero-actions">
+                  <ResultActions
+                    downloadUrl={resolveVideoUrl(heroVideo.id)}
+                    onRegenerateBackground={() => retryVideo('images')}
+                    onRegenerateSubtitles={startVideo}
+                    onEditScript={() => { handleEditScript(); window.scrollTo({ top: 0, behavior: 'smooth' }) }}
+                    onNewVideo={reset}
+                    busy={videoLoading}
+                  />
+                </div>
+              </div>
+            </div>
+          )}
+
           {/* Video */}
           <div className="video-section card">
             <div className="video-section-header">
@@ -1474,10 +1581,13 @@ export default function App() {
               {videoLoading && videoStage && <span className="small">{videoStage}</span>}
             </div>
 
-            {/* Per-platform video outputs */}
-            {pkg.videos && pkg.videos.length > 0 && (
+            {/* Per-platform video outputs.
+                The hero above already showcases the primary ready video, so
+                while it's shown we hide that one here to avoid a duplicate
+                player (other platforms / failed renders still appear). */}
+            {pkg.videos && pkg.videos.filter(v => !(heroVideo && !videoLoading && v.id === heroVideo.id)).length > 0 && (
               <div className="platform-video-list">
-                {pkg.videos.map(v => (
+                {pkg.videos.filter(v => !(heroVideo && !videoLoading && v.id === heroVideo.id)).map(v => (
                   <div key={v.id} className="platform-video-card">
                     <div className="platform-video-meta small">
                       {v.platform && <span className="platform-badge">{v.platform}</span>}
@@ -1509,50 +1619,116 @@ export default function App() {
               </div>
             )}
 
-            {/* Per-platform loading progress */}
+            {/* Per-platform loading progress — named stage list */}
             {Object.entries(platVideos).map(([plat, state]) => state.loading && (
-              <div key={plat} className="small" style={{ color: '#6b7280', marginTop: 6 }}>
-                <span className="platform-badge" style={{ marginRight: 6 }}>{plat}</span>
-                <span className="spinner" style={{ width: 10, height: 10, marginRight: 6 }} />
-                {state.stage || 'Working…'}
+              <div key={plat} style={{ marginTop: 10 }}>
+                <div className="small" style={{ marginBottom: 4 }}>
+                  <span className="platform-badge" style={{ marginRight: 6 }}>{plat}</span>
+                  Generating your video — this can take a few minutes.
+                </div>
+                <GenerationProgress
+                  mode={renderMode}
+                  currentMessage={state.stage}
+                  active={state.loading}
+                />
               </div>
             ))}
 
-            {/* Error display per platform */}
-            {Object.entries(platVideos).map(([plat, state]) => state.error && (
-              <div key={plat} className="error-text" style={{ marginTop: 4 }}>
-                <span className="platform-badge" style={{ marginRight: 4 }}>{plat}</span>
-                {state.error}
-              </div>
+            {/* Error display per platform — friendly recovery card */}
+            {Object.entries(platVideos).map(([plat, state]) => state.error && !state.loading && (
+              <ErrorRecoveryCard
+                key={plat}
+                error={state.error}
+                onRetryVideo={() => retryVideo('video')}
+                onRetryImages={() => retryVideo('images')}
+                onAddKeys={() => setShowKeysModal(true)}
+                onReload={() => retryVideo('video')}
+              />
             ))}
 
             {/* Generate section — shown when no video yet or to add more */}
             {(!pkg.videos || pkg.videos.length === 0 || (!videoLoading)) && (
               <div style={{ marginTop: pkg.videos && pkg.videos.length > 0 ? 14 : 0 }}>
-                {/* Render mode toggle */}
+                {/* Visual style — creator-facing quality + style controls */}
                 {!videoLoading && (
-                  <div className="render-mode-toggle">
-                    <button
-                      className={`render-mode-btn ${renderMode === 'static' ? 'render-mode-active' : ''}`}
-                      onClick={() => setRenderMode('static')}
-                    >
-                      Standard
-                      <span className="render-mode-desc">DALL-E images · FFmpeg slideshow</span>
-                    </button>
-                    <button
-                      className={`render-mode-btn ${renderMode === 'animated' ? 'render-mode-active' : ''}`}
-                      onClick={() => setRenderMode('animated')}
-                    >
-                      Animated <span className="pro-badge">PRO</span>
-                      <span className="render-mode-desc">AI-animated scene clips</span>
-                    </button>
-                  </div>
-                )}
-                {renderMode === 'animated' && !videoLoading && (
-                  <div className="animated-info small">
-                    Each scene image is animated by the configured provider, then assembled into one video matched to the audio.
-                    Falls back to static for any scene that fails.
-                  </div>
+                  <>
+                    <div className="field-group">
+                      <span className="field-label">Quality</span>
+                      <CostModeSelector value={costMode} onChange={applyCostMode} />
+                    </div>
+                    <div className="field-group">
+                      <span className="field-label">Visual style</span>
+                      <StylePresetSelector value={stylePreset} onChange={applyStylePreset} />
+                      {stylePreset === 'custom' && (
+                        <textarea
+                          className="animation-prompt-input"
+                          style={{ marginTop: 8 }}
+                          value={animationPrompt}
+                          onChange={e => setAnimationPrompt(e.target.value)}
+                          rows={2}
+                          placeholder="Describe the motion you want — e.g. slow cinematic zoom, gentle pan."
+                        />
+                      )}
+                    </div>
+
+                    {/* Subtitles — style controls + live preview */}
+                    <div className="field-group">
+                      <span className="field-label">Subtitles</span>
+                      <div className="subtitle-row">
+                        <div className="subtitle-row-controls">
+                          <SubtitleControls
+                            value={subtitleStyle}
+                            onChange={setSubtitleStyle}
+                            enabled={burnSubtitles}
+                            onToggle={setBurnSubtitles}
+                          />
+                        </div>
+                        {burnSubtitles && (
+                          <div className="subtitle-row-preview">
+                            <div className="sub-prev-frame">
+                              <SubtitleStylePreview style={subtitleStyle} />
+                            </div>
+                            <span className="small" style={{ color: '#9ca3af' }}>Preview</span>
+                          </div>
+                        )}
+                      </div>
+                    </div>
+
+                    {costMode === 'high' && (
+                      <div className="animated-info small">
+                        Each scene is animated into a motion clip, then matched to the audio.
+                        Any scene that fails falls back to a still image automatically.
+                      </div>
+                    )}
+                    <AdvancedSettingsDisclosure>
+                      <div className="row">
+                        <div>
+                          <label>Storyboard scenes</label>
+                          <input
+                            type="number" min={0} max={20} value={nScenes}
+                            onChange={e => setNScenes(Number(e.target.value))}
+                          />
+                        </div>
+                        <div>
+                          <label>Render mode</label>
+                          <select value={renderMode} onChange={e => setRenderMode(e.target.value as RenderMode)}>
+                            <option value="static">Standard (still images)</option>
+                            <option value="animated">Animated (motion clips)</option>
+                          </select>
+                        </div>
+                      </div>
+                      <div style={{ marginTop: 12 }}>
+                        <label>Animation prompt <span className="small" style={{ color: '#9ca3af' }}>used for animated renders</span></label>
+                        <textarea
+                          className="animation-prompt-input"
+                          value={animationPrompt}
+                          onChange={e => setAnimationPrompt(e.target.value)}
+                          rows={2}
+                          placeholder="e.g. Smooth, subtle camera movement. Slow cinematic zoom."
+                        />
+                      </div>
+                    </AdvancedSettingsDisclosure>
+                  </>
                 )}
                 <div className="actions" style={{ marginTop: 12 }}>
                   <button onClick={startVideo} disabled={videoLoading || !articleId}>

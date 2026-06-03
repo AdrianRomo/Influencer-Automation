@@ -2,6 +2,7 @@ import type {
   ArticleSummary, PaginatedArticles, PrepareArticleReq, RssCandidate, Source,
   GenerateReq, GenerateResp, JobStatus, ContentPackage, RenderMode,
   TokenResp, UserResp, UserKeysIn, UserKeysOut, CostSummary, PlatformsResp,
+  SubtitleStyle,
 } from './types'
 
 const rawBase = import.meta.env.VITE_API_BASE_URL as string | undefined
@@ -206,6 +207,7 @@ export function startGenerateVideo(
   renderMode: RenderMode = 'static',
   platform: string = 'tiktok',
   animationPrompt?: string | null,
+  subtitleStyle?: SubtitleStyle | null,
 ): Promise<GenerateResp> {
   return http<GenerateResp>('/generate-video', {
     method: 'POST',
@@ -215,6 +217,7 @@ export function startGenerateVideo(
       render_mode: renderMode,
       platform,
       animation_prompt: animationPrompt ?? null,
+      subtitle_style: subtitleStyle ?? null,
     }),
   })
 }

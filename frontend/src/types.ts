@@ -224,6 +224,18 @@ export type SceneVideoRef = {
 
 export type RenderMode = 'static' | 'animated'
 
+// Subtitle styling sent to the render task. Enums only — the backend composes
+// these into the FFmpeg force_style string; no free text crosses the boundary.
+export type SubtitlePosition = 'bottom' | 'center' | 'top'
+export type SubtitleSize = 'small' | 'medium' | 'large'
+export type SubtitlePreset = 'boxed' | 'outline' | 'bold'
+
+export type SubtitleStyle = {
+  position: SubtitlePosition
+  size: SubtitleSize
+  preset: SubtitlePreset
+}
+
 export type AnalysisResult = {
   sentiment: 'positive' | 'neutral' | 'cautionary' | 'urgent'
   impact_score: number

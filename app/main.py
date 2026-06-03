@@ -242,6 +242,14 @@ class GenerateReq(BaseModel):
     article_id: str | None = None
 
 
+class SubtitleStyleReq(BaseModel):
+    """Constrained subtitle styling — enums only, never raw text, so the
+    values can be safely composed into the FFmpeg libass force_style string."""
+    position: Literal["bottom", "center", "top"] = "bottom"
+    size: Literal["small", "medium", "large"] = "medium"
+    preset: Literal["boxed", "outline", "bold"] = "boxed"
+
+
 class GenerateVideoReq(BaseModel):
     article_id: str
     audio_asset_id: str | None = None
@@ -249,6 +257,7 @@ class GenerateVideoReq(BaseModel):
     render_mode: Literal["static", "animated"] = "static"
     platform: str = DEFAULT_PLATFORM
     animation_prompt: str | None = None
+    subtitle_style: SubtitleStyleReq | None = None
 
 
 # ── RSS candidate picker ───────────────────────────────────────────────────
@@ -1302,6 +1311,7 @@ def generate_video(
             "openai_api_key": openai_key,
             "platform": req.platform,
             "animation_prompt": req.animation_prompt,
+            "subtitle_style": req.subtitle_style.model_dump() if req.subtitle_style else None,
         },
     )
     _video_tasks[req.article_id] = task.id
