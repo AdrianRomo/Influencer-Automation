@@ -720,11 +720,56 @@ function CampaignRow(props: {
       </div>
 
       {concepts && (
-        <div style={{ display: 'grid', gap: 8, marginTop: 10 }}>
-          {concepts.length === 0 && <div className="small">No concepts yet — click Generate.</div>}
-          {concepts.map(c => <ConceptCard key={c.id} concept={c} reload={loadConcepts} run={run} />)}
-        </div>
+        concepts.length === 0 ? (
+          <div style={{ marginTop: 10 }}>
+            <EmptyState title="No concepts yet" hint="Click Generate to create ad variants for this campaign." />
+          </div>
+        ) : (
+          <div className="concept-grid">
+            {concepts.map(c => <ConceptCard key={c.id} concept={c} reload={loadConcepts} run={run} />)}
+          </div>
+        )
       )}
+    </div>
+  )
+}
+
+// Gradient backdrops give each variant a distinct look at a glance (we don't
+// render the real visual until "Make video"). Indexed by variant so V1/V2/V3
+// stay visually stable across reloads.
+const FRAME_GRADIENTS = [
+  'linear-gradient(160deg, #7c3aed, #2563eb)',
+  'linear-gradient(160deg, #db2777, #f59e0b)',
+  'linear-gradient(160deg, #059669, #0ea5e9)',
+  'linear-gradient(160deg, #dc2626, #7c3aed)',
+  'linear-gradient(160deg, #0f172a, #475569)',
+]
+
+/**
+ * Phone-style 9:16 mock of the ad: hook on top, on-screen text mid, headline +
+ * CTA pill at the bottom — the same hierarchy a real vertical ad would use.
+ * Purely presentational so variants can be compared side by side.
+ */
+function AdPreviewFrame({ concept: c }: { concept: AdConcept }) {
+  const bg = FRAME_GRADIENTS[c.variant_index % FRAME_GRADIENTS.length]
+  const empty = !c.hook && !c.on_screen_text && !c.headline && !c.cta
+  return (
+    <div className="ad-frame" style={{ background: bg }}
+      role="img" aria-label={`Ad preview, variant ${c.variant_index + 1}`}>
+      <div className="ad-frame-canvas">
+        {empty ? (
+          <div className="ad-frame-empty">Preview</div>
+        ) : (
+          <>
+            <div className="ad-frame-top">{c.hook}</div>
+            <div className="ad-frame-mid">{c.on_screen_text}</div>
+            <div className="ad-frame-bottom">
+              {c.headline && <div className="ad-frame-headline">{c.headline}</div>}
+              {c.cta && <div className="ad-frame-cta">{c.cta}</div>}
+            </div>
+          </>
+        )}
+      </div>
     </div>
   )
 }
@@ -759,16 +804,20 @@ function ConceptCard(props: {
   })
 
   return (
-    <div className="card" style={{ background: '#0000000a' }}>
-      <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8 }}>
-        <div>
-          <div style={{ fontWeight: 600 }}>{c.hook || '(no hook)'}</div>
-          <div className="small">v{c.variant_index + 1} · {c.angle || '—'}</div>
-        </div>
-        <div style={{ textAlign: 'right' }}>
-          <span className="small" style={{ color: c.status === 'flagged' ? 'var(--color-danger)' : 'var(--color-success)' }}>{c.status}</span>
-          {risk && <div className="small">risk: <span style={{ color: riskColor(risk) }}>{risk}</span></div>}
-          <div style={{ display: 'flex', gap: 4, marginTop: 4, justifyContent: 'flex-end' }}>
+    <div className="card concept-card">
+      <div className="concept-card-row">
+        <AdPreviewFrame concept={c} />
+        <div className="concept-meta">
+          <div className="concept-badges">
+            <span className="variant-badge">V{c.variant_index + 1}</span>
+            <span className="small" style={{ color: c.status === 'flagged' ? 'var(--color-danger)' : 'var(--color-success)' }}>{c.status}</span>
+            {risk && <span className="small">risk: <span style={{ color: riskColor(risk) }}>{risk}</span></span>}
+          </div>
+          <div style={{ fontWeight: 700 }}>{c.hook || '(no hook)'}</div>
+          <div className="small" style={{ color: 'var(--color-text-muted)' }}>{c.angle || 'No angle'}</div>
+          {c.cta && <div className="small"><b>CTA:</b> {c.cta}</div>}
+
+          <div className="concept-actions">
             <button className="secondary small" onClick={() => { setEditing(e => !e); setOpen(true) }}>
               {editing ? 'Cancel' : 'Edit'}
             </button>
@@ -777,15 +826,19 @@ function ConceptCard(props: {
               await pollJob(task_id)
               await reload()
             })}>Regenerate</button>
+            <button className="secondary small" onClick={() => setOpen(v => !v)} aria-expanded={open}>
+              {open ? 'Hide' : 'Details'}
+            </button>
             <button className="secondary small" onClick={() => {
               if (!window.confirm('Delete this concept?')) return
               run('Deleting…', async () => { await deleteConcept(c.id); await reload() })
             }} style={{ color: 'var(--color-danger)' }}>Delete</button>
-            <button className="secondary small" onClick={() => setOpen(v => !v)}>{open ? 'Hide' : 'Details'}</button>
           </div>
-          <div style={{ display: 'flex', gap: 4, marginTop: 4, justifyContent: 'flex-end' }}>
-            <select value={vidPlatform} onChange={e => setVidPlatform(e.target.value)} className="small">
-              {PLATFORMS.map(p => <option key={p} value={p}>{p}</option>)}
+
+          <div className="concept-actions">
+            <select value={vidPlatform} onChange={e => setVidPlatform(e.target.value)}
+              className="small" aria-label="Video platform">
+              {PLATFORMS.map(p => <option key={p} value={p}>{platformLabel(p)}</option>)}
             </select>
             <button className="secondary small" onClick={() => run('Rendering video…', async () => {
               const { task_id } = await generateConceptVideo(c.id, vidPlatform)
