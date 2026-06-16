@@ -1,0 +1,47 @@
+# Optional Traefik override.
+#
+# Usage on the host that has Traefik + the external proxy network:
+#   TRAEFIK_API_HOST=influencer.example.com \
+#   TRAEFIK_FRONTEND_HOST=autonarrator.example.com \
+#   docker compose -f docker-compose.yml -f docker-compose.traefik.yml up -d --build
+#
+# The base docker-compose.yml still publishes direct ports. If you want those
+# bound only to localhost while Traefik serves public traffic, set:
+#   API_PORT=127.0.0.1:8085
+#   FRONTEND_PORT=127.0.0.1:5173
+
+services:
+  api:
+    environment:
+      CORS_ORIGINS: ${CORS_ORIGINS:-https://${TRAEFIK_FRONTEND_HOST}}
+    networks:
+      - proxy
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=${TRAEFIK_DOCKER_NETWORK:-proxy}"
+      - "traefik.http.routers.${TRAEFIK_API_ROUTER:-influencer-api}.rule=Host(`${TRAEFIK_API_HOST}`)"
+      - "traefik.http.routers.${TRAEFIK_API_ROUTER:-influencer-api}.entrypoints=${TRAEFIK_ENTRYPOINT:-https}"
+      - "traefik.http.routers.${TRAEFIK_API_ROUTER:-influencer-api}.tls=true"
+      - "traefik.http.routers.${TRAEFIK_API_ROUTER:-influencer-api}.tls.certresolver=${TRAEFIK_CERT_RESOLVER:-cloudflare}"
+      - "traefik.http.services.${TRAEFIK_API_SERVICE:-influencer-api}.loadbalancer.server.port=8085"
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        VITE_API_BASE_URL: ${VITE_API_BASE_URL:-https://${TRAEFIK_API_HOST}}
+    networks:
+      - proxy
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=${TRAEFIK_DOCKER_NETWORK:-proxy}"
+      - "traefik.http.routers.${TRAEFIK_FRONTEND_ROUTER:-influencer-frontend}.rule=Host(`${TRAEFIK_FRONTEND_HOST}`)"
+      - "traefik.http.routers.${TRAEFIK_FRONTEND_ROUTER:-influencer-frontend}.entrypoints=${TRAEFIK_ENTRYPOINT:-https}"
+      - "traefik.http.routers.${TRAEFIK_FRONTEND_ROUTER:-influencer-frontend}.tls=true"
+      - "traefik.http.routers.${TRAEFIK_FRONTEND_ROUTER:-influencer-frontend}.tls.certresolver=${TRAEFIK_CERT_RESOLVER:-cloudflare}"
+      - "traefik.http.services.${TRAEFIK_FRONTEND_SERVICE:-influencer-frontend}.loadbalancer.server.port=80"
+
+networks:
+  proxy:
+    external: true
+    name: ${TRAEFIK_DOCKER_NETWORK:-proxy}

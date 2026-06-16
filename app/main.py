@@ -120,6 +120,13 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Content Generator", lifespan=lifespan)
 
 _cors_origins = ["http://localhost:5173", "http://127.0.0.1:5173"]
+_extra_cors_origins = os.getenv("CORS_ORIGINS", "").strip()
+if _extra_cors_origins:
+    _cors_origins.extend(
+        origin.strip().rstrip("/")
+        for origin in _extra_cors_origins.split(",")
+        if origin.strip()
+    )
 _domain = os.getenv("DOMAIN", "").strip()
 if _domain:
     for host in ("autonarrator", "influencer"):
