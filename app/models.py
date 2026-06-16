@@ -270,6 +270,48 @@ class VideoAsset(Base):
     )
 
 
+class EditTimeline(Base):
+    """Editable timeline ("Edit document") for the final-step video editor.
+
+    Built from an article's storyboard + assets, then mutated by the embedded
+    Shotstack Studio editor (drag subtitles, retime clips, toggle animate).
+    ``edit_json`` holds the canonical, provider-agnostic timeline (see
+    app/timeline.py); the Shotstack render JSON is derived from it at render time.
+
+    Like the asset tables, article_id is nullable so catalog-to-ad concepts can
+    reuse the same editor via workspace/product/ad_concept linkage.
+    """
+    __tablename__ = "edit_timelines"
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    article_id: Mapped[str | None] = mapped_column(ForeignKey("articles.id", ondelete="CASCADE"), nullable=True)
+
+    # Canonical timeline document (tracks/clips/subtitles/output). See app/timeline.py.
+    edit_json: Mapped[dict] = mapped_column(JSON, nullable=False)
+    # Bumped on every save so the frontend can detect/conflict-check edits.
+    version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    # draft | rendering | rendered | failed
+    status: Mapped[str] = mapped_column(String, default="draft", nullable=False)
+
+    # Last render linkage (Shotstack job + resulting VideoAsset).
+    render_provider: Mapped[str | None] = mapped_column(String, nullable=True)   # shotstack | ffmpeg
+    render_job_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    video_asset_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # Catalog-to-ad linkage (None = article-sourced / legacy).
+    workspace_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    product_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    ad_concept_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+
+    deleted_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+
+    __table_args__ = (
+        Index("ix_edit_timelines_article", "article_id"),
+    )
+
+
 class GenerationUsageEvent(Base):
     """One row per provider API call; used for cost tracking and reconciliation."""
     __tablename__ = "generation_usage_events"

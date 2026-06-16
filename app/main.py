@@ -92,6 +92,7 @@ from app.routers import products as products_router
 from app.routers import campaigns as campaigns_router
 from app.routers import concepts as concepts_router
 from app.routers import billing as billing_router
+from app.routers import timeline as timeline_router
 
 Base.metadata.create_all(bind=engine)
 
@@ -163,6 +164,9 @@ app.include_router(products_router.router)
 app.include_router(campaigns_router.router)
 app.include_router(concepts_router.router)
 app.include_router(billing_router.router)
+
+# Embedded video editor: editable timeline + render (Shotstack).
+app.include_router(timeline_router.router)
 
 
 @app.middleware("http")
