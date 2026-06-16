@@ -7,16 +7,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What This Project Does
 
-Current state:
-End-to-end pipeline: RSS medical/health feeds → Spanish-language narration scripts (OpenAI) → audio synthesis (ElevenLabs TTS) → served via REST API + React UI.
+Current state (this is a full short-form VIDEO pipeline, not audio-only):
+RSS medical/health feeds → Spanish narration scripts (OpenAI) → storyboard with per-scene timing → ElevenLabs TTS → DALL·E scene images → optional AI image-to-video scene clips (Seedance/Runway) → FFmpeg assembly → SRT/VTT captions → MP4 export. Also includes an ad/catalog flow (brands, products, campaigns, ad concepts), auth, workspaces, billing/credits. Served via REST API + React UI.
 
 Current core flow:
-`RSS Feed → Content Extraction → Script Generation → TTS Synthesis → MP3 Download`
+`RSS Feed → Extraction → Script → Storyboard (timed) → TTS → Images → (optional AI clips) → FFmpeg assembly → Captions → MP4`
 
-Product direction:
-This project should evolve from an audio-only content pipeline into a richer content-production system that can generate publishable short-form media assets. The desired long-term direction is:
-
-`RSS Feed / Source Content → Extraction → Script Generation → Storyboard / Scene Plan → Voiceover → Media Asset Assembly → Video Export / Download`
+Product direction (in progress, 2026-06):
+Add a final-step **embedded video editor** before render — Shotstack Studio SDK (white-label embed) emitting Edit JSON rendered by the Shotstack API, with FFmpeg (`app/video.py`) kept as a no-cost fallback. Users drag/retime subtitles and clips, and toggle a **tiered "Animate"** per clip: free motion effects (Ken Burns/zoom/pan/transitions) or AI image-to-video via the existing Seedance/Runway providers. See `app/scene_video.py`. Key constraint: Shotstack cloud render fetches assets by URL, so media must be exposed via signed, internet-reachable URLs.
 
 When making product or architecture decisions, prefer changes that move the system toward:
 - full video creation, not just narration
@@ -97,65 +95,59 @@ npm run build
 
 ### Key Files
 
-| File                 | Responsibility                                                       |
-| -------------------- | -------------------------------------------------------------------- |
-| `app/main.py`        | FastAPI app, HTTP endpoints, startup hook seeds RSS sources          |
-| `app/tasks.py`       | `generate_latest_for_source()` — main Celery task orchestration      |
-| `app/models.py`      | ORM models: Source, Article, AudioAsset, VoiceCalibration            |
-| `app/summarize.py`   | OpenAI calls: script generation, word-count targeting, storyboarding |
-| `app/tts.py`         | ElevenLabs synthesis wrapper                                         |
-| `app/extract.py`     | Article content extraction via trafilatura with fallbacks            |
-| `app/rss_sources.py` | 30+ pre-configured medical RSS feeds (FDA, NIH, CDC, NLM, etc.)      |
-| `app/db.py`          | SQLAlchemy engine, session factory, FastAPI `get_db()` dependency    |
+| File                 | Responsibility                                                                 |
+| -------------------- | ------------------------------------------------------------------------------ |
+| `app/main.py`        | FastAPI app, includes routers, startup hook seeds RSS sources                   |
+| `app/routers/`       | Route modules: auth, billing, brands, campaigns, catalog, concepts, products, workspaces, media, health |
+| `app/tasks.py`       | Celery task orchestration (article + ad-concept generation pipelines)          |
+| `app/models.py`      | ORM: Source, Article, AudioAsset, ImageAsset, VideoAsset, SceneVideoAsset, VoiceCalibration, User/Workspace, Brand/Catalog/Product, Campaign/AdConcept, credits |
+| `app/summarize.py`   | OpenAI calls: script generation, word-count targeting, storyboarding            |
+| `app/tts.py`         | ElevenLabs synthesis wrapper                                                    |
+| `app/image_gen.py`   | DALL·E scene image generation                                                   |
+| `app/scene_video.py` | Image-to-video provider abstraction: Static, **Seedance**, **Runway** (submit/poll/download) |
+| `app/video.py`       | FFmpeg assembly (scene images + audio + subtitles → 9:16 MP4)                   |
+| `app/captions.py`    | Storyboard timing → SRT/WebVTT (no LLM calls)                                   |
+| `app/export.py`      | Content package export                                                          |
+| `app/extract.py`     | Article content extraction via trafilatura with fallbacks                       |
+| `app/rss_sources.py` | 30+ pre-configured medical RSS feeds (FDA, NIH, CDC, NLM, etc.)                 |
+| `app/db.py`          | SQLAlchemy engine, session factory, FastAPI `get_db()` dependency               |
 
-### Likely Expansion Areas
+### Planned Expansion Areas (embedded editor)
 
-Use these directions when extending the codebase:
-
-* `app/video.py` or `app/render.py` for video assembly/export logic
-* `app/captions.py` for subtitle/caption formatting
-* `app/assets.py` for generated media asset management
-* `app/prompts.py` for centralized LLM prompt templates
-* `app/schemas.py` or Pydantic response models for richer API contracts
-* frontend pages/components for asset preview, scene review, and download/export actions
+* `app/timeline.py` — canonical Edit document + storyboard→Shotstack-JSON adapter
+* `app/render_shotstack.py` — submit Edit JSON to Shotstack render API, poll, store VideoAsset
+* signed/internet-reachable asset URLs so the Shotstack cloud renderer can fetch images/audio/clips
+* `frontend/src` — add a router + `/editor/:articleId` page embedding `@shotstack/shotstack-studio`
 
 ## API Endpoints
 
-Current:
+Implemented (see `app/routers/`):
 
-* `GET /sources` — list available RSS sources
-* `POST /generate` — queue audio generation job, returns `task_id`
-* `GET /jobs/{task_id}` — poll Celery task status
-* `GET /audio/{audio_id}` — download MP3
-* `GET /articles/{article_id}` — fetch article with script + storyboard JSON
+* `GET /sources`, `POST /generate`, `GET /jobs/{task_id}`
+* `GET /audio/{id}`, `GET /image/{id}`, `GET /video/{id}`, `GET /scene-videos/{id}`, `GET /thumbnail/...` (in `routers/media.py`)
+* `GET /articles/{id}` — article with script + storyboard JSON
+* `POST /generate-video` and the ad/catalog/concept/campaign/workspace/billing routes
 
-Preferred future additions:
+Planned (embedded editor):
 
-* `POST /generate-video` — queue full video/media generation
-* `GET /video/{video_id}` — download rendered video
-* `GET /assets/{asset_id}` — fetch generated image/caption/thumbnail assets
-* `GET /articles/{article_id}/package` — fetch complete content package
-* `POST /articles/{article_id}/regenerate` — rerun selected stages only
-
-Do not add future endpoints unless they align cleanly with the existing task orchestration model.
+* `GET/PUT /articles/{id}/timeline` — load/save the editable Edit document
+* `POST /articles/{id}/render` + `GET /render/{job}` — render edited timeline (Shotstack; FFmpeg fallback)
+* `POST /articles/{id}/clips/{n}/animate` — queue tiered animate (effect or AI image-to-video)
+* `GET /articles/{id}/package` — final MP4 + captions + thumbnail + social captions
 
 ## Database Schema
 
-Current:
+Implemented:
 
-* `sources` — RSS feed registry, seeded at API startup
-* `articles` — upserted by `(source_id, url)` to prevent duplicates
-* `audio_assets` — TTS outputs with file path, duration, status
-* `voice_calibration` — WPM estimates per `(voice_id, model_id, speed)`, updated via EMA
+* `sources`, `articles` (with `storyboard_json`, `social_captions_json`), `audio_assets`, `image_assets`, `video_assets`, `scene_video_assets`, `voice_calibration`
+* `users`, `workspaces`, `workspace_members`, `user_api_keys`, credit ledger (`credit_transactions`), usage events
+* `brands`, `catalogs`, `products`, `product_images`, `campaigns`, `ad_concepts`
 
-Preferred future additions:
+Planned:
 
-* `video_assets` — rendered video outputs and metadata
-* `image_assets` — thumbnails, covers, scene visuals
-* `caption_assets` — subtitle/caption exports
-* `generation_runs` — stage-by-stage execution tracking for multi-asset jobs
+* `edit_timelines` — persisted editable Edit document per article/concept, versioned
 
-Schema changes should be backward-compatible when possible.
+Schema changes should be backward-compatible when possible (Alembic migrations under `alembic/`).
 
 ## Design Patterns
 
