@@ -76,6 +76,17 @@ def store_task_owner(task_id: str, user_id: Optional[str]) -> None:
         pass
 
 
+def clear_user_task(user_id: Optional[str], task_id: str) -> None:
+    """Remove task ownership/capacity bookkeeping for a finished or canceled job."""
+    try:
+        r = _get_rl_redis()
+        if user_id:
+            r.srem(f"user_tasks:{user_id}", task_id)
+        r.delete(f"task:{task_id}:owner")
+    except Exception:
+        pass
+
+
 def assert_task_owner(task_id: str, current_user: Optional[User]) -> None:
     """Raise 403 if a JWT user tries to inspect/cancel another user's task."""
     if not current_user:
@@ -150,10 +161,25 @@ def prune_user_tasks(r, user_id: str) -> int:
     members = r.smembers(key)
     if not members:
         return 0
-    stale = [m for m in members if not r.exists(f"task:{m}:owner")]
+    stale = [
+        m for m in members
+        if not r.exists(f"task:{m}:owner") or _task_is_terminal(m)
+    ]
     if stale:
         r.srem(key, *stale)
     return r.scard(key)
+
+
+def _task_is_terminal(task_id: str) -> bool:
+    """Best-effort Celery result check for jobs whose postrun cleanup was missed."""
+    try:
+        from celery.result import AsyncResult
+        from celery.states import READY_STATES
+        from app.tasks import celery_app
+
+        return AsyncResult(task_id, app=celery_app).state in READY_STATES
+    except Exception:
+        return False
 
 
 def check_user_task_capacity(user_id: str) -> None:

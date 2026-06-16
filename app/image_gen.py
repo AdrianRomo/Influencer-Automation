@@ -26,17 +26,23 @@ IMAGE_MODEL = os.getenv("IMAGE_MODEL", "dall-e-3")
 IMAGE_SIZE = os.getenv("IMAGE_SIZE", "1024x1792")
 IMAGE_QUALITY = os.getenv("IMAGE_QUALITY", "standard")  # standard | hd
 
-# Safety prefix ensures medical prompts don't trigger content filters
-_PROMPT_PREFIX = (
-    "Professional photorealistic medical illustration, clean and informative, "
-    "no text overlays, no gore, suitable for health education: "
+_DEFAULT_PROMPT_PREFIX = (
+    "Clean editorial short-form video visual, realistic and informative, "
+    "no text overlays, no logos, no watermarks: "
 )
 _MAX_PROMPT_CHARS = 900  # well under DALL-E's 4000-char limit after prefix
 
 
-def _safe_prompt(visual_prompt: str) -> str:
-    raw = (_PROMPT_PREFIX + visual_prompt.strip())
-    return raw[:_MAX_PROMPT_CHARS + len(_PROMPT_PREFIX)]
+def _prompt_prefix(content_profile: dict | None = None) -> str:
+    policy = (content_profile or {}).get("visual_policy") or {}
+    prefix = (policy.get("prompt_prefix") or _DEFAULT_PROMPT_PREFIX).strip()
+    return prefix if prefix.endswith((":", ".", " ")) else f"{prefix}:"
+
+
+def _safe_prompt(visual_prompt: str, content_profile: dict | None = None) -> str:
+    prefix = _prompt_prefix(content_profile)
+    raw = f"{prefix} {visual_prompt.strip()}"
+    return raw[:_MAX_PROMPT_CHARS + len(prefix)]
 
 
 def generate_scene_image(
@@ -44,6 +50,7 @@ def generate_scene_image(
     api_key: str | None = None,
     collector: "UsageCollector | None" = None,
     scene_number: int | None = None,
+    content_profile: dict | None = None,
 ) -> bytes:
     """Call DALL-E and return raw PNG bytes."""
     from app.circuit_breakers import openai_breaker  # lazy import — no circular deps
@@ -53,7 +60,7 @@ def generate_scene_image(
         resp = openai_breaker.call(
             c.images.generate,
             model=IMAGE_MODEL,
-            prompt=_safe_prompt(visual_prompt),
+            prompt=_safe_prompt(visual_prompt, content_profile),
             size=IMAGE_SIZE,
             quality=IMAGE_QUALITY,
             n=1,
@@ -92,20 +99,23 @@ def generate_thumbnail(
     custom_prompt: str | None = None,
     api_key: str | None = None,
     collector: "UsageCollector | None" = None,
+    content_profile: dict | None = None,
 ) -> bytes:
     """Generate a DALL-E 3 cover/thumbnail image for the article.
 
     When ``custom_prompt`` is supplied, it replaces the template-based prompt
     (still safety-prefixed) so users can describe the cover they want.
     """
+    prefix = _prompt_prefix(content_profile)
     if custom_prompt and custom_prompt.strip():
-        prompt = (_PROMPT_PREFIX + custom_prompt.strip())[:_MAX_PROMPT_CHARS + len(_PROMPT_PREFIX)]
+        prompt = f"{prefix} {custom_prompt.strip()}"[:_MAX_PROMPT_CHARS + len(prefix)]
     else:
         topic = title[:200]
         visual_hint = f" Visual reference: {scene_prompt[:150]}." if scene_prompt else ""
+        profile_name = (content_profile or {}).get("name") or "content"
         prompt = (
-            f"Eye-catching social media cover image for a medical health video about: {topic}.{visual_hint} "
-            "Professional photorealistic healthcare aesthetic. Cinematic lighting. "
+            f"{prefix} Eye-catching social media cover image for a {profile_name} video about: {topic}.{visual_hint} "
+            "Professional editorial aesthetic. Cinematic lighting. "
             "No text, no watermarks, no logos. Clean composition."
         )[:900]
 
@@ -168,6 +178,7 @@ def generate_and_save(
     api_key: str | None = None,
     collector: "UsageCollector | None" = None,
     scene_number: int | None = None,
+    content_profile: dict | None = None,
 ) -> bool:
     """Generate an image and save to disk. Returns True on success, False on failure.
 
@@ -175,7 +186,8 @@ def generate_and_save(
     """
     try:
         img_bytes = generate_scene_image(visual_prompt, api_key=api_key,
-                                         collector=collector, scene_number=scene_number)
+                                         collector=collector, scene_number=scene_number,
+                                         content_profile=content_profile)
         with open(output_path, "wb") as fh:
             fh.write(img_bytes)
         return True

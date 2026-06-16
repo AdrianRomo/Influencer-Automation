@@ -42,8 +42,9 @@ DEFAULT_SCENES = int(os.getenv("STORYBOARD_SCENES", "8"))
 
 from app.prompts import get as _prompt
 
-SYSTEM_SCRIPT = _prompt("script", output_language=OUTPUT_LANGUAGE)
-SYSTEM_REWRITE = _prompt("rewrite", output_language=OUTPUT_LANGUAGE)
+_GENERIC_PROFILE_CONTEXT = "Content profile: General News\nTone: clear, accurate, concise"
+SYSTEM_SCRIPT = _prompt("script", output_language=OUTPUT_LANGUAGE, profile_context=_GENERIC_PROFILE_CONTEXT)
+SYSTEM_REWRITE = _prompt("rewrite", output_language=OUTPUT_LANGUAGE, profile_context=_GENERIC_PROFILE_CONTEXT)
 SYSTEM_STORYBOARD = _prompt("storyboard")
 
 
@@ -90,6 +91,32 @@ def _is_spanish(lang: Optional[str]) -> bool:
 
 def _pick_wpm(output_language: Optional[str]) -> int:
     return WPM_ES if _is_spanish(output_language) else WPM_EN
+
+
+def _profile_prompt_context(content_profile: Optional[dict]) -> str:
+    profile = content_profile or {}
+    script_policy = profile.get("script_policy") or {}
+    visual_policy = profile.get("visual_policy") or {}
+    tone = profile.get("tone") or {}
+    audience = profile.get("audience") or {}
+    analysis = profile.get("analysis_schema") or {}
+    preserve = script_policy.get("preserve_terms") or []
+    avoid = visual_policy.get("avoid") or []
+    focus = analysis.get("focus") or []
+    disclaimer = profile.get("disclaimer_text")
+    return "\n".join([
+        f"Content profile: {profile.get('name') or 'General News'}",
+        f"Description: {profile.get('description') or 'General source-driven short-form content.'}",
+        f"Tone: {', '.join(tone.get('keywords') or []) or 'clear, accurate, concise'}",
+        f"Audience: {audience.get('primary') or 'general viewers'}",
+        f"Terms to preserve exactly when present: {', '.join(preserve) or 'names, numbers, dates, units, product/source-specific terms'}",
+        f"Factuality rule: {script_policy.get('factuality') or 'Do not add unsupported facts.'}",
+        f"Disclaimer required: {'yes' if script_policy.get('disclaimer_required') else 'no'}",
+        f"Disclaimer text: {disclaimer or 'none'}",
+        f"Visual style: {visual_policy.get('prompt_prefix') or 'clean editorial visual'}",
+        f"Visual avoid list: {', '.join(avoid) or 'text overlays, logos, watermarks'}",
+        f"Analysis focus: {', '.join(focus) or 'impact_score, key_claims, audience_relevance'}",
+    ])
 
 
 def _estimate_seconds(word_count: int, output_language: Optional[str]) -> int:
@@ -186,6 +213,7 @@ def make_tts_script(
         tol_words: int | None = None,
         api_key: str | None = None,
         collector: "UsageCollector | None" = None,
+        content_profile: Optional[dict] = None,
 ) -> str:
     """
     Returns a narration-ready script aimed at ~target_seconds, always in Spanish by default.
@@ -201,6 +229,17 @@ def make_tts_script(
     tol = max(10, min(tol, int(round(target * 0.12))))
     lo, hi = target - tol, target + tol
     src_hint = language_hint or "auto-detect"
+    profile_context = _profile_prompt_context(content_profile)
+    system_script = _prompt(
+        "script",
+        output_language=output_language,
+        profile_context=profile_context,
+    )
+    system_rewrite = _prompt(
+        "rewrite",
+        output_language=output_language,
+        profile_context=profile_context,
+    )
     prompt = f"""TITLE: {title}
 
 ARTICLE TEXT:
@@ -209,17 +248,17 @@ ARTICLE TEXT:
 Input Language (hint): {src_hint}
 
 Output language:
-- Spanish ({output_language}) only.
+- {output_language} only.
 
 LENGTH IS A HARD REQUIREMENT:
 - Write between {lo} and {hi} words (target {target}).
 - Count words carefully before finalizing.
 - Narration duration budget: ~{target_seconds} seconds at ~{int(round(target * 60 / max(target_seconds, 1)))} WPM.
-- If the article lacks content, expand with additional context, implications, or relevant background to reach the target — do NOT invent medical facts, but elaborate on what is there.
+- If the article lacks content, expand with relevant context, implications, or background from the source. Do NOT invent facts.
 - If the article has too much content, compress by dropping less-essential details. Never truncate mid-sentence.
 """
 
-    script = _call_llm(SYSTEM_SCRIPT, prompt, model=model, temperature=0.3, api_key=api_key,
+    script = _call_llm(system_script, prompt, model=model, temperature=0.3, api_key=api_key,
                        collector=collector, operation="script")
     wc = _count_words(script)
 
@@ -237,7 +276,7 @@ LENGTH IS A HARD REQUIREMENT:
                 "of relevant context (background, mechanism, implications, comparisons). "
                 "Do NOT invent facts. Stay faithful to the source."
             )
-        rewrite_prompt = f"""Rewrite the Spanish TTS script to fit the target word count.
+        rewrite_prompt = f"""Rewrite the TTS script to fit the target word count and selected content profile.
 
 TARGET: {target} words. Acceptable range: {lo} to {hi} words.
 Current length: {wc} words ({direction} by ~{delta} words).
@@ -245,15 +284,15 @@ Current length: {wc} words ({direction} by ~{delta} words).
 {guidance}
 
 Rules:
-- Preserve numbers/dates/dosages/units/drug names exactly.
+- Preserve source-specific names, numbers, dates, units, and profile-listed terms exactly.
 - Keep it natural spoken narration.
-- End with the brief medical disclaimer in Spanish.
+- Include the profile disclaimer only when the content profile requires one.
 - Output ONLY the finalized script, nothing else.
 
 SCRIPT:
 {script}
 """
-        script = _call_llm(SYSTEM_REWRITE, rewrite_prompt, model=model, temperature=0.2, api_key=api_key,
+        script = _call_llm(system_rewrite, rewrite_prompt, model=model, temperature=0.2, api_key=api_key,
                            collector=collector, operation="rewrite")
         wc = _count_words(script)
 
@@ -266,9 +305,11 @@ def make_storyboard(
         language_hint: str | None = None,
         n_scenes: int = DEFAULT_SCENES,
         image_prompt_language: str = IMAGE_PROMPT_LANGUAGE,
+        output_language: str = OUTPUT_LANGUAGE,
         wpm_estimate: float | None = None,
         api_key: str | None = None,
         collector: "UsageCollector | None" = None,
+        content_profile: Optional[dict] = None,
 ) -> List[Dict[str, Any]]:
     """Return timing-enriched scene list aligned to the narration script.
 
@@ -280,17 +321,21 @@ def make_storyboard(
     if n_scenes <= 0:
         return []
     model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+    profile_context = _profile_prompt_context(content_profile)
 
     user = f"""
 Create {n_scenes} scenes for a narrated video based on the script.
 
 Return a JSON array where each object has exactly these fields:
 - scene_number: integer starting at 1
-- narration: Spanish, 1-2 sentences directly from the script. No new facts.
-- visual_prompt: {image_prompt_language} description for image/video generation. No text overlays. No logos. Medical-appropriate.
+- narration: {output_language}, 1-2 sentences directly from the script. No new facts.
+- visual_prompt: {image_prompt_language} description for image/video generation. Follow the selected profile's visual style. No text overlays. No logos.
 - on_screen_text: a 1-4 word {image_prompt_language} phrase to show as a text overlay on the video frame.
 - asset_type: one of "b-roll", "title-card", or "outro". Use "title-card" for scene 1 and "outro" for the last scene.
 - transition: always "cut" for this content type.
+
+CONTENT PROFILE:
+{profile_context}
 
 TITLE: {title}
 
@@ -353,6 +398,7 @@ def make_tts_bundle(
         wpm_estimate: float | None = None,
         api_key: str | None = None,
         collector: "UsageCollector | None" = None,
+        content_profile: Optional[dict] = None,
 ) -> Dict[str, Any]:
     """Convenience: script + metadata + timing-enriched storyboard in one call."""
     script = make_tts_script(
@@ -364,6 +410,7 @@ def make_tts_bundle(
         tol_words=tol_words,
         api_key=api_key,
         collector=collector,
+        content_profile=content_profile,
     )
     wc = _count_words(script)
     # Prefer the caller's calibrated WPM over the language default so the
@@ -374,9 +421,11 @@ def make_tts_bundle(
         title, script,
         language_hint=language_hint,
         n_scenes=n_scenes,
+        output_language=output_language,
         wpm_estimate=wpm_estimate,
         api_key=api_key,
         collector=collector,
+        content_profile=content_profile,
     )
     total_duration = sum(s.get("duration_estimate", 0.0) for s in scenes)
 
@@ -403,7 +452,7 @@ _PLATFORM_CAPTION_HINTS: Dict[str, str] = {
     "facebook":       "Facebook: conversational, slight longer form OK, 180–280 chars, 3–5 hashtags",
 }
 
-_SYSTEM_CAPTIONS = _prompt("captions")
+_SYSTEM_CAPTIONS = _prompt("captions", profile_context=_GENERIC_PROFILE_CONTEXT)
 
 
 def generate_social_captions(
@@ -413,6 +462,7 @@ def generate_social_captions(
     output_language: str = OUTPUT_LANGUAGE,
     api_key: str | None = None,
     collector: "UsageCollector | None" = None,
+    content_profile: Optional[dict] = None,
 ) -> Dict[str, Any]:
     """Generate platform-optimized post captions + hashtags for the given platforms.
 
@@ -421,6 +471,8 @@ def generate_social_captions(
     if not platforms:
         return {}
     model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+    profile_context = _profile_prompt_context(content_profile)
+    system_captions = _prompt("captions", profile_context=profile_context)
     hints = "\n".join(
         f"- {pid}: {_PLATFORM_CAPTION_HINTS.get(pid, 'social media post, 150–250 chars, 3–5 hashtags')}"
         for pid in platforms
@@ -430,12 +482,15 @@ def generate_social_captions(
 Script (language: {output_language}):
 {script[:2000]}
 
+CONTENT PROFILE:
+{profile_context}
+
 Write captions for these platforms (write in the script's language: {output_language}):
 {hints}
 
 Return ONLY a JSON object with the platform IDs as keys."""
     raw = _call_llm(
-        _SYSTEM_CAPTIONS, prompt,
+        system_captions, prompt,
         model=model, temperature=0.4,
         api_key=api_key, collector=collector, operation="captions",
     )
@@ -456,7 +511,7 @@ Return ONLY a JSON object with the platform IDs as keys."""
                 "`caption` and `hashtags` keys.\n\n" + prompt
             )
             raw = _call_llm(
-                _SYSTEM_CAPTIONS, correction,
+                system_captions, correction,
                 model=model, temperature=0.2,
                 api_key=api_key, collector=collector, operation="captions_retry",
             )
@@ -470,16 +525,28 @@ def rewrite_to_target_words(
     tol_words: int = 10,
     api_key: str | None = None,
     collector: "UsageCollector | None" = None,
+    output_language: str = OUTPUT_LANGUAGE,
+    content_profile: Optional[dict] = None,
 ) -> str:
     model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-    prompt = f"""Rewrite this Spanish TTS script to fit the word count range.
+    profile_context = _profile_prompt_context(content_profile)
+    system_rewrite = _prompt(
+        "rewrite",
+        output_language=output_language,
+        profile_context=profile_context,
+    )
+    prompt = f"""Rewrite this TTS script to fit the word count range.
 
 TARGET RANGE: {target_words - tol_words} to {target_words + tol_words} words (target {target_words}).
-Do not add new facts. Preserve numbers/dates/dosages/units/drug names exactly.
-Keep it natural spoken narration. End with the brief medical disclaimer in Spanish.
+Output language: {output_language}.
+Do not add new facts. Preserve source-specific names, numbers, dates, units, and profile-listed terms exactly.
+Keep it natural spoken narration. Include the profile disclaimer only when required.
+
+CONTENT PROFILE:
+{profile_context}
 
 SCRIPT:
 {script}
 """
-    return _call_llm(SYSTEM_REWRITE, prompt, model=model, temperature=0.2, api_key=api_key,
+    return _call_llm(system_rewrite, prompt, model=model, temperature=0.2, api_key=api_key,
                      collector=collector, operation="rewrite")

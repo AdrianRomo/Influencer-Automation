@@ -67,6 +67,8 @@ class Storyboard(BaseModel):
 class ArticleResponse(BaseModel):
     id: str
     source_id: str
+    content_profile_id: Optional[str] = None
+    content_profile_name: Optional[str] = None
     title: str
     url: str
     published_at: Optional[datetime] = None
@@ -159,7 +161,8 @@ class SceneVideoRef(BaseModel):
 class AnalysisResult(BaseModel):
     sentiment: str  # positive | neutral | cautionary | urgent
     impact_score: int
-    medical_urgency: str  # routine | informational | important | critical
+    profile_relevance: Optional[str] = None
+    medical_urgency: Optional[str] = None  # routine | informational | important | critical
     key_claims: List[str] = []
     audience_relevance: Optional[str] = None
 
@@ -189,6 +192,9 @@ class ContentPackage(BaseModel):
     url: str
     source_id: str
     source_name: Optional[str] = None
+    content_profile_id: Optional[str] = None
+    content_profile_name: Optional[str] = None
+    content_profile: Optional[dict] = None
     published_at: Optional[datetime] = None
     generated_at: datetime
     language: str = "es-MX"

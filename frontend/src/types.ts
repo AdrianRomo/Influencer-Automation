@@ -34,6 +34,31 @@ export type Source = {
   name: string
   rss_url: string
   language_hint?: string | null
+  content_profile_id?: string | null
+  category?: string | null
+  is_system?: boolean
+  enabled?: boolean
+  validation_status?: string
+  validation?: Record<string, unknown> | null
+}
+
+export type ContentProfile = {
+  id: string
+  slug: string
+  name: string
+  description?: string | null
+  is_system: boolean
+  default_language: string
+  default_platforms: string[]
+  default_target_seconds: number
+  default_n_scenes: number
+  tone: Record<string, unknown>
+  audience: Record<string, unknown>
+  script_policy: Record<string, unknown>
+  visual_policy: Record<string, unknown>
+  analysis_schema: Record<string, unknown>
+  disclaimer_text?: string | null
+  source_count: number
 }
 
 export type ArticleSummary = {
@@ -41,6 +66,7 @@ export type ArticleSummary = {
   title: string
   url: string
   source_id: string
+  content_profile_id?: string | null
   created_at: string
   has_audio: boolean
   has_video: boolean
@@ -63,6 +89,7 @@ export type RssCandidate = {
   score: number
   source_id: string
   source_name: string
+  content_profile_id?: string | null
 }
 
 export type PlatformProfile = {
@@ -95,6 +122,7 @@ export type PlatformsResp = {
 
 export type PrepareArticleReq = {
   source_id: string
+  content_profile_id?: string | null
   article_url: string
   article_title?: string
   article_summary?: string | null
@@ -108,6 +136,7 @@ export type PrepareArticleReq = {
 
 export type GenerateReq = {
   source_id: string
+  content_profile_id?: string | null
   voice_id?: string | null
   target_seconds: number
   n_scenes: number
@@ -239,7 +268,8 @@ export type SubtitleStyle = {
 export type AnalysisResult = {
   sentiment: 'positive' | 'neutral' | 'cautionary' | 'urgent'
   impact_score: number
-  medical_urgency: 'routine' | 'informational' | 'important' | 'critical'
+  profile_relevance?: 'low' | 'medium' | 'high' | 'critical' | string | null
+  medical_urgency?: 'routine' | 'informational' | 'important' | 'critical' | null
   key_claims: string[]
   audience_relevance?: string | null
 }
@@ -286,6 +316,9 @@ export type ContentPackage = {
   url: string
   source_id: string
   source_name?: string | null
+  content_profile_id?: string | null
+  content_profile_name?: string | null
+  content_profile?: Record<string, unknown> | null
   published_at?: string | null
   generated_at: string
   language?: string

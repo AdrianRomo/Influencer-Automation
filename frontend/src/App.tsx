@@ -2,16 +2,16 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type {
   ArticleSummary, ContentPackage, GenerateReq,
   JobStatus, PlatformsResp, RenderMode, RssCandidate, SceneVideoRef,
-  Source, UserResp, UserKeysOut,
+  Source, UserResp, UserKeysOut, ContentProfile,
 } from './types'
 import {
-  cancelJob, deleteArticle, editScript, fetchRssCandidates, getArticlePackage, getExportZipUrl,
-  getPlatforms, jobStatus, listArticles, listSources, logout, pinArticle, prepareArticle,
+  cancelJob, createContentProfile, createProfileSource, deleteArticle, editScript, fetchRssCandidates, getArticlePackage, getExportZipUrl,
+  getPlatforms, jobStatus, listArticles, listContentProfiles, listSources, logout, pinArticle, prepareArticle,
   refreshAccessToken, regenerateStage, reorderStoryboard, resolveAudioUrl, resolveCaptionUrl,
   resolveImageUrl, resolveThumbnailUrl, resolveVideoUrl, setApiKey, startGenerate,
   startGenerateVideo, startRegenerateScript, getMe,
   getUserKeys, setAuthToken, clearAuthToken, setRefreshToken,
-  startGenerateThumbnail, uploadThumbnail,
+  startGenerateThumbnail, uploadThumbnail, validateRss,
 } from './api'
 import { fmtSeconds, relativeDate, stageLabel, STATE_LABELS } from './utils'
 import { AnalysisCard } from './components/AnalysisCard'
@@ -67,6 +67,10 @@ export default function App() {
   const [platformsData, setPlatformsData] = useState<PlatformsResp | null>(null)
 
   // ── Form state (restored from localStorage) ───────────────────────────
+  const [contentProfiles, setContentProfiles] = useState<ContentProfile[]>([])
+  const [profileId, setProfileId] = useState<string>(() =>
+    localStorage.getItem('gen_contentProfileId') ?? 'medical_news'
+  )
   const [sources, setSources] = useState<Source[]>([])
   const [sourceId, setSourceId] = useState('')
   const [targetSeconds, setTargetSeconds] = useState<number>(() => {
@@ -89,6 +93,20 @@ export default function App() {
   const [animationPrompt, setAnimationPrompt] = useState<string>(() =>
     localStorage.getItem('gen_animationPrompt') ?? ''
   )
+  const selectedProfile = contentProfiles.find(p => p.id === profileId) ?? null
+
+  // ── RSS source creation ───────────────────────────────────────────────
+  const [showAddSource, setShowAddSource] = useState(false)
+  const [newSourceName, setNewSourceName] = useState('')
+  const [newSourceUrl, setNewSourceUrl] = useState('')
+  const [newSourceLanguage, setNewSourceLanguage] = useState('en')
+  const [sourceSaving, setSourceSaving] = useState(false)
+  const [sourceError, setSourceError] = useState('')
+  const [showCreateProfile, setShowCreateProfile] = useState(false)
+  const [newProfileName, setNewProfileName] = useState('')
+  const [newProfileDescription, setNewProfileDescription] = useState('')
+  const [profileSaving, setProfileSaving] = useState(false)
+  const [profileError, setProfileError] = useState('')
 
   // ── Audio generation ───────────────────────────────────────────────────
   const [loading, setLoading] = useState(false)
@@ -253,12 +271,18 @@ export default function App() {
   useEffect(() => { localStorage.setItem('gen_language', language) }, [language])
   useEffect(() => { localStorage.setItem('gen_selectedPlatforms', JSON.stringify(selectedPlatforms)) }, [selectedPlatforms])
   useEffect(() => { localStorage.setItem('gen_animationPrompt', animationPrompt) }, [animationPrompt])
+  useEffect(() => { localStorage.setItem('gen_contentProfileId', profileId) }, [profileId])
 
-  // Load sources + history + platform metadata once authenticated
+  // Load profile catalog + platform metadata once authenticated
   useEffect(() => {
     if (authLoading || showAuthModal) return
-    listSources()
-      .then(s => { setSources(s); if (s.length) setSourceId(String(s[0].id)) })
+    listContentProfiles()
+      .then(profiles => {
+        setContentProfiles(profiles)
+        if (profiles.length && !profiles.some(p => p.id === profileId)) {
+          setProfileId(profiles[0].id)
+        }
+      })
       .catch(e => setError(String((e as Error)?.message ?? e)))
     getPlatforms()
       .then(p => {
@@ -276,6 +300,20 @@ export default function App() {
       if (videoPollTimer.current) window.clearTimeout(videoPollTimer.current)
     }
   }, [authLoading, showAuthModal])
+
+  // Load sources for the selected profile.
+  useEffect(() => {
+    if (authLoading || showAuthModal || !profileId) return
+    listSources(profileId)
+      .then(s => {
+        setSources(s)
+        setSourceId(s.length ? String(s[0].id) : '_all')
+        setCandidates([])
+        setCandidatesError('')
+      })
+      .catch(e => setError(String((e as Error)?.message ?? e)))
+    loadHistory()
+  }, [authLoading, showAuthModal, profileId])
 
   // Refresh history while tasks run
   useEffect(() => {
@@ -343,7 +381,7 @@ export default function App() {
 
   async function loadHistory() {
     try {
-      const resp = await listArticles({ limit: HISTORY_PAGE, offset: 0 })
+      const resp = await listArticles({ limit: HISTORY_PAGE, offset: 0, profile_id: profileId })
       setHistory(resp.items)
       setHistoryTotal(resp.total)
       setHistoryHasMore(resp.has_more)
@@ -355,7 +393,7 @@ export default function App() {
   async function loadMoreHistory() {
     setHistoryLoadingMore(true)
     try {
-      const resp = await listArticles({ limit: HISTORY_PAGE, offset: history.length })
+      const resp = await listArticles({ limit: HISTORY_PAGE, offset: history.length, profile_id: profileId })
       setHistory(prev => [...prev, ...resp.items])
       setHistoryHasMore(resp.has_more)
     } catch {
@@ -375,6 +413,7 @@ export default function App() {
     try {
       const p = await getArticlePackage(articleId)
       setPkg(p)
+      if (p.content_profile_id) setProfileId(p.content_profile_id)
       setStatusText('Ready')
     } catch (e: unknown) {
       setError(String((e as Error)?.message ?? e))
@@ -394,6 +433,7 @@ export default function App() {
     try {
       const payload: GenerateReq = {
         source_id: selectedCandidate.source_id,
+        content_profile_id: selectedCandidate.content_profile_id ?? profileId,
         target_seconds: targetSeconds,
         n_scenes: nScenes,
         article_url: selectedCandidate.url,
@@ -545,6 +585,83 @@ export default function App() {
     setSelectedCandidate(null)
   }
 
+  function handleProfileChange(nextProfileId: string) {
+    const p = contentProfiles.find(x => x.id === nextProfileId)
+    setProfileId(nextProfileId)
+    setSelectedCandidate(null)
+    setCandidates([])
+    setCandidatesError('')
+    setPkg(null)
+    setAudioJob(null); setPlatVideos({})
+    setError(''); setStatusText('Idle')
+    setFlowStep('pick')
+    if (p) {
+      setLanguage(p.default_language)
+      setTargetSeconds(p.default_target_seconds)
+      setNScenes(p.default_n_scenes)
+      if (p.default_platforms?.length) setSelectedPlatforms(p.default_platforms)
+    }
+  }
+
+  async function handleAddSource() {
+    if (!profileId || !newSourceUrl.trim() || !newSourceName.trim()) return
+    setSourceSaving(true)
+    setSourceError('')
+    try {
+      const validation = await validateRss(newSourceUrl.trim())
+      if (!validation.valid) {
+        setSourceError(validation.error || 'RSS feed is invalid')
+        return
+      }
+      const created = await createProfileSource(profileId, {
+        name: newSourceName.trim(),
+        rss_url: newSourceUrl.trim(),
+        language_hint: newSourceLanguage.trim() || null,
+        enabled: true,
+      })
+      const refreshed = await listSources(profileId)
+      setSources(refreshed)
+      listContentProfiles().then(setContentProfiles).catch(() => {})
+      setSourceId(created.id)
+      setNewSourceName('')
+      setNewSourceUrl('')
+      setShowAddSource(false)
+      addToast('success', 'RSS source added')
+    } catch (e: unknown) {
+      setSourceError(String((e as Error)?.message ?? e))
+    } finally {
+      setSourceSaving(false)
+    }
+  }
+
+  async function handleCreateProfile() {
+    if (!newProfileName.trim()) return
+    setProfileSaving(true)
+    setProfileError('')
+    try {
+      const created = await createContentProfile({
+        name: newProfileName.trim(),
+        description: newProfileDescription.trim() || null,
+        default_language: language,
+        default_platforms: selectedPlatforms,
+        default_target_seconds: targetSeconds,
+        default_n_scenes: nScenes,
+      })
+      const profiles = await listContentProfiles()
+      setContentProfiles(profiles)
+      setProfileId(created.id)
+      setNewProfileName('')
+      setNewProfileDescription('')
+      setShowCreateProfile(false)
+      setShowAddSource(true)
+      addToast('success', 'Profile created')
+    } catch (e: unknown) {
+      setProfileError(String((e as Error)?.message ?? e))
+    } finally {
+      setProfileSaving(false)
+    }
+  }
+
   // ── Article picker handlers ───────────────────────────────────────────────
 
   async function handlePullCandidates() {
@@ -554,7 +671,7 @@ export default function App() {
     try {
       // sourceId '_all' means fetch across all sources
       const sid = sourceId === '_all' ? undefined : sourceId
-      const results = await fetchRssCandidates(sid, 10)
+      const results = await fetchRssCandidates(sid, 10, profileId)
       if (results.length === 0) {
         setCandidatesError('No articles found. Try a different source or check back later.')
       } else {
@@ -598,6 +715,7 @@ export default function App() {
     try {
       const resp = await prepareArticle({
         source_id: selectedCandidate.source_id,
+        content_profile_id: selectedCandidate.content_profile_id ?? profileId,
         article_url: selectedCandidate.url,
         article_title: selectedCandidate.title,
         article_summary: selectedCandidate.summary ?? null,
@@ -653,6 +771,7 @@ export default function App() {
     try {
       const payload: GenerateReq = {
         source_id: pkg.source_id,
+        content_profile_id: pkg.content_profile_id ?? profileId,
         article_id: pkg.article_id,
         target_seconds: targetSeconds,
         n_scenes: nScenes,
@@ -673,8 +792,8 @@ export default function App() {
   // Page title
   useEffect(() => {
     document.title = pkg?.title
-      ? `${pkg.title.slice(0, 50)} — Medical Content Generator`
-      : 'Medical Content Generator'
+      ? `${pkg.title.slice(0, 50)} — Content Generator`
+      : 'Content Generator'
   }, [pkg?.title])
 
   // Cmd/Ctrl+Enter → preview script (only in configure step with a selected article)
@@ -925,7 +1044,7 @@ export default function App() {
       {/* Header */}
       <div className="header">
         <div>
-          <div className="h1">Medical Content Generator</div>
+          <div className="h1">Content Generator</div>
           <div className="small">RSS → Script → Audio → Storyboard → Video</div>
         </div>
         <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
@@ -996,6 +1115,127 @@ export default function App() {
             <span className="flow-step-title">Choose an Article</span>
           </div>
 
+          <div className="profile-picker">
+            <div>
+              <label>Content profile</label>
+              <select
+                value={profileId}
+                onChange={e => handleProfileChange(e.target.value)}
+                disabled={candidatesLoading || !contentProfiles.length}
+              >
+                {contentProfiles.map(p => (
+                  <option key={p.id} value={p.id}>
+                    {p.name}{p.source_count ? ` · ${p.source_count} feeds` : ''}
+                  </option>
+                ))}
+              </select>
+              {selectedProfile?.description && (
+                <div className="small profile-description">{selectedProfile.description}</div>
+              )}
+            </div>
+            <div className="profile-actions">
+              <button
+                type="button"
+                className="secondary settings-btn"
+                onClick={() => {
+                  setShowCreateProfile(v => !v)
+                  setProfileError('')
+                }}
+                disabled={!currentUser}
+                title={currentUser ? 'Create a custom profile' : 'Sign in to create profiles'}
+              >
+                {showCreateProfile ? 'Close' : 'New Profile'}
+              </button>
+              <button
+                type="button"
+                className="secondary settings-btn"
+                onClick={() => {
+                  setShowAddSource(v => !v)
+                  setSourceError('')
+                }}
+                disabled={!currentUser}
+                title={currentUser ? 'Add an RSS source to this profile' : 'Sign in to add RSS sources'}
+              >
+                {showAddSource ? 'Close' : 'Add RSS'}
+              </button>
+            </div>
+          </div>
+
+          {showCreateProfile && (
+            <div className="add-source-panel">
+              <label>Profile name</label>
+              <input
+                value={newProfileName}
+                onChange={e => setNewProfileName(e.target.value)}
+                placeholder="e.g. Local Business News"
+                disabled={profileSaving}
+              />
+              <label>Description</label>
+              <textarea
+                value={newProfileDescription}
+                onChange={e => setNewProfileDescription(e.target.value)}
+                placeholder="What kind of content should this profile produce?"
+                disabled={profileSaving}
+                rows={2}
+              />
+              <div className="actions" style={{ marginTop: 10 }}>
+                <button
+                  type="button"
+                  onClick={handleCreateProfile}
+                  disabled={profileSaving || !newProfileName.trim()}
+                >
+                  {profileSaving ? <><span className="spinner spinner-light" />Creating…</> : 'Create Profile'}
+                </button>
+              </div>
+              {profileError && <div className="error-text" style={{ marginTop: 8 }}>{profileError}</div>}
+            </div>
+          )}
+
+          {showAddSource && (
+            <div className="add-source-panel">
+              <div className="row">
+                <div>
+                  <label>Feed name</label>
+                  <input
+                    value={newSourceName}
+                    onChange={e => setNewSourceName(e.target.value)}
+                    placeholder="e.g. The Verge AI"
+                    disabled={sourceSaving}
+                  />
+                </div>
+                <div>
+                  <label>Input language</label>
+                  <select
+                    value={newSourceLanguage}
+                    onChange={e => setNewSourceLanguage(e.target.value)}
+                    disabled={sourceSaving}
+                  >
+                    <option value="en">English</option>
+                    <option value="es">Spanish</option>
+                    <option value="">Auto-detect</option>
+                  </select>
+                </div>
+              </div>
+              <label>RSS URL</label>
+              <input
+                value={newSourceUrl}
+                onChange={e => setNewSourceUrl(e.target.value)}
+                placeholder="https://example.com/feed.xml"
+                disabled={sourceSaving}
+              />
+              <div className="actions" style={{ marginTop: 10 }}>
+                <button
+                  type="button"
+                  onClick={handleAddSource}
+                  disabled={sourceSaving || !newSourceName.trim() || !newSourceUrl.trim()}
+                >
+                  {sourceSaving ? <><span className="spinner spinner-light" />Validating…</> : 'Validate & Add'}
+                </button>
+              </div>
+              {sourceError && <div className="error-text" style={{ marginTop: 8 }}>{sourceError}</div>}
+            </div>
+          )}
+
           <div className="picker-source-row">
             <div style={{ flex: 1 }}>
               <label>Source</label>
@@ -1045,7 +1285,9 @@ export default function App() {
 
           {candidates.length === 0 && !candidatesLoading && !candidatesError && (
             <div className="picker-empty">
-              Select a source above and click <strong>Pull Latest Articles</strong> to browse available content.
+              {sources.length
+                ? <>Select a source above and click <strong>Pull Latest Articles</strong> to browse available content.</>
+                : <>Add an RSS source to this profile to browse available content.</>}
             </div>
           )}
         </div>

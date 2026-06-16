@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import re
+import uuid
 import zipfile
 from collections import defaultdict
 from contextlib import asynccontextmanager
@@ -43,8 +44,9 @@ from app.auth import (
     generate_refresh_token, REFRESH_TOKEN_EXPIRE_SECONDS, ACCESS_TOKEN_EXPIRE_MINUTES,
 )
 from app.db import get_db, engine
-from app.models import Base, Source, AudioAsset, Article, ImageAsset, VideoAsset, SceneVideoAsset, User, UserApiKeys
+from app.models import Base, Source, AudioAsset, Article, ImageAsset, VideoAsset, SceneVideoAsset, User, UserApiKeys, ContentProfile
 from app.rss_sources import SOURCES
+from app.content_profiles import seed_content_profiles, build_profile_snapshot, DEFAULT_CONTENT_PROFILE_ID
 from app.schemas import (
     ArticleResponse, Storyboard,
     AudioAssetRef, ScriptAsset, VisualPromptEntry, ContentPackage,
@@ -68,6 +70,7 @@ from app.deps import (
     check_api_key,
     check_auth_rate as _check_auth_rate,
     check_user_task_capacity as _check_user_task_capacity,
+    clear_user_task as _clear_user_task,
     clear_auth_cookies as _clear_auth_cookies,
     consume_refresh_token as _consume_refresh_token,
     get_optional_user,
@@ -108,11 +111,13 @@ async def lifespan(app: FastAPI):
         for s in SOURCES:
             if not db.get(Source, s["id"]):
                 db.add(Source(**s))
+        db.flush()
+        seed_content_profiles(db)
         db.commit()
     yield
 
 
-app = FastAPI(title="Medical Content Generator", lifespan=lifespan)
+app = FastAPI(title="Content Generator", lifespan=lifespan)
 
 _cors_origins = ["http://localhost:5173", "http://127.0.0.1:5173"]
 _domain = os.getenv("DOMAIN", "").strip()
@@ -215,10 +220,12 @@ class RssCandidateOut(BaseModel):
     score: float
     source_id: str
     source_name: str
+    content_profile_id: str | None = None
 
 
 class PrepareArticleReq(BaseModel):
     source_id: str
+    content_profile_id: str | None = None
     article_url: str
     article_title: str = Field(default="", max_length=500)
     article_summary: str | None = Field(default=None, max_length=5000)
@@ -232,6 +239,7 @@ class PrepareArticleReq(BaseModel):
 
 class GenerateReq(BaseModel):
     source_id: str
+    content_profile_id: str | None = None
     voice_id: str | None = None
     target_seconds: int = Field(default=DEFAULT_TARGET_SECONDS, ge=30, le=600)
     n_scenes: int = Field(default=DEFAULT_SCENES, ge=0, le=20)
@@ -258,6 +266,240 @@ class GenerateVideoReq(BaseModel):
     platform: str = DEFAULT_PLATFORM
     animation_prompt: str | None = None
     subtitle_style: SubtitleStyleReq | None = None
+
+
+class ContentProfileOut(BaseModel):
+    id: str
+    slug: str
+    name: str
+    description: str | None = None
+    is_system: bool
+    default_language: str
+    default_platforms: list[str]
+    default_target_seconds: int
+    default_n_scenes: int
+    tone: dict
+    audience: dict
+    script_policy: dict
+    visual_policy: dict
+    analysis_schema: dict
+    disclaimer_text: str | None = None
+    source_count: int = 0
+
+
+class ContentProfileIn(BaseModel):
+    name: str = Field(min_length=2, max_length=80)
+    description: str | None = Field(default=None, max_length=1000)
+    default_language: str = DEFAULT_LANGUAGE
+    default_platforms: list[str] = Field(default_factory=lambda: [DEFAULT_PLATFORM])
+    default_target_seconds: int = Field(default=60, ge=15, le=600)
+    default_n_scenes: int = Field(default=8, ge=0, le=20)
+    tone_keywords: list[str] = Field(default_factory=list, max_length=12)
+    audience: str | None = Field(default=None, max_length=500)
+    preserve_terms: list[str] = Field(default_factory=list, max_length=20)
+    visual_prompt_prefix: str | None = Field(default=None, max_length=500)
+    disclaimer_text: str | None = Field(default=None, max_length=500)
+
+
+class SourceOut(BaseModel):
+    id: str
+    name: str
+    rss_url: str
+    language_hint: str | None = None
+    content_profile_id: str | None = None
+    category: str | None = None
+    is_system: bool = False
+    enabled: bool = True
+    validation_status: str = "unchecked"
+    validation: dict | None = None
+
+
+class SourceCreateReq(BaseModel):
+    name: str = Field(min_length=2, max_length=160)
+    rss_url: str = Field(min_length=8, max_length=2000)
+    language_hint: str | None = Field(default=None, max_length=20)
+    category: str | None = Field(default=None, max_length=80)
+    enabled: bool = True
+
+
+class RssValidateReq(BaseModel):
+    rss_url: str = Field(min_length=8, max_length=2000)
+
+
+class RssValidateOut(BaseModel):
+    valid: bool
+    rss_url: str
+    feed_title: str | None = None
+    entry_count: int = 0
+    sample_title: str | None = None
+    sample_url: str | None = None
+    error: str | None = None
+
+
+def _slugify_profile_name(name: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+    return slug or f"profile-{uuid.uuid4().hex[:8]}"
+
+
+def _require_user(current_user: Optional[User]) -> User:
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Sign in required")
+    return current_user
+
+
+def _profile_to_out(profile: ContentProfile, source_count: int = 0) -> ContentProfileOut:
+    snap = build_profile_snapshot(profile)
+    return ContentProfileOut(
+        id=profile.id,
+        slug=profile.slug,
+        name=profile.name,
+        description=profile.description,
+        is_system=bool(profile.is_system),
+        default_language=snap["default_language"],
+        default_platforms=snap["default_platforms"],
+        default_target_seconds=snap["default_target_seconds"],
+        default_n_scenes=snap["default_n_scenes"],
+        tone=snap["tone"],
+        audience=snap["audience"],
+        script_policy=snap["script_policy"],
+        visual_policy=snap["visual_policy"],
+        analysis_schema=snap["analysis_schema"],
+        disclaimer_text=snap["disclaimer_text"],
+        source_count=source_count,
+    )
+
+
+def _source_to_out(source: Source) -> SourceOut:
+    return SourceOut(
+        id=source.id,
+        name=source.name,
+        rss_url=source.rss_url,
+        language_hint=source.language_hint,
+        content_profile_id=source.content_profile_id,
+        category=source.category,
+        is_system=bool(source.is_system),
+        enabled=bool(source.enabled),
+        validation_status=source.validation_status,
+        validation=source.validation_json,
+    )
+
+
+def _visible_profiles_query(current_user: Optional[User]):
+    q = select(ContentProfile).where(ContentProfile.deleted_at.is_(None))
+    if current_user:
+        q = q.where((ContentProfile.is_system == 1) | (ContentProfile.user_id == current_user.id))
+    else:
+        q = q.where(ContentProfile.is_system == 1)
+    return q
+
+
+def _get_visible_profile(db: Session, profile_id: str | None, current_user: Optional[User]) -> ContentProfile:
+    pid = profile_id or DEFAULT_CONTENT_PROFILE_ID
+    profile = db.get(ContentProfile, pid)
+    if not profile or profile.deleted_at:
+        raise HTTPException(status_code=404, detail="Content profile not found")
+    if not profile.is_system and (not current_user or profile.user_id != current_user.id):
+        raise HTTPException(status_code=404, detail="Content profile not found")
+    return profile
+
+
+def _visible_sources_query(current_user: Optional[User], profile_id: str | None = None, include_disabled: bool = False):
+    q = select(Source).where(Source.deleted_at.is_(None))
+    if profile_id:
+        q = q.where(Source.content_profile_id == profile_id)
+    if not include_disabled:
+        q = q.where(Source.enabled == 1)
+    if current_user:
+        q = q.where((Source.is_system == 1) | (Source.user_id == current_user.id))
+    else:
+        q = q.where(Source.is_system == 1)
+    return q.order_by(Source.is_system.desc(), Source.name)
+
+
+def _assert_source_visible(source: Source, current_user: Optional[User]) -> None:
+    if source.deleted_at:
+        raise HTTPException(status_code=404, detail="Source not found")
+    if source.is_system:
+        return
+    if not current_user or source.user_id != current_user.id:
+        raise HTTPException(status_code=404, detail="Source not found")
+
+
+def _validate_rss_url(rss_url: str) -> dict:
+    from app.extract import _validate_article_url
+
+    url = rss_url.strip()
+    try:
+        _validate_article_url(url)
+    except ValueError as exc:
+        return {"valid": False, "rss_url": url, "error": str(exc)}
+
+    try:
+        feed = _fp.parse(url)
+        entries = list(getattr(feed, "entries", []) or [])
+        feed_title = (getattr(feed, "feed", {}) or {}).get("title")
+        first = entries[0] if entries else {}
+        sample_url = (first.get("link") or "").strip() if first else None
+        sample_title = (first.get("title") or "").strip() if first else None
+        if not entries:
+            err = "Feed parsed but no entries were found"
+            if getattr(feed, "bozo_exception", None):
+                err = str(feed.bozo_exception)
+            return {
+                "valid": False,
+                "rss_url": url,
+                "feed_title": feed_title,
+                "entry_count": 0,
+                "error": err,
+            }
+        return {
+            "valid": True,
+            "rss_url": url,
+            "feed_title": feed_title,
+            "entry_count": len(entries),
+            "sample_title": sample_title,
+            "sample_url": sample_url,
+            "error": None,
+        }
+    except Exception as exc:
+        return {"valid": False, "rss_url": url, "error": str(exc)}
+
+
+def _profile_payload(req: ContentProfileIn, user_id: str | None = None, *, profile_id: str | None = None) -> dict:
+    preserve = [x.strip() for x in req.preserve_terms if x.strip()]
+    tone = [x.strip() for x in req.tone_keywords if x.strip()]
+    visual_prefix = (req.visual_prompt_prefix or "").strip() or (
+        "Clean editorial visual for short-form narrated content, realistic and informative:"
+    )
+    disclaimer = (req.disclaimer_text or "").strip() or None
+    return {
+        "id": profile_id or str(uuid.uuid4()),
+        "user_id": user_id,
+        "slug": _slugify_profile_name(req.name),
+        "name": req.name.strip(),
+        "description": (req.description or "").strip() or None,
+        "is_system": 0,
+        "default_language": req.default_language,
+        "default_platforms_json": req.default_platforms or [DEFAULT_PLATFORM],
+        "default_target_seconds": req.default_target_seconds,
+        "default_n_scenes": req.default_n_scenes,
+        "tone_json": {"keywords": tone},
+        "audience_json": {"primary": (req.audience or "").strip()},
+        "script_policy_json": {
+            "preserve_terms": preserve,
+            "factuality": "Do not add unsupported facts. Preserve named entities, numbers, dates, units, and source-specific claims.",
+            "disclaimer_required": bool(disclaimer),
+        },
+        "visual_policy_json": {
+            "prompt_prefix": visual_prefix,
+            "avoid": ["text overlays", "logos", "watermarks", "misleading visuals"],
+        },
+        "analysis_schema_json": {
+            "focus": ["audience_relevance", "impact_score", "key_claims"],
+            "impact_label": "impact_score",
+        },
+        "disclaimer_text": disclaimer,
+    }
 
 
 # ── RSS candidate picker ───────────────────────────────────────────────────
@@ -289,20 +531,128 @@ def _rss_score_entry(entry, now: datetime) -> float:
     return score
 
 
+@app.get("/content-profiles", response_model=list[ContentProfileOut], dependencies=[Depends(check_api_key)])
+def list_content_profiles(
+    db: Session = Depends(get_db),
+    current_user: Optional[User] = Depends(get_optional_user),
+):
+    profiles = db.execute(
+        _visible_profiles_query(current_user).order_by(ContentProfile.is_system.desc(), ContentProfile.name)
+    ).scalars().all()
+    counts: dict[str | None, int] = {}
+    for source in db.execute(_visible_sources_query(current_user)).scalars().all():
+        counts[source.content_profile_id] = counts.get(source.content_profile_id, 0) + 1
+    return [_profile_to_out(p, int(counts.get(p.id, 0) or 0)) for p in profiles]
+
+
+@app.post("/content-profiles", response_model=ContentProfileOut, dependencies=[Depends(check_api_key)])
+def create_content_profile(
+    req: ContentProfileIn,
+    db: Session = Depends(get_db),
+    current_user: Optional[User] = Depends(get_optional_user),
+):
+    user = _require_user(current_user)
+    profile = ContentProfile(**_profile_payload(req, user.id))
+    db.add(profile)
+    db.commit()
+    db.refresh(profile)
+    return _profile_to_out(profile)
+
+
+@app.patch("/content-profiles/{profile_id}", response_model=ContentProfileOut, dependencies=[Depends(check_api_key)])
+def update_content_profile(
+    profile_id: str,
+    req: ContentProfileIn,
+    db: Session = Depends(get_db),
+    current_user: Optional[User] = Depends(get_optional_user),
+):
+    user = _require_user(current_user)
+    profile = db.get(ContentProfile, profile_id)
+    if not profile or profile.deleted_at or profile.user_id != user.id:
+        raise HTTPException(status_code=404, detail="Content profile not found")
+    if profile.is_system:
+        raise HTTPException(status_code=403, detail="System profiles cannot be edited")
+
+    payload = _profile_payload(req, user.id, profile_id=profile.id)
+    for key, value in payload.items():
+        if key in {"id", "user_id", "is_system"}:
+            continue
+        setattr(profile, key, value)
+    profile.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(profile)
+    return _profile_to_out(profile)
+
+
+@app.post("/rss/validate", response_model=RssValidateOut, dependencies=[Depends(check_api_key)])
+def validate_rss(req: RssValidateReq):
+    return RssValidateOut(**_validate_rss_url(req.rss_url))
+
+
+@app.get("/content-profiles/{profile_id}/sources", response_model=list[SourceOut], dependencies=[Depends(check_api_key)])
+def list_profile_sources(
+    profile_id: str,
+    include_disabled: bool = Query(default=False),
+    db: Session = Depends(get_db),
+    current_user: Optional[User] = Depends(get_optional_user),
+):
+    _get_visible_profile(db, profile_id, current_user)
+    rows = db.execute(_visible_sources_query(current_user, profile_id, include_disabled)).scalars().all()
+    return [_source_to_out(r) for r in rows]
+
+
+@app.post("/content-profiles/{profile_id}/sources", response_model=SourceOut, dependencies=[Depends(check_api_key)])
+def create_profile_source(
+    profile_id: str,
+    req: SourceCreateReq,
+    db: Session = Depends(get_db),
+    current_user: Optional[User] = Depends(get_optional_user),
+):
+    user = _require_user(current_user)
+    _get_visible_profile(db, profile_id, current_user)
+
+    validation = _validate_rss_url(req.rss_url)
+    if not validation.get("valid"):
+        raise HTTPException(status_code=422, detail=validation.get("error") or "RSS feed is invalid")
+
+    source = Source(
+        id=str(uuid.uuid4()),
+        user_id=user.id,
+        content_profile_id=profile_id,
+        name=req.name.strip(),
+        rss_url=req.rss_url.strip(),
+        language_hint=(req.language_hint or "").strip() or None,
+        category=(req.category or "").strip() or None,
+        is_system=0,
+        enabled=1 if req.enabled else 0,
+        validation_status="valid",
+        validation_json=validation,
+    )
+    db.add(source)
+    db.commit()
+    db.refresh(source)
+    return _source_to_out(source)
+
+
 @app.get("/rss/candidates", response_model=list[RssCandidateOut], dependencies=[Depends(check_api_key)])
 async def get_rss_candidates(
     source_id: str | None = Query(default=None, description="Filter to a single source; omit for all sources"),
+    profile_id: str | None = Query(default=None, description="Filter to one content profile"),
     limit: int = Query(default=10, ge=1, le=30),
     db: Session = Depends(get_db),
+    current_user: Optional[User] = Depends(get_optional_user),
 ):
     """Fetch and score RSS candidates for the article picker — no DB writes, no generation."""
     if source_id:
         src = db.get(Source, source_id)
         if not src:
             raise HTTPException(status_code=404, detail="Source not found")
+        _assert_source_visible(src, current_user)
         sources_to_fetch: list[Source] = [src]
     else:
-        sources_to_fetch = list(db.execute(select(Source)).scalars().all())
+        if profile_id:
+            _get_visible_profile(db, profile_id, current_user)
+        sources_to_fetch = list(db.execute(_visible_sources_query(current_user, profile_id)).scalars().all())
 
     now = datetime.utcnow()
 
@@ -325,6 +675,7 @@ async def get_rss_candidates(
                     "score": round(_rss_score_entry(entry, now), 2),
                     "source_id": src_obj.id,
                     "source_name": src_obj.name,
+                    "content_profile_id": src_obj.content_profile_id,
                 })
             results.sort(key=lambda c: -c["score"])
             return results
@@ -375,12 +726,16 @@ async def _unhandled_exception(request: Request, exc: Exception):
 # ── Sources ────────────────────────────────────────────────────────────────
 
 @app.get("/sources", dependencies=[Depends(check_api_key)])
-def list_sources(db=Depends(get_db)):
-    rows = db.execute(select(Source)).scalars().all()
-    return [
-        {"id": r.id, "name": r.name, "rss_url": r.rss_url, "language_hint": r.language_hint}
-        for r in rows
-    ]
+def list_sources(
+    profile_id: str | None = Query(default=None),
+    include_disabled: bool = Query(default=False),
+    db: Session = Depends(get_db),
+    current_user: Optional[User] = Depends(get_optional_user),
+):
+    if profile_id:
+        _get_visible_profile(db, profile_id, current_user)
+    rows = db.execute(_visible_sources_query(current_user, profile_id, include_disabled)).scalars().all()
+    return [_source_to_out(r).model_dump() for r in rows]
 
 
 @app.get("/platforms", dependencies=[Depends(check_api_key)])
@@ -402,6 +757,7 @@ def list_platforms():
 @app.get("/articles", dependencies=[Depends(check_api_key)])
 def list_articles(
     source_id: str | None = Query(default=None),
+    profile_id: str | None = Query(default=None),
     pinned: bool | None = Query(default=None),
     limit: int = Query(default=20, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
@@ -432,6 +788,8 @@ def list_articles(
     )
     if source_id:
         q = q.where(Article.source_id == source_id)
+    if profile_id:
+        q = q.where(Article.content_profile_id == profile_id)
     if current_user:
         q = q.where(Article.user_id == current_user.id)
     if pinned is not None:
@@ -441,6 +799,8 @@ def list_articles(
     count_q = select(func.count(Article.id)).where(Article.deleted_at.is_(None))
     if source_id:
         count_q = count_q.where(Article.source_id == source_id)
+    if profile_id:
+        count_q = count_q.where(Article.content_profile_id == profile_id)
     if current_user:
         count_q = count_q.where(Article.user_id == current_user.id)
     if pinned is not None:
@@ -454,6 +814,7 @@ def list_articles(
             "title": r.Article.title,
             "url": r.Article.url,
             "source_id": r.Article.source_id,
+            "content_profile_id": r.Article.content_profile_id,
             "created_at": r.Article.created_at,
             "has_audio": bool(r.audio_count),
             "has_video": bool(r.video_count),
@@ -473,9 +834,12 @@ def get_article(article_id: str, db=Depends(get_db), current_user: Optional[User
         raise HTTPException(status_code=404, detail="Article not found")
     _assert_article_owner(article, current_user)
     storyboard = _load_storyboard(article)
+    profile = db.get(ContentProfile, article.content_profile_id) if article.content_profile_id else None
     return ArticleResponse(
         id=article.id,
         source_id=article.source_id,
+        content_profile_id=article.content_profile_id,
+        content_profile_name=profile.name if profile else None,
         title=article.title,
         url=article.url,
         published_at=article.published_at,
@@ -705,6 +1069,7 @@ def get_article_package(article_id: str, db=Depends(get_db), current_user: Optio
         pass
 
     source_obj = db.get(Source, article.source_id)
+    profile_obj = db.get(ContentProfile, article.content_profile_id) if article.content_profile_id else None
 
     return ContentPackage(
         article_id=article.id,
@@ -712,6 +1077,9 @@ def get_article_package(article_id: str, db=Depends(get_db), current_user: Optio
         url=article.url,
         source_id=article.source_id,
         source_name=source_obj.name if source_obj else None,
+        content_profile_id=article.content_profile_id,
+        content_profile_name=profile_obj.name if profile_obj else None,
+        content_profile=article.profile_snapshot_json,
         published_at=article.published_at,
         generated_at=article.created_at,
         language=article.language or "es-MX",
@@ -1154,8 +1522,14 @@ def prepare_article_endpoint(
     if current_user:
         _check_user_task_capacity(current_user.id)
 
-    if not db.get(Source, req.source_id):
+    src = db.get(Source, req.source_id)
+    if not src:
         raise HTTPException(status_code=404, detail="Unknown source_id")
+    _assert_source_visible(src, current_user)
+    profile_id = req.content_profile_id or src.content_profile_id or DEFAULT_CONTENT_PROFILE_ID
+    _get_visible_profile(db, profile_id, current_user)
+    if src.content_profile_id and src.content_profile_id != profile_id:
+        raise HTTPException(status_code=422, detail="Source does not belong to the selected content profile")
     openai_key, _, el_voice = _resolve_user_keys(current_user, db)
     # Model + speed drive the VoiceCalibration lookup inside the task.
     el_model = os.getenv("ELEVENLABS_MODEL_ID", "eleven_multilingual_v2")
@@ -1164,6 +1538,7 @@ def prepare_article_endpoint(
         "prepare_article",
         kwargs={
             "source_id": req.source_id,
+            "content_profile_id": profile_id,
             "article_url": req.article_url,
             "article_title": req.article_title,
             "article_summary": req.article_summary,
@@ -1196,6 +1571,11 @@ def generate(
     src = db.get(Source, req.source_id)
     if not src:
         raise HTTPException(status_code=404, detail="Unknown source_id")
+    _assert_source_visible(src, current_user)
+    profile_id = req.content_profile_id or src.content_profile_id or DEFAULT_CONTENT_PROFILE_ID
+    _get_visible_profile(db, profile_id, current_user)
+    if src.content_profile_id and src.content_profile_id != profile_id:
+        raise HTTPException(status_code=422, detail="Source does not belong to the selected content profile")
 
     uid = current_user.id if current_user else f"ip:{(request.client.host if request.client else 'x')}"
     _rate_limit(f"rl:generate:{uid}", limit=5, window=60)
@@ -1224,6 +1604,7 @@ def generate(
         "generate_latest_for_source",
         kwargs={
             "source_id": req.source_id,
+            "content_profile_id": profile_id,
             "voice_id": el_voice or req.voice_id,
             "target_seconds": req.target_seconds,
             "n_scenes": req.n_scenes,
@@ -1268,6 +1649,7 @@ def cancel_job(task_id: str, current_user: Optional[User] = Depends(get_optional
     """Revoke a queued or running task. Sends SIGTERM to the worker process."""
     _assert_task_owner(task_id, current_user)
     celery_app.control.revoke(task_id, terminate=True, signal="SIGTERM")
+    _clear_user_task(current_user.id if current_user else None, task_id)
     return {"cancelled": task_id}
 
 

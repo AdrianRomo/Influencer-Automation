@@ -1,4 +1,4 @@
-"""Sentiment and impact analysis for medical article scripts."""
+"""Sentiment and impact analysis for profile-driven article scripts."""
 from __future__ import annotations
 
 import json
@@ -11,8 +11,7 @@ if TYPE_CHECKING:
     from app.usage import UsageCollector
 
 from app.prompts import get as _prompt
-
-_SYSTEM = _prompt("analysis")
+from app.summarize import _profile_prompt_context
 
 _client: OpenAI | None = None
 
@@ -28,6 +27,7 @@ def analyze_article(
     script: str,
     api_key: Optional[str] = None,
     collector: "UsageCollector | None" = None,
+    content_profile: Optional[dict] = None,
 ) -> dict:
     """Return sentiment/impact analysis for a TTS script.
 
@@ -35,12 +35,14 @@ def analyze_article(
     """
     model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
     c = OpenAI(api_key=api_key) if api_key else _llm()
+    profile_context = _profile_prompt_context(content_profile)
+    system = _prompt("analysis", profile_context=profile_context)
 
     try:
         resp = c.responses.create(
             model=model,
             input=[
-                {"role": "system", "content": _SYSTEM},
+                {"role": "system", "content": system},
                 {"role": "user", "content": script[:4000]},
             ],
             temperature=0.2,
@@ -82,10 +84,12 @@ def analyze_article(
         return json.loads(raw)
 
     except Exception:
+        profile_id = (content_profile or {}).get("id")
         return {
             "sentiment": "neutral",
             "impact_score": 5,
-            "medical_urgency": "informational",
+            "profile_relevance": "medium",
+            "medical_urgency": "informational" if profile_id == "medical_news" else None,
             "key_claims": [],
             "audience_relevance": None,
         }

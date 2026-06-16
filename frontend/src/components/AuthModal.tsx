@@ -34,7 +34,7 @@ export function AuthModal({ onSuccess }: {
   return (
     <div className="modal-overlay">
       <div className="modal-card">
-        <div className="modal-title">Medical Content Generator</div>
+        <div className="modal-title">Content Generator</div>
         <div className="modal-subtitle">Sign in to generate and manage your content</div>
 
         <div className="tab-row">

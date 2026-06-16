@@ -36,12 +36,59 @@ class UserApiKeys(Base):
     user: Mapped["User"] = relationship(back_populates="api_keys")
 
 
+class ContentProfile(Base):
+    """Reusable topic/voice policy for source-driven content generation."""
+    __tablename__ = "content_profiles"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id: Mapped[Optional[str]] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), nullable=True, index=True
+    )
+
+    slug: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    name: Mapped[str] = mapped_column(String, nullable=False)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    is_system: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+
+    default_language: Mapped[str] = mapped_column(String(20), default="es-MX", nullable=False)
+    default_platforms_json: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    default_target_seconds: Mapped[int] = mapped_column(Integer, default=60, nullable=False)
+    default_n_scenes: Mapped[int] = mapped_column(Integer, default=8, nullable=False)
+
+    tone_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    audience_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    script_policy_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    visual_policy_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    analysis_schema_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    disclaimer_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    deleted_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+
+    __table_args__ = (
+        Index("ix_content_profiles_user_slug", "user_id", "slug"),
+    )
+
+
 class Source(Base):
     __tablename__ = "sources"
     id: Mapped[str] = mapped_column(String, primary_key=True)
+    user_id: Mapped[Optional[str]] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), nullable=True, index=True
+    )
+    content_profile_id: Mapped[str | None] = mapped_column(
+        ForeignKey("content_profiles.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     name: Mapped[str] = mapped_column(String, nullable=False)
     rss_url: Mapped[str] = mapped_column(String, nullable=False)
     language_hint: Mapped[str | None] = mapped_column(String, nullable=True)
+    category: Mapped[str | None] = mapped_column(String, nullable=True)
+    is_system: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    enabled: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    validation_status: Mapped[str] = mapped_column(String(30), default="unchecked", nullable=False)
+    validation_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    deleted_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
 
     articles: Mapped[list["Article"]] = relationship(back_populates="source", cascade="all, delete-orphan")
 
@@ -51,6 +98,9 @@ class Article(Base):
     source_id: Mapped[str] = mapped_column(ForeignKey("sources.id", ondelete="CASCADE"), nullable=False)
     user_id: Mapped[Optional[str]] = mapped_column(
         ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    content_profile_id: Mapped[str | None] = mapped_column(
+        ForeignKey("content_profiles.id", ondelete="SET NULL"), nullable=True, index=True
     )
 
     title: Mapped[str] = mapped_column(String, nullable=False)
@@ -82,6 +132,7 @@ class Article(Base):
     language: Mapped[str] = mapped_column(String(20), default="es-MX", nullable=False)
     selected_platforms: Mapped[list | None] = mapped_column(JSON, nullable=True)  # ["tiktok", "reels"]
     animation_prompt: Mapped[str | None] = mapped_column(Text, nullable=True)
+    profile_snapshot_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
     # Cover/thumbnail image for social posts
     thumbnail_path: Mapped[str | None] = mapped_column(String, nullable=True)

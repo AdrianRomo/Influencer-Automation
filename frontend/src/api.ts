@@ -2,7 +2,7 @@ import type {
   ArticleSummary, PaginatedArticles, PrepareArticleReq, RssCandidate, Source,
   GenerateReq, GenerateResp, JobStatus, ContentPackage, RenderMode,
   TokenResp, UserResp, UserKeysIn, UserKeysOut, CostSummary, PlatformsResp,
-  SubtitleStyle,
+  SubtitleStyle, ContentProfile,
 } from './types'
 
 const rawBase = import.meta.env.VITE_API_BASE_URL as string | undefined
@@ -161,24 +161,74 @@ export function saveUserKeys(keys: UserKeysIn): Promise<UserKeysOut> {
   return http<UserKeysOut>('/users/me/keys', { method: 'PUT', body: JSON.stringify(keys) })
 }
 
-export function listSources(): Promise<Source[]> {
-  return http<Source[]>('/sources')
+export function listContentProfiles(): Promise<ContentProfile[]> {
+  return http<ContentProfile[]>('/content-profiles')
+}
+
+export function createContentProfile(input: {
+  name: string
+  description?: string | null
+  default_language?: string
+  default_platforms?: string[]
+  default_target_seconds?: number
+  default_n_scenes?: number
+  tone_keywords?: string[]
+  audience?: string | null
+  preserve_terms?: string[]
+  visual_prompt_prefix?: string | null
+  disclaimer_text?: string | null
+}): Promise<ContentProfile> {
+  return http<ContentProfile>('/content-profiles', {
+    method: 'POST',
+    body: JSON.stringify(input),
+  })
+}
+
+export function listSources(profileId?: string | null): Promise<Source[]> {
+  const q = new URLSearchParams()
+  if (profileId) q.set('profile_id', profileId)
+  const qs = q.toString()
+  return http<Source[]>(`/sources${qs ? `?${qs}` : ''}`)
 }
 
 export function getPlatforms(): Promise<PlatformsResp> {
   return http<PlatformsResp>('/platforms')
 }
 
-export function fetchRssCandidates(sourceId?: string, limit = 10): Promise<RssCandidate[]> {
+export function fetchRssCandidates(sourceId?: string, limit = 10, profileId?: string | null): Promise<RssCandidate[]> {
   const q = new URLSearchParams()
   if (sourceId) q.set('source_id', sourceId)
+  if (profileId) q.set('profile_id', profileId)
   q.set('limit', String(limit))
   return http<RssCandidate[]>(`/rss/candidates?${q.toString()}`)
 }
 
-export function listArticles(params?: { source_id?: string; limit?: number; offset?: number }): Promise<PaginatedArticles> {
+export function validateRss(rssUrl: string): Promise<{
+  valid: boolean
+  rss_url: string
+  feed_title?: string | null
+  entry_count: number
+  sample_title?: string | null
+  sample_url?: string | null
+  error?: string | null
+}> {
+  return http('/rss/validate', { method: 'POST', body: JSON.stringify({ rss_url: rssUrl }) })
+}
+
+export function createProfileSource(
+  profileId: string,
+  input: { name: string; rss_url: string; language_hint?: string | null; category?: string | null; enabled?: boolean },
+): Promise<Source> {
+  return http<Source>(`/content-profiles/${encodeURIComponent(profileId)}/sources`, {
+    method: 'POST',
+    body: JSON.stringify(input),
+  })
+}
+
+export function listArticles(params?: { source_id?: string; profile_id?: string; limit?: number; offset?: number }): Promise<PaginatedArticles> {
   const q = new URLSearchParams()
   if (params?.source_id) q.set('source_id', params.source_id)
+  if (params?.profile_id) q.set('profile_id', params.profile_id)
   if (params?.limit != null) q.set('limit', String(params.limit))
   if (params?.offset != null) q.set('offset', String(params.offset))
   const qs = q.toString()

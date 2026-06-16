@@ -15,6 +15,7 @@ from app.db import SessionLocal
 from app.models import (
     Source, Article, AudioAsset, VoiceCalibration, ImageAsset, VideoAsset,
     SceneVideoAsset, Product, Brand, Campaign, AdConcept,
+    ContentProfile,
 )
 from app.extract import extract_article_text
 from app.summarize import make_tts_bundle, rewrite_to_target_words, generate_social_captions, _pick_wpm
@@ -28,6 +29,7 @@ from app.logging_config import (
     clear_log_context,
 )
 from app.sentry_init import init_sentry
+from app.content_profiles import build_profile_snapshot, DEFAULT_CONTENT_PROFILE_ID
 
 init_sentry()
 configure_logging()
@@ -113,6 +115,21 @@ CAL_ALPHA = float(os.getenv("TTS_CAL_ALPHA", "0.3"))
 MAX_TTS_ATTEMPTS = int(os.getenv("TTS_MAX_ATTEMPTS", "2"))
 MIN_SECONDS = int(os.getenv("TTS_DURATION_MIN_SECONDS", "150"))
 MAX_SECONDS = int(os.getenv("TTS_DURATION_MAX_SECONDS", "210"))
+
+
+def _resolve_content_profile(db, profile_id: str | None = None, source: Source | None = None) -> tuple[str | None, dict]:
+    resolved_id = profile_id or (source.content_profile_id if source else None) or DEFAULT_CONTENT_PROFILE_ID
+    profile = db.get(ContentProfile, resolved_id) if resolved_id else None
+    if not profile:
+        profile = db.get(ContentProfile, DEFAULT_CONTENT_PROFILE_ID)
+    return (profile.id if profile else None), build_profile_snapshot(profile)
+
+
+def _profile_for_article(db, article: Article) -> dict:
+    if article.profile_snapshot_json:
+        return article.profile_snapshot_json
+    profile = db.get(ContentProfile, article.content_profile_id) if article.content_profile_id else None
+    return build_profile_snapshot(profile)
 
 
 import hashlib
@@ -272,6 +289,7 @@ def prepare_article(
     article_title: str = "",
     article_summary: str | None = None,
     article_published_at: str | None = None,
+    content_profile_id: str | None = None,
     n_scenes: int = 8,
     target_seconds: int = TARGET_SECONDS,
     openai_api_key: str | None = None,
@@ -292,6 +310,7 @@ def prepare_article(
         src = db.get(Source, source_id)
         if not src:
             raise ValueError(f"Unknown source_id: {source_id}")
+        resolved_profile_id, profile_snapshot = _resolve_content_profile(db, content_profile_id, src)
 
         title = (article_title or "").strip() or "Untitled"
         url = article_url.strip()
@@ -324,6 +343,8 @@ def prepare_article(
         article = Article(
             source_id=src.id, title=title, url=url, published_at=published_at,
             user_id=user_id, language=eff_language,
+            content_profile_id=resolved_profile_id,
+            profile_snapshot_json=profile_snapshot,
             selected_platforms=eff_platforms,
             animation_prompt=animation_prompt,
         )
@@ -338,6 +359,8 @@ def prepare_article(
             if user_id and not article.user_id:
                 article.user_id = user_id
             article.language = eff_language
+            article.content_profile_id = resolved_profile_id or article.content_profile_id
+            article.profile_snapshot_json = profile_snapshot
             article.selected_platforms = eff_platforms or article.selected_platforms or ["tiktok"]
             if animation_prompt:
                 article.animation_prompt = animation_prompt
@@ -398,6 +421,7 @@ def prepare_article(
                     api_key=openai_api_key,
                     collector=collector,
                     output_language=eff_language,
+                    content_profile=profile_snapshot,
                 )
                 wc = bundle.get("word_count") or len(bundle["script"].split())
                 script_by_target[dur] = {
@@ -446,7 +470,10 @@ def prepare_article(
             try:
                 from app.analysis import analyze_article as _analyze
                 self.update_state(state="PROGRESS", meta={"stage": "analyzing", "msg": "Analyzing content…"})
-                article.analysis_json = _analyze(script, api_key=openai_api_key, collector=collector)
+                article.analysis_json = _analyze(
+                    script, api_key=openai_api_key, collector=collector,
+                    content_profile=profile_snapshot,
+                )
                 db.commit()
             except Exception as exc:
                 logger.warning("Analysis failed (non-fatal): %s", exc)
@@ -457,6 +484,7 @@ def prepare_article(
                 article.social_captions_json = generate_social_captions(
                     title=title, script=script, platforms=platforms,
                     output_language=eff_language, api_key=openai_api_key, collector=collector,
+                    content_profile=profile_snapshot,
                 )
                 db.commit()
             except Exception as exc:
@@ -488,6 +516,7 @@ def _synthesize_one_script(
     elevenlabs_api_key: str | None,
     openai_api_key: str | None,
     collector: "UsageCollector",
+    content_profile: dict | None = None,
     progress_label: str = "",
 ) -> tuple[str, float, str, int]:
     """Synthesize one script to one audio file, tolerating up to MAX_TTS_ATTEMPTS.
@@ -548,6 +577,8 @@ def _synthesize_one_script(
             script = rewrite_to_target_words(
                 script, target_words=target_wc, tol_words=20,
                 api_key=openai_api_key, collector=collector,
+                output_language=eff_language,
+                content_profile=content_profile,
             )
             word_count = len(script.split())
         except Exception as e:
@@ -580,6 +611,7 @@ def _synthesize_per_platform(
     openai_api_key: str | None,
     elevenlabs_api_key: str | None,
     collector: "UsageCollector",
+    content_profile: dict | None = None,
 ) -> dict:
     """Synthesize one audio per unique script; fan-out AudioAsset rows per platform."""
     # Group platforms by script text so we only hit TTS once per unique text.
@@ -618,6 +650,7 @@ def _synthesize_per_platform(
             elevenlabs_api_key=elevenlabs_api_key,
             openai_api_key=openai_api_key,
             collector=collector,
+            content_profile=content_profile,
             progress_label=f"[{idx}/{total_groups} {joined}]",
         )
 
@@ -694,6 +727,7 @@ def _synthesize_per_platform(
 def generate_latest_for_source(
     self,
     source_id: str,
+    content_profile_id: str | None = None,
     voice_id: str | None = None,
     target_seconds: int = TARGET_SECONDS,
     n_scenes: int = 8,
@@ -714,6 +748,7 @@ def generate_latest_for_source(
         src = db.get(Source, source_id)
         if not src:
             raise ValueError(f"Unknown source_id: {source_id}")
+        resolved_profile_id, profile_snapshot = _resolve_content_profile(db, content_profile_id, src)
 
         # TTS config resolved up-front — needed by both the script+TTS path and the TTS-only path
         used_voice_id = voice_id or os.getenv("ELEVENLABS_VOICE_ID")
@@ -734,6 +769,7 @@ def generate_latest_for_source(
             scenes = (article.storyboard_json or {}).get("scenes") or []
             word_count = len(script.split())
             eff_language = language or article.language or os.getenv("TTS_OUTPUT_LANGUAGE", "es-MX")
+            profile_snapshot = _profile_for_article(db, article)
             collector = UsageCollector(article_id=article.id, user_id=user_id)
             logger.info("TTS-only run for pre-prepared article id=%s words=%d", article.id, word_count)
 
@@ -751,6 +787,7 @@ def generate_latest_for_source(
                     openai_api_key=openai_api_key,
                     elevenlabs_api_key=elevenlabs_api_key,
                     collector=collector,
+                    content_profile=profile_snapshot,
                 )
         else:
             # ── Full path: obtain article + extract content + generate script ─
@@ -787,6 +824,8 @@ def generate_latest_for_source(
             article = Article(
                 source_id=src.id, title=title, url=url, published_at=published_at,
                 user_id=user_id, language=eff_language,
+                content_profile_id=resolved_profile_id,
+                profile_snapshot_json=profile_snapshot,
             )
             db.add(article)
             try:
@@ -799,6 +838,8 @@ def generate_latest_for_source(
                 if user_id and not article.user_id:
                     article.user_id = user_id
                 article.language = eff_language
+                article.content_profile_id = resolved_profile_id or article.content_profile_id
+                article.profile_snapshot_json = profile_snapshot
                 db.commit()
 
             self.update_state(state="PROGRESS", meta={"stage": "extracting", "msg": "Extracting article content…"})
@@ -825,6 +866,7 @@ def generate_latest_for_source(
                 api_key=openai_api_key,
                 collector=collector,
                 output_language=eff_language,
+                content_profile=profile_snapshot,
             )
 
             script = bundle["script"]
@@ -847,6 +889,7 @@ def generate_latest_for_source(
                 article.social_captions_json = generate_social_captions(
                     title=title, script=script, platforms=platforms,
                     output_language=eff_language, api_key=openai_api_key, collector=collector,
+                    content_profile=profile_snapshot,
                 )
                 db.commit()
             except Exception as exc:
@@ -894,6 +937,8 @@ def generate_latest_for_source(
                 script = rewrite_to_target_words(
                     script, target_words=target_wc, tol_words=20,
                     api_key=openai_api_key, collector=collector,
+                    output_language=eff_language,
+                    content_profile=profile_snapshot,
                 )
                 word_count = len(script.split())
 
@@ -916,7 +961,10 @@ def generate_latest_for_source(
         try:
             from app.analysis import analyze_article as _analyze
             self.update_state(state="PROGRESS", meta={"stage": "analyzing", "msg": "Analyzing content…"})
-            article.analysis_json = _analyze(script, api_key=openai_api_key, collector=collector)
+            article.analysis_json = _analyze(
+                script, api_key=openai_api_key, collector=collector,
+                content_profile=profile_snapshot,
+            )
         except Exception as exc:
             logger.warning("Analysis failed (non-fatal): %s", exc)
 
@@ -1003,6 +1051,7 @@ def generate_video_for_article(
             raise ValueError(f"Unknown article_id: {article_id}")
         if not article.storyboard_json:
             raise RuntimeError("Article has no storyboard — run audio generation first")
+        profile_snapshot = _profile_for_article(db, article)
 
         try:
             storyboard = Storyboard(**article.storyboard_json)
@@ -1085,6 +1134,7 @@ def generate_video_for_article(
                     success = generate_and_save(
                         scene.visual_prompt, img_path, api_key=openai_api_key,
                         collector=collector, scene_number=scene.scene_number,
+                        content_profile=profile_snapshot,
                     )
                     img_record = ImageAsset(
                         article_id=article_id,
@@ -1192,6 +1242,7 @@ def regenerate_script_for_article(
         tol_words = _words_for_seconds(tol_seconds, wpm)
 
         collector = UsageCollector(article_id=article_id, user_id=getattr(article, "user_id", None))
+        profile_snapshot = _profile_for_article(db, article)
         bundle = make_tts_bundle(
             title=article.title,
             body=article.raw_text,
@@ -1203,6 +1254,8 @@ def regenerate_script_for_article(
             wpm_estimate=wpm,
             api_key=openai_api_key,
             collector=collector,
+            output_language=article.language or os.getenv("TTS_OUTPUT_LANGUAGE", "es-MX"),
+            content_profile=profile_snapshot,
         )
 
         article.tts_script = bundle["script"]
@@ -1214,7 +1267,10 @@ def regenerate_script_for_article(
         try:
             from app.analysis import analyze_article as _analyze
             self.update_state(state="PROGRESS", meta={"stage": "analyzing", "msg": "Analyzing content…"})
-            article.analysis_json = _analyze(bundle["script"], api_key=openai_api_key, collector=collector)
+            article.analysis_json = _analyze(
+                bundle["script"], api_key=openai_api_key, collector=collector,
+                content_profile=profile_snapshot,
+            )
         except Exception as exc:
             logger.warning("Analysis failed (non-fatal): %s", exc)
 
@@ -1862,6 +1918,7 @@ def generate_animated_video_for_article(
             raise ValueError(f"Unknown article_id: {article_id}")
         if not article.storyboard_json:
             raise RuntimeError("Article has no storyboard — run audio generation first")
+        profile_snapshot = _profile_for_article(db, article)
 
         try:
             storyboard = Storyboard(**article.storyboard_json)
@@ -1940,6 +1997,7 @@ def generate_animated_video_for_article(
                     success = generate_and_save(
                         scene.visual_prompt, img_path, api_key=openai_api_key,
                         collector=anim_collector, scene_number=scene.scene_number,
+                        content_profile=profile_snapshot,
                     )
                     img_rec = ImageAsset(
                         article_id=article_id,
@@ -2209,6 +2267,7 @@ def generate_article_thumbnail(
         article = db.get(Article, article_id)
         if not article:
             raise ValueError(f"Unknown article_id: {article_id}")
+        profile_snapshot = _profile_for_article(db, article)
 
         collector = UsageCollector(article_id=article.id, user_id=user_id)
         self.update_state(state="PROGRESS", meta={"stage": "thumbnail", "msg": "Generating thumbnail…"})
@@ -2225,6 +2284,7 @@ def generate_article_thumbnail(
             custom_prompt=prompt,
             api_key=openai_api_key,
             collector=collector,
+            content_profile=profile_snapshot,
         )
 
         image_dir = os.getenv("IMAGE_DIR", "/data/images")

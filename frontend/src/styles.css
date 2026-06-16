@@ -79,7 +79,7 @@ label {
   margin-bottom: 6px;
 }
 
-select, input {
+select, input, textarea {
   width: 100%;
   padding: 10px 12px;
   border: 1px solid #d1d5db;
@@ -87,9 +87,10 @@ select, input {
   outline: none;
   font-size: 14px;
   font-family: inherit;
+  resize: vertical;
 }
 
-select:focus, input:focus {
+select:focus, input:focus, textarea:focus {
   border-color: #9ca3af;
 }
 
@@ -1990,6 +1991,36 @@ hr {
 .result-hero-actions { flex: 1 1 240px; min-width: 220px; }
 @media (max-width: 560px) {
   .result-hero-body { justify-content: center; }
+}
+
+/* ── Content profiles + RSS sources ─────────────────────────────────────── */
+.profile-picker {
+  display: flex;
+  gap: var(--space-3);
+  align-items: flex-start;
+  justify-content: space-between;
+  margin-bottom: var(--space-3);
+  flex-wrap: wrap;
+}
+.profile-picker > div { flex: 1 1 280px; min-width: 0; }
+.profile-actions {
+  display: flex;
+  gap: var(--space-2);
+  align-items: center;
+  flex-wrap: wrap;
+}
+.profile-description {
+  margin-top: 5px;
+  max-width: 720px;
+}
+.add-source-panel {
+  display: grid;
+  gap: var(--space-2);
+  padding: var(--space-3);
+  margin-bottom: var(--space-3);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: #f9fafb;
 }
 
 /* ── Ad Studio: concept variants + preview frame ─────────────────────────── */
