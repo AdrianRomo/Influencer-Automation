@@ -42,7 +42,7 @@ services:
       - image-data:/data/images
       - video-data:/data/video
     ports:
-      - "${API_PORT:-8085}:8085"
+      - "${API_PORT:-8090}:8085"
     networks:
       - backend
     depends_on:
@@ -110,7 +110,7 @@ services:
     build:
       context: ./frontend
       args:
-        VITE_API_BASE_URL: ${VITE_API_BASE_URL:-http://localhost:8085}
+        VITE_API_BASE_URL: ${VITE_API_BASE_URL:-http://localhost:8090}
     ports:
       - "${FRONTEND_PORT:-5173}:80"
     networks:
