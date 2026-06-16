@@ -16,6 +16,17 @@ import type { EditDocument, TimelineSubtitleClip, TimelineVisualClip } from '../
 
 const round = (n: number) => Math.round(n * 1000) / 1000
 
+// Shotstack Studio requires 6-digit hex colors (#RRGGBB) with a separate
+// `opacity`; our styles may carry 8-digit #RRGGBBAA. Split the alpha out.
+function splitColor(value: string | undefined, fallback: string): { color: string; opacity: number } {
+  const v = (value ?? '').trim()
+  const m8 = /^#([A-Fa-f0-9]{6})([A-Fa-f0-9]{2})$/.exec(v)
+  if (m8) return { color: `#${m8[1]}`, opacity: round(parseInt(m8[2], 16) / 255) }
+  const m6 = /^#([A-Fa-f0-9]{6})$/.exec(v)
+  if (m6) return { color: `#${m6[1]}`, opacity: 1 }
+  return { color: fallback, opacity: 1 }
+}
+
 function assetUrl(kind: string, id: string): string {
   if (kind === 'video') return resolveSceneVideoUrl(id)
   if (kind === 'audio') return resolveAudioUrl(id)
@@ -24,6 +35,8 @@ function assetUrl(kind: string, id: string): string {
 
 function subtitleToStudio(c: TimelineSubtitleClip) {
   const style = (c.style ?? {}) as Record<string, any>
+  const fg = splitColor(style.color, '#FFFFFF')
+  const bg = splitColor(style.background, '#000000')
   return {
     asset: {
       type: 'text',
@@ -31,10 +44,11 @@ function subtitleToStudio(c: TimelineSubtitleClip) {
       font: {
         family: style.font_family ?? 'Montserrat ExtraBold',
         size: Number(style.font_size ?? 48),
-        color: style.color ?? '#FFFFFF',
+        color: fg.color,
+        opacity: fg.opacity,
         weight: 700,
       },
-      background: { color: style.background ?? '#000000B3', padding: 12 },
+      background: { color: bg.color, opacity: bg.opacity, padding: 12 },
       alignment: { horizontal: style.align ?? 'center', vertical: 'bottom' },
     },
     start: c.start,

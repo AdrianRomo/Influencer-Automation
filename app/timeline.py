@@ -211,6 +211,17 @@ def _visual_to_shotstack(clip: dict, resolve_src: Callable[[str, str], str]) -> 
     return out
 
 
+def _hex6(color: str | None, fallback: str) -> str:
+    """Shotstack rejects 8-digit #RRGGBBAA — drop alpha down to #RRGGBB."""
+    if isinstance(color, str):
+        c = color.strip()
+        if len(c) == 9 and c.startswith("#"):
+            return c[:7]
+        if len(c) == 7 and c.startswith("#"):
+            return c
+    return fallback
+
+
 def _subtitle_to_shotstack(clip: dict) -> dict:
     style = clip.get("style") or {}
     pos = style.get("position", "bottom")
@@ -219,9 +230,9 @@ def _subtitle_to_shotstack(clip: dict) -> dict:
             "type": "title",
             "text": clip.get("text", ""),
             "style": "subtitle",
-            "color": style.get("color", "#FFFFFF"),
+            "color": _hex6(style.get("color"), "#FFFFFF"),
             "size": _size_bucket(style.get("font_size", 48)),
-            "background": style.get("background", "#000000B3"),
+            "background": _hex6(style.get("background"), "#000000"),
             "position": pos,
         },
         "start": clip["start"],
