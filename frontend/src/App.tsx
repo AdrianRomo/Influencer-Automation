@@ -31,6 +31,7 @@ import { AdvancedSettingsDisclosure } from './components/AdvancedSettingsDisclos
 import { SubtitleControls, SubtitleStylePreview, DEFAULT_SUBTITLE_STYLE } from './components/SubtitleControls'
 import { GenerationStepper } from './components/GenerationStepper'
 import { VideoPreviewPanel, ResultActions } from './components/ResultPanel'
+import { VideoEditor } from './editor/VideoEditor'
 import type { SubtitleStyle } from './types'
 import {
   COST_MODES, STYLE_PRESETS, costModeFor, stylePresetFor,
@@ -56,6 +57,8 @@ export default function App() {
   // ── Settings (legacy API key) ───────────────────────────────────────────
   const [apiKey, setApiKeyState] = useState(() => localStorage.getItem('api_key') ?? '')
   const [showSettings, setShowSettings] = useState(false)
+  // Article currently open in the full-screen video editor (null = closed).
+  const [editorArticleId, setEditorArticleId] = useState<string | null>(null)
 
   // ── Top-level view: classic article pipeline vs catalog-to-ad studio ─────
   const [mode, setMode] = useState<'articles' | 'studio'>(
@@ -1029,6 +1032,11 @@ export default function App() {
   return (
     <div className="container">
 
+      {/* Full-screen embedded video editor */}
+      {editorArticleId && (
+        <VideoEditor articleId={editorArticleId} onClose={() => setEditorArticleId(null)} />
+      )}
+
       {/* Auth modal */}
       {showAuthModal && <AuthModal onSuccess={handleAuthSuccess} />}
 
@@ -1988,6 +1996,15 @@ export default function App() {
                           : `DALL-E images + FFmpeg · ~2–5 min${selectedPlatforms.length > 1 ? ` × ${selectedPlatforms.length}` : ''}`}
                       </span>
                   }
+                  {articleId && !videoLoading && (
+                    <button
+                      className="secondary"
+                      onClick={() => setEditorArticleId(articleId)}
+                      title="Open the timeline editor: drag subtitles, retime scenes, animate, then render"
+                    >
+                      🎬 Open in editor
+                    </button>
+                  )}
                 </div>
                 {pkg.videos && pkg.videos.length > 0 && articleId && !videoLoading && (
                   <div className="actions" style={{ marginTop: 8 }}>

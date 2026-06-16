@@ -2129,3 +2129,55 @@ hr {
   .campaign-head-actions { width: 100%; }
   .export-group { border-left: none; padding-left: 0; }
 }
+
+/* ── Embedded video editor ─────────────────────────────────────────────── */
+.editor-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  background: #0b0f17;
+  color: #e5e7eb;
+  display: flex;
+  flex-direction: column;
+}
+.editor-bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 16px;
+  border-bottom: 1px solid #1f2937;
+  background: #111827;
+}
+.editor-title { font-weight: 600; }
+.editor-title em { color: #f59e0b; font-style: normal; margin-left: 6px; }
+.editor-actions { margin-left: auto; display: flex; gap: 8px; }
+.editor-error { padding: 8px 16px; background: #7f1d1d; color: #fee2e2; font-size: 13px; }
+.editor-status { padding: 8px 16px; background: #1e3a8a; color: #dbeafe; font-size: 13px; }
+.editor-body { flex: 1; display: flex; min-height: 0; }
+.editor-stage {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  position: relative;
+}
+.editor-loading {
+  position: absolute; inset: 0; display: flex; align-items: center;
+  justify-content: center; color: #9ca3af; pointer-events: none;
+}
+.editor-canvas { flex: 1; min-height: 0; background: #000; }
+.editor-timeline { height: 280px; border-top: 1px solid #1f2937; background: #0f172a; }
+.editor-sidebar {
+  width: 300px;
+  border-left: 1px solid #1f2937;
+  padding: 14px;
+  overflow-y: auto;
+  background: #111827;
+}
+.editor-sidebar h4 { margin: 0 0 6px; }
+.animate-row { display: flex; flex-direction: column; gap: 4px; margin-bottom: 12px; }
+.animate-row select { padding: 6px; background: #0b0f17; color: #e5e7eb; border: 1px solid #374151; border-radius: 6px; }
+.animate-row .badge {
+  font-size: 10px; background: #4338ca; color: #e0e7ff;
+  padding: 1px 6px; border-radius: 999px; margin-left: 6px;
+}

@@ -458,3 +458,57 @@ export type AdConcept = {
   status: string
   created_at?: string | null
 }
+
+// ── Embedded video editor (timeline) ───────────────────────────────────────
+export type AnimateMode = 'none' | 'effect' | 'ai'
+
+export type TimelineSubtitleClip = {
+  id: string
+  start: number
+  length: number
+  text: string
+  style: Record<string, unknown>
+}
+
+export type TimelineVisualClip = {
+  id: string
+  scene_number: number
+  start: number
+  length: number
+  asset_kind: 'image' | 'video'
+  asset_id: string | null
+  src: string | null
+  fit: string
+  transition: { in: string | null; out: string | null }
+  animate: { mode: AnimateMode; effect: string | null; provider: string | null; scene_video_id: string | null }
+  on_screen_text?: string
+}
+
+export type TimelineTrack =
+  | { type: 'subtitles'; clips: TimelineSubtitleClip[] }
+  | { type: 'visual'; clips: TimelineVisualClip[] }
+
+export type EditDocument = {
+  schema_version: number
+  source: { kind: string; id: string }
+  output: { format: string; width: number; height: number; fps: number }
+  duration: number
+  soundtrack: { asset_kind: string; asset_id: string; src: string } | null
+  tracks: TimelineTrack[]
+}
+
+export type EditTimelineResp = {
+  timeline_id: string
+  article_id: string | null
+  version: number
+  status: string
+  render_provider: string | null
+  render_job_id: string | null
+  video_asset_id: string | null
+  error: string | null
+  edit: EditDocument
+  updated_at: string | null
+}
+
+export type RenderStartResp = { timeline_id: string; render_job_id: string; status: string }
+export type RenderPollResp = { status: string; video_asset_id?: string; error?: string }

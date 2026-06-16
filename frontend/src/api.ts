@@ -3,6 +3,7 @@ import type {
   GenerateReq, GenerateResp, JobStatus, ContentPackage, RenderMode,
   TokenResp, UserResp, UserKeysIn, UserKeysOut, CostSummary, PlatformsResp,
   SubtitleStyle, ContentProfile,
+  EditDocument, EditTimelineResp, RenderStartResp, RenderPollResp,
 } from './types'
 
 const rawBase = import.meta.env.VITE_API_BASE_URL as string | undefined
@@ -249,6 +250,35 @@ export function jobStatus(taskId: string): Promise<JobStatus> {
 
 export function getArticlePackage(articleId: string): Promise<ContentPackage> {
   return http<ContentPackage>(`/articles/${encodeURIComponent(articleId)}/package`)
+}
+
+// ── Embedded video editor (timeline) ───────────────────────────────────────
+
+export function getTimeline(articleId: string): Promise<EditTimelineResp> {
+  return http<EditTimelineResp>(`/articles/${encodeURIComponent(articleId)}/timeline`)
+}
+
+export function saveTimeline(
+  articleId: string,
+  edit: EditDocument,
+  version?: number,
+): Promise<EditTimelineResp> {
+  return http<EditTimelineResp>(`/articles/${encodeURIComponent(articleId)}/timeline`, {
+    method: 'PUT',
+    body: JSON.stringify({ edit, version }),
+  })
+}
+
+export function startTimelineRender(articleId: string): Promise<RenderStartResp> {
+  return http<RenderStartResp>(`/articles/${encodeURIComponent(articleId)}/render`, {
+    method: 'POST',
+  })
+}
+
+export function pollTimelineRender(articleId: string, jobId: string): Promise<RenderPollResp> {
+  return http<RenderPollResp>(
+    `/articles/${encodeURIComponent(articleId)}/render/${encodeURIComponent(jobId)}`,
+  )
 }
 
 export function startGenerateVideo(
